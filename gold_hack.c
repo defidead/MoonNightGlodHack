@@ -344,7 +344,7 @@ static int resolve_apis_from_pairs(void) {
         install_sigsegv_handler();
 
         // 遍历每个指针大小的对齐位置
-        uintptr_t scan_end = region->end - 2 * sizeof(void*);
+        uintptr_t scan_end = region->end - 4 * sizeof(void*); // 留足空间读后续指针
         for (uintptr_t addr = region->start; addr <= scan_end; addr += sizeof(void*)) {
             // 安全读取：如果 SIGSEGV 则跳过整个区域
             g_in_safe_access = 1;
@@ -354,11 +354,10 @@ static int resolve_apis_from_pairs(void) {
                 break; // 跳出 for 循环，跳到下一个区域
             }
             uintptr_t val1 = *(volatile uintptr_t *)addr;          // 可能是 string_ptr
-            uintptr_t val2 = *(volatile uintptr_t *)(addr + sizeof(void*)); // 可能是 func_ptr
             g_in_safe_access = 0;
 
-            // 快速过滤：两个值都应该是合理的指针地址
-            if (val1 < 0x1000 || val2 < 0x1000) continue;
+            // 快速过滤
+            if (val1 < 0x1000) continue;
 
             // 检查 val1 是否匹配我们找到的某个 API 字符串地址
             for (int s = 0; s < g_string_match_count; s++) {
@@ -368,23 +367,39 @@ static int resolve_apis_from_pairs(void) {
                     // 检查这个 API 是否已经解析过
                     if (*g_api_table[api_idx].func_ptr != NULL) continue;
 
-                    // val2 应该指向代码段（rx）
-                    int valid_code = 0;
-                    for (int c = 0; c < g_region_count; c++) {
-                        if (val2 >= g_regions[c].start && val2 < g_regions[c].end) {
-                            // 代码区域应该是 readable + executable
-                            if (g_regions[c].readable) {
-                                valid_code = 1;
-                            }
+                    // 配对结构可能是 {name, func} 或 {name, ???, func}
+                    // 尝试多个偏移找函数指针
+                    for (int off = 1; off <= 3; off++) {
+                        g_in_safe_access = 1;
+                        if (sigsetjmp(g_jmpbuf, 1) != 0) {
+                            g_in_safe_access = 0;
                             break;
                         }
-                    }
+                        uintptr_t candidate = *(volatile uintptr_t *)(addr + off * sizeof(void*));
+                        g_in_safe_access = 0;
 
-                    if (valid_code) {
-                        *g_api_table[api_idx].func_ptr = (void *)val2;
-                        resolved++;
-                        LOGI("[scan] Resolved %s @ 0x%" PRIxPTR " (string @ 0x%" PRIxPTR ", pair @ 0x%" PRIxPTR ")",
-                             g_api_table[api_idx].name, val2, val1, addr);
+                        if (candidate < 0x10000) continue;
+                        // 跳过指向字符串自身的指针（val2 == val1 的情况）
+                        if (candidate == val1) continue;
+
+                        // 验证函数指针指向 r-x 可执行区域
+                        int valid_code = 0;
+                        for (int c = 0; c < g_region_count; c++) {
+                            if (candidate >= g_regions[c].start && candidate < g_regions[c].end) {
+                                if (g_regions[c].readable && g_regions[c].executable) {
+                                    valid_code = 1;
+                                }
+                                break;
+                            }
+                        }
+
+                        if (valid_code) {
+                            *g_api_table[api_idx].func_ptr = (void *)candidate;
+                            resolved++;
+                            LOGI("[scan] Resolved %s @ 0x%" PRIxPTR " (string @ 0x%" PRIxPTR ", pair @ 0x%" PRIxPTR ", offset +%d)",
+                                 g_api_table[api_idx].name, candidate, val1, addr, off);
+                            break; // 找到了，不再尝试其他偏移
+                        }
                     }
                 }
             }

@@ -24,10 +24,9 @@
 #include <jni.h>
 #include <android/log.h>
 
-// ========== 嵌入的 DEX 字节码（由 CI 生成 overlay_dex.h）==========
-#ifdef OVERLAY_DEX
-#include "overlay_dex.h"   // 定义 unsigned char overlay_dex_data[] 和 unsigned int overlay_dex_data_len
-#endif
+// ========== 嵌入的 DEX 字节码（由 CI 通过 -include overlay_dex.h 注入）==========
+// overlay_dex_data[] 和 overlay_dex_data_len 由编译器 -include 标志提供
+// 同时定义 -DOVERLAY_DEX 启用悬浮菜单功能
 
 // ========== 配置 ==========
 #ifndef TARGET_GOLD

@@ -26,7 +26,6 @@ Linux localhost 5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284 #1 SMP PREEM
 | 文件 | 说明 |
 |------|------|
 | `inject_gold.py` | 纯 Python+Frida 方案，内嵌完整的 JS 注入脚本，一键修改金币+重置技能 |
-| `control_panel.py` | 纯 Frida 方案 + 游戏内悬浮窗控制面板 |
 
 ### 逆向分析数据
 

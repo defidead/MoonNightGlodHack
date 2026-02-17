@@ -367,9 +367,9 @@ static int resolve_apis_from_pairs(void) {
                     // 检查这个 API 是否已经解析过
                     if (*g_api_table[api_idx].func_ptr != NULL) continue;
 
-                    // 配对结构可能是 {name, func} 或 {name, ???, func}
-                    // 尝试多个偏移找函数指针
-                    for (int off = 1; off <= 3; off++) {
+                    // 配对结构是 {name_ptr, ???, func_ptr}（3个指针，步长0x18）
+                    // 只尝试偏移 +1 和 +2，+3 是下一条 entry 的 name_ptr
+                    for (int off = 1; off <= 2; off++) {
                         g_in_safe_access = 1;
                         if (sigsetjmp(g_jmpbuf, 1) != 0) {
                             g_in_safe_access = 0;
@@ -379,21 +379,31 @@ static int resolve_apis_from_pairs(void) {
                         g_in_safe_access = 0;
 
                         if (candidate < 0x10000) continue;
-                        // 跳过指向字符串自身的指针（val2 == val1 的情况）
+                        // 跳过指向字符串自身的指针
                         if (candidate == val1) continue;
 
-                        // 验证函数指针指向 r-x 可执行区域
-                        int valid_code = 0;
+                        // 排除已知的 API 字符串地址（避免误将下一个 name_ptr 当作 func_ptr）
+                        int is_known_string = 0;
+                        for (int ks = 0; ks < g_string_match_count; ks++) {
+                            if (candidate == g_string_matches[ks].addr) {
+                                is_known_string = 1;
+                                break;
+                            }
+                        }
+                        if (is_known_string) continue;
+
+                        // 验证函数指针指向某个已映射的区域（不要求 r-x，MHP 可能重定向）
+                        int valid_ptr = 0;
                         for (int c = 0; c < g_region_count; c++) {
                             if (candidate >= g_regions[c].start && candidate < g_regions[c].end) {
-                                if (g_regions[c].readable && g_regions[c].executable) {
-                                    valid_code = 1;
+                                if (g_regions[c].readable) {
+                                    valid_ptr = 1;
                                 }
                                 break;
                             }
                         }
 
-                        if (valid_code) {
+                        if (valid_ptr) {
                             *g_api_table[api_idx].func_ptr = (void *)candidate;
                             resolved++;
                             LOGI("[scan] Resolved %s @ 0x%" PRIxPTR " (string @ 0x%" PRIxPTR ", pair @ 0x%" PRIxPTR ", offset +%d)",
@@ -418,13 +428,15 @@ done:
 // ========== 查找 RoleInfo 实例并修改金币 ==========
 static int modify_gold(int target_gold) {
     // 1. 获取 domain 并附加线程
+    LOGI("Calling il2cpp_domain_get @ %p", (void*)fn_domain_get);
     Il2CppDomain domain = fn_domain_get();
     if (!domain) {
         LOGE("il2cpp_domain_get returned NULL");
         return -1;
     }
+    LOGI("Domain: %p, calling thread_attach...", domain);
     fn_thread_attach(domain);
-    LOGI("Attached to il2cpp domain: %p", domain);
+    LOGI("Attached to il2cpp domain");
 
     // 2. 找到 Assembly-CSharp.dll
     size_t asm_count = 0;
@@ -472,6 +484,8 @@ static int modify_gold(int target_gold) {
     int modified_count = 0;
     int scanned_count = 0;
 
+    install_sigsegv_handler();
+
     for (int r = 0; r < g_region_count; r++) {
         MemRegion *region = &g_regions[r];
         if (!region->readable || !region->writable) continue;
@@ -487,36 +501,42 @@ static int modify_gold(int target_gold) {
         if (size < 0x100) continue;
 
         for (size_t off = 0; off <= size - 0x100; off += 8) {
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) {
+                g_in_safe_access = 0;
+                break; // 跳过这个区域
+            }
             uintptr_t *p = (uintptr_t *)(base + off);
             
-            if (*p != klass_val) continue;
+            if (*p != klass_val) { g_in_safe_access = 0; continue; }
 
             // 候选对象地址
             uintptr_t obj_addr = (uintptr_t)(base + off);
             
             // 验证 monitor 字段 (offset +8): 应该是 0 或有效指针
-            uintptr_t monitor = *(uintptr_t *)(obj_addr + 8);
-            if (monitor != 0 && monitor < 0x10000) continue;
+            uintptr_t monitor = *(volatile uintptr_t *)(obj_addr + 8);
+            if (monitor != 0 && monitor < 0x10000) { g_in_safe_access = 0; continue; }
 
             // 验证 roleId (offset 0x10): 应该是 0-200
-            int32_t roleId = *(int32_t *)(obj_addr + 0x10);
-            if (roleId < 0 || roleId > 200) continue;
+            int32_t roleId = *(volatile int32_t *)(obj_addr + 0x10);
+            if (roleId < 0 || roleId > 200) { g_in_safe_access = 0; continue; }
 
             // 验证 maxHp (offset 0x14): 应该是 0-99999
-            int32_t maxHp = *(int32_t *)(obj_addr + 0x14);
-            if (maxHp < 0 || maxHp > 99999) continue;
+            int32_t maxHp = *(volatile int32_t *)(obj_addr + 0x14);
+            if (maxHp < 0 || maxHp > 99999) { g_in_safe_access = 0; continue; }
 
             // 验证 curHp (offset 0x18): 应该是 0-99999
-            int32_t curHp = *(int32_t *)(obj_addr + 0x18);
-            if (curHp < 0 || curHp > 99999) continue;
+            int32_t curHp = *(volatile int32_t *)(obj_addr + 0x18);
+            if (curHp < 0 || curHp > 99999) { g_in_safe_access = 0; continue; }
 
             // 验证 level (offset 0x24): 应该是 0-100
-            int32_t level = *(int32_t *)(obj_addr + 0x24);
-            if (level < 0 || level > 100) continue;
+            int32_t level = *(volatile int32_t *)(obj_addr + 0x24);
+            if (level < 0 || level > 100) { g_in_safe_access = 0; continue; }
 
             // 读取当前金币
             int32_t *gold_ptr = (int32_t *)(obj_addr + 0x2c);
             int32_t old_gold = *gold_ptr;
+            g_in_safe_access = 0;
 
             scanned_count++;
             LOGI("Found RoleInfo instance @ 0x%" PRIxPTR ": roleId=%d level=%d HP=%d/%d gold=%d",
@@ -531,6 +551,7 @@ static int modify_gold(int target_gold) {
     }
 
     LOGI("Scan complete: found %d candidates, modified %d instances", scanned_count, modified_count);
+    uninstall_sigsegv_handler();
     return modified_count;
 }
 

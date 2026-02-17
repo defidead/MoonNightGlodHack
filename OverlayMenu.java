@@ -388,7 +388,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             gd.setCornerRadius(dp(8));
             autoSkillBtn.setBackground(gd);
             startAutoReset();
-            statusText.setText("\uD83D\uDD04 自动重置已开启(每3秒)");
+            statusText.setText("\uD83D\uDD04 自动重置已开启(每1秒)");
         } else {
             autoSkillBtn.setText("自动:关");
             GradientDrawable gd = new GradientDrawable();

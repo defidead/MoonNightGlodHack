@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <signal.h>
+#include <setjmp.h>
 #include <sys/mman.h>
 #include <android/log.h>
 
@@ -189,6 +191,49 @@ static uintptr_t memmem_find(uintptr_t haystack, size_t haystack_len,
     return 0;
 }
 
+// ========== 安全内存访问（SIGSEGV 保护）==========
+static sigjmp_buf g_jmpbuf;
+static volatile int g_in_safe_access = 0;
+
+static void sigsegv_handler(int sig) {
+    if (g_in_safe_access) {
+        siglongjmp(g_jmpbuf, 1);
+    }
+    // 不在安全访问中，恢复默认行为
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void install_sigsegv_handler(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigsegv_handler;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+}
+
+static void uninstall_sigsegv_handler(void) {
+    signal(SIGSEGV, SIG_DFL);
+    signal(SIGBUS, SIG_DFL);
+}
+
+// 安全版 memmem_find，崩溃时返回 0
+static uintptr_t memmem_find_safe(uintptr_t haystack, size_t haystack_len,
+                                  const void *needle, size_t needle_len) {
+    if (needle_len > haystack_len) return 0;
+    g_in_safe_access = 1;
+    if (sigsetjmp(g_jmpbuf, 1) != 0) {
+        // SIGSEGV 发生，跳过这个区域
+        g_in_safe_access = 0;
+        LOGW("[scan] SIGSEGV during memmem_find_safe at 0x%" PRIxPTR, haystack);
+        return 0;
+    }
+    uintptr_t result = memmem_find(haystack, haystack_len, needle, needle_len);
+    g_in_safe_access = 0;
+    return result;
+}
+
 // ========== 方法1: 通过 dlsym 尝试（正常情况下）==========
 static int try_dlsym_apis(void) {
     void *handle = dlopen("libil2cpp.so", RTLD_NOLOAD);
@@ -218,6 +263,10 @@ static int try_dlsym_apis(void) {
 static void scan_api_strings(void) {
     g_string_match_count = 0;
 
+    install_sigsegv_handler();
+
+    int scanned_regions = 0;
+    int skipped_segv = 0;
     for (int r = 0; r < g_region_count && g_string_match_count < MAX_API_STRINGS; r++) {
         MemRegion *region = &g_regions[r];
         if (!region->readable) continue;
@@ -227,6 +276,17 @@ static void scan_api_strings(void) {
 
         // 跳过某些不可能包含字符串的区域
         if (strstr(region->path, "/dev/") || strstr(region->path, "dalvik")) continue;
+        // 跳过 GPU/DMA/框架相关的大区域以避免崩溃
+        if (strstr(region->path, "/dmabuf") || strstr(region->path, "/gpu") ||
+            strstr(region->path, "kgsl") || strstr(region->path, "mali")) continue;
+        // 跳过超大的匿名区域（>50MB，不太可能包含 API 字符串）
+        if (region->path[0] == '\0' && size > 50 * 1024 * 1024) continue;
+
+        scanned_regions++;
+        if (scanned_regions % 500 == 0) {
+            LOGI("[scan] Progress: scanned %d regions, found %d strings so far",
+                 scanned_regions, g_string_match_count);
+        }
 
         for (int api_idx = 0; g_api_table[api_idx].name; api_idx++) {
             const char *api_name = g_api_table[api_idx].name;
@@ -237,7 +297,7 @@ static void scan_api_strings(void) {
             size_t remaining = size;
 
             while (remaining >= name_len && g_string_match_count < MAX_API_STRINGS) {
-                uintptr_t found = memmem_find(search_start, remaining, api_name, name_len);
+                uintptr_t found = memmem_find_safe(search_start, remaining, api_name, name_len);
                 if (!found) break;
 
                 g_string_matches[g_string_match_count].addr = found;
@@ -252,7 +312,8 @@ static void scan_api_strings(void) {
         }
     }
 
-    LOGI("[scan] Found %d API string occurrences in memory", g_string_match_count);
+    LOGI("[scan] Scanned %d readable regions, found %d API string occurrences", scanned_regions, g_string_match_count);
+    uninstall_sigsegv_handler();
 }
 
 // 步骤2: 在 rw- 匿名区域查找 {string_ptr, func_ptr} 配对
@@ -268,11 +329,21 @@ static int resolve_apis_from_pairs(void) {
         size_t size = region->end - region->start;
         if (size < 16 || size > MAX_SCAN_SIZE) continue;
 
+        install_sigsegv_handler();
+
         // 遍历每个指针大小的对齐位置
         uintptr_t scan_end = region->end - 2 * sizeof(void*);
         for (uintptr_t addr = region->start; addr <= scan_end; addr += sizeof(void*)) {
-            uintptr_t val1 = *(uintptr_t *)addr;          // 可能是 string_ptr
-            uintptr_t val2 = *(uintptr_t *)(addr + sizeof(void*)); // 可能是 func_ptr
+            // 安全读取：如果 SIGSEGV 则跳过整个区域
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) {
+                g_in_safe_access = 0;
+                LOGW("[scan] SIGSEGV in resolve_apis_from_pairs at region 0x%" PRIxPTR, region->start);
+                break; // 跳出 for 循环，跳到下一个区域
+            }
+            uintptr_t val1 = *(volatile uintptr_t *)addr;          // 可能是 string_ptr
+            uintptr_t val2 = *(volatile uintptr_t *)(addr + sizeof(void*)); // 可能是 func_ptr
+            g_in_safe_access = 0;
 
             // 快速过滤：两个值都应该是合理的指针地址
             if (val1 < 0x1000 || val2 < 0x1000) continue;
@@ -312,6 +383,7 @@ static int resolve_apis_from_pairs(void) {
     }
 
 done:
+    uninstall_sigsegv_handler();
     LOGI("[scan] Resolved %d/%d APIs via memory scanning", resolved, API_COUNT);
     return (resolved >= API_COUNT) ? 0 : -1;
 }

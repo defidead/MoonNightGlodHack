@@ -1,24 +1,14 @@
-# 月圆之夜 修改器
+# 月圆之夜 手机版 修改器
 
 针对 **月圆之夜 v1.6.28**（`com.ztgame.yyzy`）的内存修改工具。支持修改金币、重置技能 CD，带游戏内悬浮菜单。
 
 游戏使用 Unity il2cpp + HybridCLR，并有 MHP v3.5.0 保护（剥离 il2cpp API 符号 + hook dlsym）。
 
 ## 使用
-
-```bash
-# 1. push 编译好的 .so 到设备（CI 自动编译，从 Actions 下载）
-adb push libgoldhack.so /data/local/tmp/
-
-# 2. 注入（需要 frida-server 在设备上运行）
-python3 inject.py --spawn --no-detach
+自行研究如何注入so文件，写的py为基于frida的注入，没有进行最终验证，项目最终验证于xiaomipad6 android15版本,模拟器为mumu（mac），frida版本为frida-server-16.5.9-android-arm64
 ```
-
-或者不需要编译 .so，直接用纯 Frida 方案：
-
-```bash
-python3 inject_gold.py              # 默认 99999 金币
-python3 inject_gold.py --gold 888888
+uname -a
+Linux localhost 5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284 #1 SMP PREEMPT Tue Oct 21 03:03:12 UTC 2025 aarch64 Toybox
 ```
 
 ## 文件说明

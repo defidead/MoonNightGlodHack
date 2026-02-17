@@ -304,6 +304,8 @@ static void scan_api_strings(void) {
                 g_string_matches[g_string_match_count].api_name = api_name;
                 g_string_matches[g_string_match_count].api_index = api_idx;
                 g_string_match_count++;
+                LOGI("[scan] Found string '%s' @ 0x%" PRIxPTR " in region %s",
+                     api_name, found, region->path[0] ? region->path : "[anon]");
 
                 size_t offset = found - search_start + name_len;
                 search_start += offset;
@@ -316,18 +318,28 @@ static void scan_api_strings(void) {
     uninstall_sigsegv_handler();
 }
 
-// 步骤2: 在 rw- 匿名区域查找 {string_ptr, func_ptr} 配对
+// 步骤2: 在 rw- 区域查找 {string_ptr, func_ptr} 配对
 static int resolve_apis_from_pairs(void) {
     int resolved = 0;
+    int scanned_pair_regions = 0;
 
     for (int r = 0; r < g_region_count; r++) {
         MemRegion *region = &g_regions[r];
-        // 只扫描 rw- 私有匿名区域
+        // 必须 rw-（非可执行）
         if (!region->readable || !region->writable || region->executable) continue;
-        if (region->path[0] != '\0') continue; // 匿名区域 path 为空
 
         size_t size = region->end - region->start;
         if (size < 16 || size > MAX_SCAN_SIZE) continue;
+
+        // 跳过不可能包含 API 配对的区域
+        if (strstr(region->path, "/dev/")) continue;
+        if (strstr(region->path, "dalvik")) continue;
+        if (strstr(region->path, "/dmabuf") || strstr(region->path, "/gpu") ||
+            strstr(region->path, "kgsl") || strstr(region->path, "mali")) continue;
+        // 跳过太大的匿名区域（>50MB）
+        if (region->path[0] == '\0' && size > 50 * 1024 * 1024) continue;
+
+        scanned_pair_regions++;
 
         install_sigsegv_handler();
 
@@ -384,7 +396,7 @@ static int resolve_apis_from_pairs(void) {
 
 done:
     uninstall_sigsegv_handler();
-    LOGI("[scan] Resolved %d/%d APIs via memory scanning", resolved, API_COUNT);
+    LOGI("[scan] Scanned %d rw- regions for pairs, resolved %d/%d APIs", scanned_pair_regions, resolved, API_COUNT);
     return (resolved >= API_COUNT) ? 0 : -1;
 }
 

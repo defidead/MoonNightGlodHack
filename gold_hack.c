@@ -246,9 +246,13 @@ typedef struct {
 // 全局记录 pair 信息（供缓存使用）
 static uintptr_t g_pair_addrs[API_COUNT] = {0};
 
-// 前向声明（memmem_find_safe 在后面定义，load_api_cache 需要提前引用）
+// 前向声明（这些函数/变量在后面定义，load_api_cache 需要提前引用）
 static uintptr_t memmem_find_safe(uintptr_t haystack, size_t haystack_len,
                                    const void *needle, size_t needle_len);
+static void install_sigsegv_handler(void);
+static void uninstall_sigsegv_handler(void);
+static sigjmp_buf g_jmpbuf;
+static volatile int g_in_safe_access = 0;
 
 static void save_api_cache(uintptr_t il2cpp_base) {
     ApiCache cache;
@@ -442,8 +446,6 @@ static uintptr_t memmem_find(uintptr_t haystack, size_t haystack_len,
 }
 
 // ========== 安全内存访问（SIGSEGV 保护）==========
-static sigjmp_buf g_jmpbuf;
-static volatile int g_in_safe_access = 0;
 static struct sigaction g_old_sigsegv;
 static struct sigaction g_old_sigbus;
 static int g_old_saved = 0;

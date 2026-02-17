@@ -701,16 +701,31 @@ static void create_overlay_menu(void) {
     void *buf_addr = (*env)->GetDirectBufferAddress(env, dex_buf);
     memcpy(buf_addr, overlay_dex_data, overlay_dex_data_len);
 
-    // 获取系统 ClassLoader
-    jclass Thread_cls = (*env)->FindClass(env, "java/lang/Thread");
-    jmethodID Thread_currentThread = (*env)->GetStaticMethodID(env, Thread_cls,
-        "currentThread", "()Ljava/lang/Thread;");
-    jobject curThread = (*env)->CallStaticObjectMethod(env, Thread_cls, Thread_currentThread);
-    jmethodID getContextCL = (*env)->GetMethodID(env, Thread_cls,
-        "getContextClassLoader", "()Ljava/lang/ClassLoader;");
-    jobject parentCL = (*env)->CallObjectMethod(env, curThread, getContextCL);
+    // 获取应用的 ClassLoader（native 线程的 FindClass 只能找系统类）
+    // 通过 ActivityThread.currentActivityThread().getApplication().getClassLoader()
+    jclass AT_cls = (*env)->FindClass(env, "android/app/ActivityThread");
+    jmethodID AT_current = (*env)->GetStaticMethodID(env, AT_cls,
+        "currentActivityThread", "()Landroid/app/ActivityThread;");
+    jobject actThread = (*env)->CallStaticObjectMethod(env, AT_cls, AT_current);
+    jmethodID AT_getApp = (*env)->GetMethodID(env, AT_cls,
+        "getApplication", "()Landroid/app/Application;");
+    jobject app = (*env)->CallObjectMethod(env, actThread, AT_getApp);
+    if (!app) {
+        LOGE("[overlay] ActivityThread.getApplication() returned null");
+        goto cleanup;
+    }
+    jclass Context_cls = (*env)->FindClass(env, "android/content/Context");
+    jmethodID getCL = (*env)->GetMethodID(env, Context_cls,
+        "getClassLoader", "()Ljava/lang/ClassLoader;");
+    jobject appCL = (*env)->CallObjectMethod(env, app, getCL);
+    LOGI("[overlay] App ClassLoader: %p", appCL);
 
-    // 创建 InMemoryDexClassLoader
+    // 获取 ClassLoader.loadClass 方法（后续多处使用）
+    jclass ClassLoader_cls = (*env)->FindClass(env, "java/lang/ClassLoader");
+    jmethodID loadClass = (*env)->GetMethodID(env, ClassLoader_cls,
+        "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+
+    // 创建 InMemoryDexClassLoader（使用 appCL 作为 parent）
     jclass IMDCL_cls = (*env)->FindClass(env, "dalvik/system/InMemoryDexClassLoader");
     if ((*env)->ExceptionCheck(env)) {
         (*env)->ExceptionClear(env);
@@ -719,19 +734,16 @@ static void create_overlay_menu(void) {
     }
     jmethodID IMDCL_ctor = (*env)->GetMethodID(env, IMDCL_cls, "<init>",
         "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-    jobject dexLoader = (*env)->NewObject(env, IMDCL_cls, IMDCL_ctor, dex_buf, parentCL);
+    jobject dexLoader = (*env)->NewObject(env, IMDCL_cls, IMDCL_ctor, dex_buf, appCL);
     if ((*env)->ExceptionCheck(env)) {
         (*env)->ExceptionDescribe(env);
         (*env)->ExceptionClear(env);
         LOGE("[overlay] Failed to create InMemoryDexClassLoader");
         goto cleanup;
     }
-    LOGI("[overlay] DexClassLoader created");
+    LOGI("[overlay] DexClassLoader created (parent=appCL)");
 
     // 4. 加载 OverlayMenu 类
-    jmethodID loadClass = (*env)->GetMethodID(env,
-        (*env)->GetObjectClass(env, dexLoader),
-        "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
     jstring className = (*env)->NewStringUTF(env, "com.hack.menu.OverlayMenu");
     jclass menuClass = (jclass)(*env)->CallObjectMethod(env, dexLoader, loadClass, className);
     if ((*env)->ExceptionCheck(env) || !menuClass) {
@@ -753,12 +765,19 @@ static void create_overlay_menu(void) {
     }
     LOGI("[overlay] Native methods registered");
 
-    // 6. 获取 Activity（通过 UnityPlayer.currentActivity）
-    jclass unityPlayer = (*env)->FindClass(env, "com/unity3d/player/UnityPlayer");
-    if ((*env)->ExceptionCheck(env)) {
+    // 6. 获取 Activity（通过 app ClassLoader 加载 UnityPlayer）
+    jstring upClassName = (*env)->NewStringUTF(env, "com.unity3d.player.UnityPlayer");
+    jclass unityPlayer = (jclass)(*env)->CallObjectMethod(env, appCL, loadClass, upClassName);
+    if ((*env)->ExceptionCheck(env) || !unityPlayer) {
         (*env)->ExceptionClear(env);
-        LOGE("[overlay] UnityPlayer class not found");
-        goto cleanup;
+        LOGW("[overlay] UnityPlayer not found via appCL, trying loadClass on dexLoader...");
+        // fallback: try with dexLoader's parent delegation
+        unityPlayer = (jclass)(*env)->CallObjectMethod(env, dexLoader, loadClass, upClassName);
+        if ((*env)->ExceptionCheck(env) || !unityPlayer) {
+            (*env)->ExceptionClear(env);
+            LOGE("[overlay] UnityPlayer class not found at all");
+            goto cleanup;
+        }
     }
     jfieldID actField = (*env)->GetStaticFieldID(env, unityPlayer,
         "currentActivity", "Landroid/app/Activity;");

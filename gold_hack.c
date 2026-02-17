@@ -1,8 +1,10 @@
 /*
- * gold_hack.c - 月圆之夜 金币修改器 (native .so)
+ * gold_hack.c - 月圆之夜 金币修改器 (native .so) + 游戏内悬浮菜单
  *
- * 功能: 注入后自动查找 RoleInfo 实例并修改 curgold 字段
- * 兼容: 不同设备/不同基地址，运行时动态发现 il2cpp API
+ * 功能:
+ *   1. 注入后自动查找 il2cpp API（兼容 MHP 保护）
+ *   2. 通过 JNI 加载嵌入的 DEX，创建游戏内悬浮菜单
+ *   3. 菜单按钮回调 native 方法实时修改金币 / 重置技能 CD
  *
  * 编译: aarch64-linux-android35-clang -shared -fPIC -O2 -o libgoldhack.so gold_hack.c -llog
  * 注入: 通过 Frida / zygisk / ptrace 注入到 com.ztgame.yyzy 进程
@@ -19,7 +21,13 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <sys/mman.h>
+#include <jni.h>
 #include <android/log.h>
+
+// ========== 嵌入的 DEX 字节码（由 CI 生成 overlay_dex.h）==========
+#ifdef OVERLAY_DEX
+#include "overlay_dex.h"   // 定义 unsigned char overlay_dex_data[] 和 unsigned int overlay_dex_data_len
+#endif
 
 // ========== 配置 ==========
 #ifndef TARGET_GOLD
@@ -436,174 +444,352 @@ done:
     return (resolved >= API_COUNT) ? 0 : -1;
 }
 
-// ========== 查找 RoleInfo 实例并修改金币 ==========
-static int modify_gold(int target_gold) {
-    // 1. 获取 domain 并附加线程
+// ========== il2cpp 运行时上下文（初始化后全局缓存）==========
+static Il2CppDomain  g_domain       = NULL;
+static Il2CppImage   g_csharp_image = NULL;
+static Il2CppClass   g_roleinfo_cls = NULL;
+
+// 初始化 il2cpp 上下文（domain / image / class），只需调用一次
+static int init_il2cpp_context(void) {
+    if (g_roleinfo_cls) return 0;  // 已初始化
+
     LOGI("Calling il2cpp_domain_get @ %p", (void*)fn_domain_get);
-    Il2CppDomain domain = fn_domain_get();
-    if (!domain) {
-        LOGE("il2cpp_domain_get returned NULL");
-        return -1;
-    }
-    LOGI("Domain: %p, calling thread_attach...", domain);
-    fn_thread_attach(domain);
+    g_domain = fn_domain_get();
+    if (!g_domain) { LOGE("il2cpp_domain_get returned NULL"); return -1; }
+    LOGI("Domain: %p, calling thread_attach...", g_domain);
+    fn_thread_attach(g_domain);
     LOGI("Attached to il2cpp domain");
 
-    // 2. 找到 Assembly-CSharp.dll
     size_t asm_count = 0;
-    Il2CppAssembly *assemblies = fn_domain_get_assemblies(domain, &asm_count);
-    if (!assemblies || asm_count == 0) {
-        LOGE("No assemblies found");
-        return -1;
-    }
+    Il2CppAssembly *assemblies = fn_domain_get_assemblies(g_domain, &asm_count);
+    if (!assemblies || asm_count == 0) { LOGE("No assemblies found"); return -1; }
     LOGI("Found %zu assemblies", asm_count);
 
-    Il2CppImage csharp_image = NULL;
     for (size_t i = 0; i < asm_count; i++) {
-        // assemblies 是指针数组
         Il2CppAssembly asm_ptr = ((Il2CppAssembly *)assemblies)[i];
         Il2CppImage img = fn_assembly_get_image(asm_ptr);
         if (!img) continue;
         const char *name = fn_image_get_name(img);
         if (name && strcmp(name, "Assembly-CSharp.dll") == 0) {
-            csharp_image = img;
+            g_csharp_image = img;
             break;
         }
     }
+    if (!g_csharp_image) { LOGE("Assembly-CSharp.dll not found"); return -1; }
+    LOGI("Found Assembly-CSharp.dll: %p", g_csharp_image);
 
-    if (!csharp_image) {
-        LOGE("Assembly-CSharp.dll not found");
-        return -1;
-    }
-    LOGI("Found Assembly-CSharp.dll: %p", csharp_image);
+    g_roleinfo_cls = fn_class_from_name(g_csharp_image, "", "RoleInfo");
+    if (!g_roleinfo_cls) { LOGE("RoleInfo class not found"); return -1; }
+    LOGI("RoleInfo klass: %p", g_roleinfo_cls);
+    return 0;
+}
 
-    // 3. 查找 RoleInfo 类
-    LOGI("Calling il2cpp_class_from_name @ %p (image=%p, ns='', name='RoleInfo')", (void*)fn_class_from_name, csharp_image);
-    Il2CppClass roleInfoClass = fn_class_from_name(csharp_image, "", "RoleInfo");
-    LOGI("il2cpp_class_from_name returned: %p", roleInfoClass);
-    if (!roleInfoClass) {
-        LOGE("RoleInfo class not found");
-        return -1;
-    }
-    LOGI("RoleInfo klass: %p", roleInfoClass);
+// ========== 堆扫描 RoleInfo 实例的通用宏 ==========
+// callback(obj_addr) 中可以使用 obj_addr
+#define SCAN_ROLEINFO_INSTANCES(callback_body)                               \
+do {                                                                         \
+    parse_maps();                                                            \
+    uintptr_t klass_val = (uintptr_t)g_roleinfo_cls;                        \
+    install_sigsegv_handler();                                               \
+    for (int r = 0; r < g_region_count; r++) {                               \
+        MemRegion *region = &g_regions[r];                                   \
+        if (!region->readable || !region->writable) continue;                \
+        size_t size = region->end - region->start;                           \
+        if (size < 0x100 || size > MAX_SCAN_SIZE) continue;                  \
+        if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue; \
+        uint8_t *base = (uint8_t *)region->start;                            \
+        for (size_t off = 0; off <= size - 0x100; off += 8) {                \
+            g_in_safe_access = 1;                                            \
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; break; } \
+            uintptr_t *p = (uintptr_t *)(base + off);                        \
+            if (*p != klass_val) { g_in_safe_access = 0; continue; }         \
+            uintptr_t obj_addr = (uintptr_t)(base + off);                    \
+            /* 验证 monitor */                                                \
+            uintptr_t monitor = *(volatile uintptr_t *)(obj_addr + 8);       \
+            if (monitor != 0 && monitor < 0x10000) { g_in_safe_access = 0; continue; } \
+            /* 验证 roleId (0x10): 0-200 */                                   \
+            int32_t roleId = *(volatile int32_t *)(obj_addr + 0x10);         \
+            if (roleId < 0 || roleId > 200) { g_in_safe_access = 0; continue; } \
+            /* 验证 maxHp (0x14): 0-99999 */                                  \
+            int32_t maxHp = *(volatile int32_t *)(obj_addr + 0x14);          \
+            if (maxHp < 0 || maxHp > 99999) { g_in_safe_access = 0; continue; } \
+            /* 验证 curHp (0x18): 0-99999 */                                  \
+            int32_t curHp = *(volatile int32_t *)(obj_addr + 0x18);          \
+            if (curHp < 0 || curHp > 99999) { g_in_safe_access = 0; continue; } \
+            /* 验证 level (0x24): 0-100 */                                    \
+            int32_t level = *(volatile int32_t *)(obj_addr + 0x24);          \
+            if (level < 0 || level > 100) { g_in_safe_access = 0; continue; } \
+            g_in_safe_access = 0;                                            \
+            LOGI("RoleInfo @ 0x%" PRIxPTR ": roleId=%d level=%d HP=%d/%d",   \
+                 obj_addr, roleId, level, curHp, maxHp);                     \
+            { callback_body }                                                \
+        }                                                                    \
+    }                                                                        \
+    uninstall_sigsegv_handler();                                             \
+} while(0)
 
-    // 4. 重新解析 maps（游戏运行时可能有新的内存分配）
-    parse_maps();
+// ========== 修改金币（返回修改的实例数）==========
+static int do_modify_gold(int target_gold) {
+    if (init_il2cpp_context() != 0) return -1;
+    int count = 0;
+    SCAN_ROLEINFO_INSTANCES({
+        int32_t *gold_ptr = (int32_t *)(obj_addr + 0x2c);
+        int32_t old_gold = *gold_ptr;
+        *gold_ptr = target_gold;
+        count++;
+        LOGI("  => Gold: %d -> %d", old_gold, target_gold);
+    });
+    LOGI("do_modify_gold: modified %d instance(s)", count);
+    return count;
+}
 
-    // 5. 在堆内存中扫描 RoleInfo 实例
-    //    il2cpp 对象布局: [klass_ptr(8)] [monitor(8)] [fields...]
-    //    curgold 在 offset 0x2c
-    uintptr_t klass_val = (uintptr_t)roleInfoClass;
-    int modified_count = 0;
-    int scanned_count = 0;
-
-    install_sigsegv_handler();
-
-    for (int r = 0; r < g_region_count; r++) {
-        MemRegion *region = &g_regions[r];
-        if (!region->readable || !region->writable) continue;
-        
-        size_t size = region->end - region->start;
-        if (size < 0x100 || size > MAX_SCAN_SIZE) continue;
-        
-        // 跳过 .so / /dev/ 映射
-        if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue;
-
-        uint8_t *base = (uint8_t *)region->start;
-        // 确保有足够空间读取 RoleInfo 对象 (至少 0xf4 字节)
-        if (size < 0x100) continue;
-
-        for (size_t off = 0; off <= size - 0x100; off += 8) {
-            g_in_safe_access = 1;
-            if (sigsetjmp(g_jmpbuf, 1) != 0) {
-                g_in_safe_access = 0;
-                break; // 跳过这个区域
+// ========== 重置所有技能 CD（返回重置的技能数）==========
+static int do_reset_skill_cd(void) {
+    if (init_il2cpp_context() != 0) return -1;
+    int count = 0;
+    SCAN_ROLEINFO_INSTANCES({
+        // dungeonSkill @ 0x80
+        uintptr_t ds_ptr = *(volatile uintptr_t *)(obj_addr + 0x80);
+        if (ds_ptr > 0x10000) {
+            int32_t *cd = (int32_t *)(ds_ptr + 0x14);
+            if (*cd > 0) {
+                int32_t ds_id = *(int32_t *)(ds_ptr + 0x10);
+                LOGI("  => DungeonSkill id=%d CD: %d -> 0", ds_id, *cd);
+                *cd = 0; count++;
             }
-            uintptr_t *p = (uintptr_t *)(base + off);
-            
-            if (*p != klass_val) { g_in_safe_access = 0; continue; }
-
-            // 候选对象地址
-            uintptr_t obj_addr = (uintptr_t)(base + off);
-            
-            // 验证 monitor 字段 (offset +8): 应该是 0 或有效指针
-            uintptr_t monitor = *(volatile uintptr_t *)(obj_addr + 8);
-            if (monitor != 0 && monitor < 0x10000) { g_in_safe_access = 0; continue; }
-
-            // 验证 roleId (offset 0x10): 应该是 0-200
-            int32_t roleId = *(volatile int32_t *)(obj_addr + 0x10);
-            if (roleId < 0 || roleId > 200) { g_in_safe_access = 0; continue; }
-
-            // 验证 maxHp (offset 0x14): 应该是 0-99999
-            int32_t maxHp = *(volatile int32_t *)(obj_addr + 0x14);
-            if (maxHp < 0 || maxHp > 99999) { g_in_safe_access = 0; continue; }
-
-            // 验证 curHp (offset 0x18): 应该是 0-99999
-            int32_t curHp = *(volatile int32_t *)(obj_addr + 0x18);
-            if (curHp < 0 || curHp > 99999) { g_in_safe_access = 0; continue; }
-
-            // 验证 level (offset 0x24): 应该是 0-100
-            int32_t level = *(volatile int32_t *)(obj_addr + 0x24);
-            if (level < 0 || level > 100) { g_in_safe_access = 0; continue; }
-
-            // 读取当前金币
-            int32_t *gold_ptr = (int32_t *)(obj_addr + 0x2c);
-            int32_t old_gold = *gold_ptr;
-            g_in_safe_access = 0;
-
-            scanned_count++;
-            LOGI("Found RoleInfo instance @ 0x%" PRIxPTR ": roleId=%d level=%d HP=%d/%d gold=%d",
-                 obj_addr, roleId, level, curHp, maxHp, old_gold);
-
-            // 修改金币
-            *gold_ptr = target_gold;
-            modified_count++;
-
-            LOGI("  => Gold modified: %d -> %d", old_gold, target_gold);
-
-            // ========== 修改技能 CD ==========
-            // RoleInfo.dungeonSkill @ offset 0x80 (UserSkillState*)
-            // UserSkillState: [0x10] skillId, [0x14] cd
-            uintptr_t dungeon_skill_ptr = *(volatile uintptr_t *)(obj_addr + 0x80);
-            if (dungeon_skill_ptr > 0x10000) {
-                int32_t *ds_cd_ptr = (int32_t *)(dungeon_skill_ptr + 0x14);
-                int32_t old_cd = *ds_cd_ptr;
-                if (old_cd > 0) {
-                    *ds_cd_ptr = 0;
-                    int32_t ds_id = *(int32_t *)(dungeon_skill_ptr + 0x10);
-                    LOGI("  => DungeonSkill id=%d CD: %d -> 0", ds_id, old_cd);
-                }
-            }
-
-            // RoleInfo.skills @ offset 0x88 (List<UserSkillState>*)
-            // List<T> layout: [klass(8)] [monitor(8)] [_items(8)] [_size(4)]
-            // _items is a C# array: [klass(8)] [monitor(8)] [length(8)] [elements...]
-            uintptr_t skills_list_ptr = *(volatile uintptr_t *)(obj_addr + 0x88);
-            if (skills_list_ptr > 0x10000) {
-                uintptr_t items_arr = *(volatile uintptr_t *)(skills_list_ptr + 0x10);
-                int32_t list_size = *(volatile int32_t *)(skills_list_ptr + 0x18);
-                if (items_arr > 0x10000 && list_size > 0 && list_size < 100) {
-                    // 数组元素从 offset 0x20 开始 (klass 8 + monitor 8 + length 8 + bounds 8 = 0x20)
-                    for (int si = 0; si < list_size; si++) {
-                        uintptr_t skill_obj = *(volatile uintptr_t *)(items_arr + 0x20 + si * sizeof(void*));
-                        if (skill_obj < 0x10000) continue;
-                        int32_t *s_cd_ptr = (int32_t *)(skill_obj + 0x14);
-                        int32_t old_s_cd = *s_cd_ptr;
-                        if (old_s_cd > 0) {
-                            *s_cd_ptr = 0;
-                            int32_t s_id = *(int32_t *)(skill_obj + 0x10);
-                            LOGI("  => Skill id=%d CD: %d -> 0", s_id, old_s_cd);
-                        }
+        }
+        // skills list @ 0x88
+        uintptr_t sl = *(volatile uintptr_t *)(obj_addr + 0x88);
+        if (sl > 0x10000) {
+            uintptr_t items = *(volatile uintptr_t *)(sl + 0x10);
+            int32_t sz = *(volatile int32_t *)(sl + 0x18);
+            if (items > 0x10000 && sz > 0 && sz < 100) {
+                for (int si = 0; si < sz; si++) {
+                    uintptr_t sk = *(volatile uintptr_t *)(items + 0x20 + si * sizeof(void*));
+                    if (sk < 0x10000) continue;
+                    int32_t *scd = (int32_t *)(sk + 0x14);
+                    if (*scd > 0) {
+                        int32_t sid = *(int32_t *)(sk + 0x10);
+                        LOGI("  => Skill id=%d CD: %d -> 0", sid, *scd);
+                        *scd = 0; count++;
                     }
                 }
             }
         }
+    });
+    LOGI("do_reset_skill_cd: reset %d skill(s)", count);
+    return count;
+}
+
+// ========== 同时修改金币和技能（兼容旧的一次性模式）==========
+static int modify_gold(int target_gold) {
+    if (init_il2cpp_context() != 0) return -1;
+    int gold_count = 0;
+    SCAN_ROLEINFO_INSTANCES({
+        // 修改金币
+        int32_t *gold_ptr = (int32_t *)(obj_addr + 0x2c);
+        int32_t old_gold = *gold_ptr;
+        *gold_ptr = target_gold;
+        gold_count++;
+        LOGI("  => Gold: %d -> %d", old_gold, target_gold);
+
+        // dungeonSkill CD
+        uintptr_t ds_ptr = *(volatile uintptr_t *)(obj_addr + 0x80);
+        if (ds_ptr > 0x10000) {
+            int32_t *cd = (int32_t *)(ds_ptr + 0x14);
+            if (*cd > 0) { LOGI("  => DungeonSkill CD: %d -> 0", *cd); *cd = 0; }
+        }
+        // skills list CD
+        uintptr_t sl = *(volatile uintptr_t *)(obj_addr + 0x88);
+        if (sl > 0x10000) {
+            uintptr_t items = *(volatile uintptr_t *)(sl + 0x10);
+            int32_t sz = *(volatile int32_t *)(sl + 0x18);
+            if (items > 0x10000 && sz > 0 && sz < 100) {
+                for (int si = 0; si < sz; si++) {
+                    uintptr_t sk = *(volatile uintptr_t *)(items + 0x20 + si * sizeof(void*));
+                    if (sk < 0x10000) continue;
+                    int32_t *scd = (int32_t *)(sk + 0x14);
+                    if (*scd > 0) { LOGI("  => Skill CD: %d -> 0", *scd); *scd = 0; }
+                }
+            }
+        }
+    });
+    return gold_count;
+}
+
+// ========== JNI native 方法实现（供 Java 悬浮菜单回调）==========
+static jstring JNICALL jni_modify_gold(JNIEnv *env, jclass clazz, jint amount) {
+    LOGI("[JNI] nativeModifyGold(%d)", (int)amount);
+    int count = do_modify_gold((int)amount);
+    char buf[128];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 金币已修改为 %d (%d个实例)", (int)amount, count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到实例(需在游戏对局中)");
+    else
+        snprintf(buf, sizeof(buf), "\u274C API 初始化失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
+static jstring JNICALL jni_reset_skill_cd(JNIEnv *env, jclass clazz) {
+    LOGI("[JNI] nativeResetSkillCD");
+    int count = do_reset_skill_cd();
+    char buf[128];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 已重置 %d 个技能CD", count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到需要重置的技能");
+    else
+        snprintf(buf, sizeof(buf), "\u274C API 初始化失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
+static JNINativeMethod g_jni_methods[] = {
+    { "nativeModifyGold",  "(I)Ljava/lang/String;", (void *)jni_modify_gold },
+    { "nativeResetSkillCD", "()Ljava/lang/String;",  (void *)jni_reset_skill_cd },
+};
+
+// ========== 通过 JNI 加载嵌入的 DEX 并创建悬浮菜单 ==========
+#ifdef OVERLAY_DEX
+static void create_overlay_menu(void) {
+    LOGI("[overlay] Creating in-game overlay menu...");
+
+    // 1. 获取 JavaVM
+    typedef jint (*JNI_GetCreatedJavaVMs_t)(JavaVM**, jsize, jsize*);
+    JNI_GetCreatedJavaVMs_t getVMs = NULL;
+
+    // 尝试从 libart.so 获取
+    void *art = dlopen("libart.so", RTLD_NOLOAD);
+    if (art) getVMs = (JNI_GetCreatedJavaVMs_t)dlsym(art, "JNI_GetCreatedJavaVMs");
+    if (!getVMs) {
+        // 尝试 libnativehelper.so
+        void *nh = dlopen("libnativehelper.so", RTLD_NOLOAD);
+        if (nh) getVMs = (JNI_GetCreatedJavaVMs_t)dlsym(nh, "JNI_GetCreatedJavaVMs");
+    }
+    if (!getVMs) {
+        LOGE("[overlay] Cannot find JNI_GetCreatedJavaVMs");
+        return;
     }
 
-    LOGI("Scan complete: found %d candidates, modified %d instances", scanned_count, modified_count);
-    uninstall_sigsegv_handler();
-    return modified_count;
+    JavaVM *jvm = NULL;
+    jsize vm_count = 0;
+    if (getVMs(&jvm, 1, &vm_count) != JNI_OK || vm_count == 0 || !jvm) {
+        LOGE("[overlay] No JavaVM found");
+        return;
+    }
+    LOGI("[overlay] JavaVM: %p", jvm);
+
+    // 2. 附加线程
+    JNIEnv *env = NULL;
+    int attached = 0;
+    jint res = (*jvm)->GetEnv(jvm, (void**)&env, JNI_VERSION_1_6);
+    if (res != JNI_OK) {
+        JavaVMAttachArgs args = { JNI_VERSION_1_6, "GoldHackOverlay", NULL };
+        if ((*jvm)->AttachCurrentThread(jvm, &env, &args) != JNI_OK) {
+            LOGE("[overlay] AttachCurrentThread failed");
+            return;
+        }
+        attached = 1;
+    }
+
+    // 3. 用 InMemoryDexClassLoader 加载 DEX（API 26+）
+    jclass ByteBuffer_cls = (*env)->FindClass(env, "java/nio/ByteBuffer");
+    jmethodID BB_allocateDirect = (*env)->GetStaticMethodID(env, ByteBuffer_cls,
+        "allocateDirect", "(I)Ljava/nio/ByteBuffer;");
+    jobject dex_buf = (*env)->CallStaticObjectMethod(env, ByteBuffer_cls,
+        BB_allocateDirect, (jint)overlay_dex_data_len);
+    // 拷贝 DEX 数据到 DirectByteBuffer
+    void *buf_addr = (*env)->GetDirectBufferAddress(env, dex_buf);
+    memcpy(buf_addr, overlay_dex_data, overlay_dex_data_len);
+
+    // 获取系统 ClassLoader
+    jclass Thread_cls = (*env)->FindClass(env, "java/lang/Thread");
+    jmethodID Thread_currentThread = (*env)->GetStaticMethodID(env, Thread_cls,
+        "currentThread", "()Ljava/lang/Thread;");
+    jobject curThread = (*env)->CallStaticObjectMethod(env, Thread_cls, Thread_currentThread);
+    jmethodID getContextCL = (*env)->GetMethodID(env, Thread_cls,
+        "getContextClassLoader", "()Ljava/lang/ClassLoader;");
+    jobject parentCL = (*env)->CallObjectMethod(env, curThread, getContextCL);
+
+    // 创建 InMemoryDexClassLoader
+    jclass IMDCL_cls = (*env)->FindClass(env, "dalvik/system/InMemoryDexClassLoader");
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        LOGE("[overlay] InMemoryDexClassLoader not found (API < 26?)");
+        goto cleanup;
+    }
+    jmethodID IMDCL_ctor = (*env)->GetMethodID(env, IMDCL_cls, "<init>",
+        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+    jobject dexLoader = (*env)->NewObject(env, IMDCL_cls, IMDCL_ctor, dex_buf, parentCL);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        LOGE("[overlay] Failed to create InMemoryDexClassLoader");
+        goto cleanup;
+    }
+    LOGI("[overlay] DexClassLoader created");
+
+    // 4. 加载 OverlayMenu 类
+    jmethodID loadClass = (*env)->GetMethodID(env,
+        (*env)->GetObjectClass(env, dexLoader),
+        "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring className = (*env)->NewStringUTF(env, "com.hack.menu.OverlayMenu");
+    jclass menuClass = (jclass)(*env)->CallObjectMethod(env, dexLoader, loadClass, className);
+    if ((*env)->ExceptionCheck(env) || !menuClass) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        LOGE("[overlay] Failed to load OverlayMenu class");
+        goto cleanup;
+    }
+    LOGI("[overlay] OverlayMenu class loaded");
+
+    // 5. 注册 native 方法
+    if ((*env)->RegisterNatives(env, menuClass, g_jni_methods, 2) != JNI_OK) {
+        LOGE("[overlay] RegisterNatives failed");
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionDescribe(env);
+            (*env)->ExceptionClear(env);
+        }
+        goto cleanup;
+    }
+    LOGI("[overlay] Native methods registered");
+
+    // 6. 获取 Activity（通过 UnityPlayer.currentActivity）
+    jclass unityPlayer = (*env)->FindClass(env, "com/unity3d/player/UnityPlayer");
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+        LOGE("[overlay] UnityPlayer class not found");
+        goto cleanup;
+    }
+    jfieldID actField = (*env)->GetStaticFieldID(env, unityPlayer,
+        "currentActivity", "Landroid/app/Activity;");
+    jobject activity = (*env)->GetStaticObjectField(env, unityPlayer, actField);
+    if (!activity) {
+        LOGE("[overlay] UnityPlayer.currentActivity is null");
+        goto cleanup;
+    }
+    LOGI("[overlay] Activity: %p", activity);
+
+    // 7. 调用 OverlayMenu.create(activity)
+    jmethodID createMethod = (*env)->GetStaticMethodID(env, menuClass,
+        "create", "(Landroid/app/Activity;)V");
+    (*env)->CallStaticVoidMethod(env, menuClass, createMethod, activity);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        LOGE("[overlay] OverlayMenu.create() failed");
+        goto cleanup;
+    }
+    LOGI("[overlay] OverlayMenu.create() called successfully!");
+
+cleanup:
+    // 注意: 不 DetachCurrentThread —— 线程会继续存活以处理后续 JNI 调用
+    if (attached) {
+        // 保持 attached 以便 JNI 回调可用
+        LOGI("[overlay] Thread stays attached for JNI callbacks");
+    }
 }
+#endif /* OVERLAY_DEX */
 
 // ========== 主工作线程 ==========
 static void *hack_thread(void *arg) {
@@ -657,8 +843,24 @@ static void *hack_thread(void *arg) {
         LOGI("API ready: %s @ %p", g_api_table[i].name, *g_api_table[i].func_ptr);
     }
 
-    // 5. 修改金币 + 技能 CD
-    LOGI("=== Modifying gold to %d & resetting skill CDs ===", target_gold);
+    // 5. 初始化 il2cpp 上下文（domain/image/class 缓存到全局）
+    if (init_il2cpp_context() != 0) {
+        LOGE("Failed to initialize il2cpp context");
+        return NULL;
+    }
+    LOGI("il2cpp context initialized");
+
+    // 6. 启动游戏内悬浮菜单
+#ifdef OVERLAY_DEX
+    LOGI("=== Creating overlay menu ===");
+    create_overlay_menu();
+    LOGI("=== Overlay menu launched, waiting for user interaction ===");
+    // 线程保持存活以处理 JNI 回调
+    // 菜单按钮触发 native 方法时会在 Java 线程中调用 do_modify_gold / do_reset_skill_cd
+    while (1) { sleep(3600); }
+#else
+    // 无 overlay 模式：直接执行一次性修改
+    LOGI("=== Modifying gold to %d & resetting skill CDs (one-shot mode) ===", target_gold);
     int count = modify_gold(target_gold);
     
     if (count > 0) {
@@ -677,6 +879,7 @@ static void *hack_thread(void *arg) {
     } else {
         LOGE("=== Gold modification failed ===");
     }
+#endif
 
     LOGI("=== GoldHack thread finished ===");
     return NULL;

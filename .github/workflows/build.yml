@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'gold_hack.c'
+      - 'OverlayMenu.java'
       - '.github/workflows/build.yml'
   workflow_dispatch:
     inputs:
@@ -11,6 +12,14 @@ on:
         description: '目标金币值'
         required: false
         default: '99999'
+      enable_overlay:
+        description: '启用游戏内悬浮菜单'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   build:
@@ -20,17 +29,87 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set gold value
+      - name: Set config
         id: config
         run: |
           GOLD="${{ github.event.inputs.target_gold }}"
           echo "gold=${GOLD:-99999}" >> $GITHUB_OUTPUT
+          OVERLAY="${{ github.event.inputs.enable_overlay }}"
+          echo "overlay=${OVERLAY:-true}" >> $GITHUB_OUTPUT
 
       - name: Find NDK
         id: ndk
         run: |
           echo "NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_OUTPUT
           ls $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang | tail -1
+
+      - name: Compile OverlayMenu.java to DEX
+        if: steps.config.outputs.overlay == 'true'
+        run: |
+          echo "=== Compiling OverlayMenu.java → DEX → C header ==="
+          
+          # 查找 android.jar
+          ANDROID_JAR=""
+          for api in 35 34 33 32 31 30; do
+            JAR="$ANDROID_HOME/platforms/android-$api/android.jar"
+            if [ -f "$JAR" ]; then
+              ANDROID_JAR="$JAR"
+              echo "Using android.jar: $JAR"
+              break
+            fi
+          done
+          if [ -z "$ANDROID_JAR" ]; then
+            echo "ERROR: No android.jar found"
+            ls $ANDROID_HOME/platforms/ 2>/dev/null
+            exit 1
+          fi
+          
+          # 查找 d8
+          D8=""
+          for dir in $(ls -d $ANDROID_HOME/build-tools/* 2>/dev/null | sort -V -r); do
+            if [ -f "$dir/d8" ]; then
+              D8="$dir/d8"
+              echo "Using d8: $D8"
+              break
+            fi
+          done
+          if [ -z "$D8" ]; then
+            echo "ERROR: d8 not found"
+            ls $ANDROID_HOME/build-tools/ 2>/dev/null
+            exit 1
+          fi
+          
+          # 1. javac → .class
+          mkdir -p build_java
+          javac -source 8 -target 8 \
+            -cp "$ANDROID_JAR" \
+            -d build_java \
+            OverlayMenu.java \
+            2>&1 | tee javac_log.txt
+          
+          echo "Compiled classes:"
+          find build_java -name '*.class' -ls
+          
+          # 2. d8 → classes.dex
+          mkdir -p build_dex
+          $D8 \
+            --min-api 26 \
+            --output build_dex \
+            $(find build_java -name '*.class')
+          
+          ls -lh build_dex/classes.dex
+          
+          # 3. xxd → overlay_dex.h
+          xxd -i build_dex/classes.dex > overlay_dex.h
+          # 修正变量名（xxd 生成的名字含路径斜杠）
+          sed -i 's/build_dex__classes_dex/overlay_dex_data/g' overlay_dex.h
+          sed -i 's/build_dex_classes_dex/overlay_dex_data/g' overlay_dex.h
+          
+          echo "=== overlay_dex.h ==="
+          head -5 overlay_dex.h
+          echo "..."
+          tail -3 overlay_dex.h
+          wc -c build_dex/classes.dex
 
       - name: Build arm64-v8a
         run: |
@@ -50,10 +129,20 @@ jobs:
           echo "Using compiler: $CC"
           $CC --version
           
-          # 编译，将错误输出到文件
+          # 设置 overlay 编译标志
+          OVERLAY_FLAGS=""
+          if [ "${{ steps.config.outputs.overlay }}" = "true" ] && [ -f overlay_dex.h ]; then
+            OVERLAY_FLAGS="-DOVERLAY_DEX -include overlay_dex.h"
+            echo "Overlay DEX enabled"
+          else
+            echo "Overlay DEX disabled (one-shot mode)"
+          fi
+          
+          # 编译
           $CC \
             -shared -fPIC -O2 \
             -DTARGET_GOLD=${{ steps.config.outputs.gold }} \
+            $OVERLAY_FLAGS \
             -o libgoldhack.so \
             gold_hack.c \
             -llog -lc \
@@ -86,9 +175,15 @@ jobs:
           fi
           echo "Using compiler: $CC"
           
+          OVERLAY_FLAGS=""
+          if [ "${{ steps.config.outputs.overlay }}" = "true" ] && [ -f overlay_dex.h ]; then
+            OVERLAY_FLAGS="-DOVERLAY_DEX -include overlay_dex.h"
+          fi
+          
           $CC \
             -shared -fPIC -O2 \
             -DTARGET_GOLD=${{ steps.config.outputs.gold }} \
+            $OVERLAY_FLAGS \
             -o libgoldhack_armv7a.so \
             gold_hack.c \
             -llog -lc \

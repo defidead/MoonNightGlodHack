@@ -6,7 +6,7 @@ inject.py - 通过 Frida 将 libgoldhack.so 注入到游戏进程
 使用:
   python3 inject.py                  # attach 模式（游戏须已运行）
   python3 inject.py --spawn          # spawn 模式（自动重启游戏）
-  python3 inject.py --gold 888888    # 自定义金币值（需重新编译）
+  python3 inject.py --no-detach      # 注入后保持连接（悬浮菜单模式）
 """
 
 import frida
@@ -15,6 +15,7 @@ import time
 import subprocess
 import argparse
 import os
+import signal
 
 PACKAGE = "com.ztgame.yyzy"
 SO_NAME = "libgoldhack.so"
@@ -38,7 +39,7 @@ def push_so():
     print(f"[+] Pushed to {REMOTE_PATH}")
     return True
 
-def inject_attach(device, wait_time=20):
+def inject_attach(device, wait_time=20, no_detach=False):
     """attach 模式: 附加到运行中的进程"""
     print(f"[*] Looking for {PACKAGE}...")
     
@@ -76,8 +77,16 @@ def inject_attach(device, wait_time=20):
     if result.get('type') == 'loaded':
         print(f"[+] {SO_NAME} loaded at {result.get('base')}")
     
-    print(f"[*] Waiting {wait_time}s for hack to complete...")
-    time.sleep(wait_time)
+    if no_detach:
+        print(f"[*] Overlay mode: keeping connection alive. Press Ctrl+C to exit.")
+        print(f"[*] Watch logcat: adb logcat -s GoldHack")
+        try:
+            signal.pause()
+        except KeyboardInterrupt:
+            print("\n[*] Detaching...")
+    else:
+        print(f"[*] Waiting {wait_time}s for hack to complete...")
+        time.sleep(wait_time)
     
     try:
         script.unload()
@@ -87,7 +96,7 @@ def inject_attach(device, wait_time=20):
     
     return True
 
-def inject_spawn(device, wait_time=30):
+def inject_spawn(device, wait_time=30, no_detach=False):
     """spawn 模式: 重启游戏并注入"""
     print(f"[*] Killing {PACKAGE}...")
     subprocess.run(["adb", "shell", f"am force-stop {PACKAGE}"], capture_output=True)
@@ -121,9 +130,19 @@ def inject_spawn(device, wait_time=30):
         print(f"[+] {SO_NAME} loaded at {result.get('base')}")
     
     device.resume(pid)
-    print(f"[*] Game resumed, waiting {wait_time}s for hack to complete...")
-    print(f"[*] Watch logcat: adb logcat -s GoldHack")
-    time.sleep(wait_time)
+    
+    if no_detach:
+        print(f"[*] Game resumed. Overlay mode: keeping connection alive.")
+        print(f"[*] Watch logcat: adb logcat -s GoldHack")
+        print(f"[*] Press Ctrl+C to exit.")
+        try:
+            signal.pause()
+        except KeyboardInterrupt:
+            print("\n[*] Detaching...")
+    else:
+        print(f"[*] Game resumed, waiting {wait_time}s for hack to complete...")
+        print(f"[*] Watch logcat: adb logcat -s GoldHack")
+        time.sleep(wait_time)
     
     try:
         script.unload()
@@ -138,6 +157,8 @@ def main():
     parser.add_argument("--spawn", action="store_true", help="重启游戏并注入（默认attach到已运行的进程）")
     parser.add_argument("--wait", type=int, default=30, help="等待时间(秒)")
     parser.add_argument("--skip-push", action="store_true", help="跳过推送.so步骤")
+    parser.add_argument("--no-detach", action="store_true",
+                        help="注入后保持连接（悬浮菜单模式需要，Ctrl+C退出）")
     args = parser.parse_args()
 
     # 推送 .so
@@ -155,9 +176,9 @@ def main():
 
     # 注入
     if args.spawn:
-        success = inject_spawn(device, args.wait)
+        success = inject_spawn(device, args.wait, args.no_detach)
     else:
-        success = inject_attach(device, args.wait)
+        success = inject_attach(device, args.wait, args.no_detach)
 
     if success:
         print("\n[*] Done! Check logcat for results:")

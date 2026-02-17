@@ -121,10 +121,10 @@ static int parse_maps(void) {
         MemRegion *r = &g_regions[g_region_count];
         char perms[8] = {0};
         unsigned long long start, end, offset, inode;
-        int dev_major, dev_minor;
+        unsigned int dev_major, dev_minor;
         char path[512] = {0};
 
-        int n = sscanf(line, "%llx-%llx %4s %llx %d:%d %llu %511[^\n]",
+        int n = sscanf(line, "%llx-%llx %4s %llx %x:%x %llu %511[^\n]",
                        &start, &end, perms, &offset, &dev_major, &dev_minor, &inode, path);
         if (n < 7) continue;
 

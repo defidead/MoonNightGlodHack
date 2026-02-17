@@ -171,6 +171,115 @@ static uintptr_t find_il2cpp_base(void) {
     return 0;
 }
 
+// 获取 libil2cpp.so 在内存中的总映射大小（用作缓存校验 key）
+static size_t get_il2cpp_total_size(void) {
+    uintptr_t lo = UINTPTR_MAX, hi = 0;
+    for (int i = 0; i < g_region_count; i++) {
+        if (strstr(g_regions[i].path, "libil2cpp.so")) {
+            if (g_regions[i].start < lo) lo = g_regions[i].start;
+            if (g_regions[i].end > hi)   hi = g_regions[i].end;
+        }
+    }
+    return (hi > lo) ? (size_t)(hi - lo) : 0;
+}
+
+// ========== API 偏移缓存（加速下次启动）==========
+// 使用游戏自身的 cache 目录，注入进程有读写权限
+#define API_CACHE_PATH "/data/data/com.ztgame.yyzy/cache/goldhack_api.bin"
+#define API_CACHE_MAGIC 0x47484B43  // "GHKC"
+
+typedef struct {
+    uint32_t magic;
+    uint32_t api_count;
+    uint64_t il2cpp_size;   // 校验：libil2cpp.so 映射大小
+    uint64_t offsets[API_COUNT]; // 每个 API 相对于 il2cpp_base 的偏移
+} ApiCache;
+
+static void save_api_cache(uintptr_t il2cpp_base) {
+    ApiCache cache;
+    memset(&cache, 0, sizeof(cache));
+    cache.magic = API_CACHE_MAGIC;
+    cache.api_count = API_COUNT;
+    cache.il2cpp_size = (uint64_t)get_il2cpp_total_size();
+    
+    for (int i = 0; i < API_COUNT && g_api_table[i].name; i++) {
+        void *fn = *g_api_table[i].func_ptr;
+        if (fn) {
+            cache.offsets[i] = (uint64_t)((uintptr_t)fn - il2cpp_base);
+        }
+    }
+    
+    FILE *fp = fopen(API_CACHE_PATH, "wb");
+    if (fp) {
+        fwrite(&cache, sizeof(cache), 1, fp);
+        fclose(fp);
+        LOGI("[cache] Saved API cache to %s (il2cpp_size=0x%llx)",
+             API_CACHE_PATH, (unsigned long long)cache.il2cpp_size);
+    } else {
+        LOGW("[cache] Failed to save cache: %s", API_CACHE_PATH);
+    }
+}
+
+// 返回 0=成功加载, -1=无缓存或不匹配
+static int load_api_cache(uintptr_t il2cpp_base) {
+    FILE *fp = fopen(API_CACHE_PATH, "rb");
+    if (!fp) {
+        LOGI("[cache] No cache file found");
+        return -1;
+    }
+    
+    ApiCache cache;
+    size_t rd = fread(&cache, 1, sizeof(cache), fp);
+    fclose(fp);
+    
+    if (rd != sizeof(cache) || cache.magic != API_CACHE_MAGIC || cache.api_count != API_COUNT) {
+        LOGW("[cache] Cache file invalid or version mismatch");
+        return -1;
+    }
+    
+    // 校验 libil2cpp.so 大小是否一致（检测游戏更新）
+    uint64_t cur_size = (uint64_t)get_il2cpp_total_size();
+    if (cache.il2cpp_size != cur_size) {
+        LOGW("[cache] il2cpp size mismatch: cached=0x%llx cur=0x%llx (game updated?)",
+             (unsigned long long)cache.il2cpp_size, (unsigned long long)cur_size);
+        return -1;
+    }
+    
+    // 恢复 API 指针
+    int loaded = 0;
+    for (int i = 0; i < API_COUNT && g_api_table[i].name; i++) {
+        if (cache.offsets[i] == 0) continue;
+        uintptr_t addr = il2cpp_base + (uintptr_t)cache.offsets[i];
+        // 验证地址在某个可读区域内
+        int valid = 0;
+        for (int r = 0; r < g_region_count; r++) {
+            if (g_regions[r].readable && addr >= g_regions[r].start && addr < g_regions[r].end) {
+                valid = 1; break;
+            }
+        }
+        if (valid) {
+            *g_api_table[i].func_ptr = (void *)addr;
+            loaded++;
+            LOGI("[cache] Restored %s @ %p (offset=0x%llx)",
+                 g_api_table[i].name, (void*)addr, (unsigned long long)cache.offsets[i]);
+        } else {
+            LOGW("[cache] Invalid address for %s: 0x%" PRIxPTR, g_api_table[i].name, addr);
+        }
+    }
+    
+    if (loaded == API_COUNT) {
+        LOGI("[cache] All %d APIs restored from cache", loaded);
+        return 0;
+    }
+    
+    // 部分加载失败，清空
+    LOGW("[cache] Only %d/%d APIs restored, falling back to scan", loaded, API_COUNT);
+    for (int i = 0; g_api_table[i].name; i++) {
+        *g_api_table[i].func_ptr = NULL;
+    }
+    return -1;
+}
+
 // ========== 安全内存读取 ==========
 static int safe_read(uintptr_t addr, void *buf, size_t len) {
     // 检查地址是否在已知的可读区域内
@@ -901,12 +1010,19 @@ static void *hack_thread(void *arg) {
         return NULL;
     }
 
-    // 3. 尝试获取 il2cpp API
+    // 3. 尝试获取 il2cpp API（优先从缓存加载）
     LOGI("Attempting to resolve il2cpp APIs...");
     
-    // 方法1: 先尝试 dlsym（无保护的情况下）
-    if (try_dlsym_apis() == 0) {
+    int api_from_cache = 0;
+    // 方法0: 从缓存文件加载（最快）
+    if (load_api_cache(il2cpp_base) == 0) {
+        LOGI("All APIs restored from cache (<1ms)");
+        api_from_cache = 1;
+    }
+    // 方法1: 尝试 dlsym（无保护的情况下）
+    else if (try_dlsym_apis() == 0) {
         LOGI("All APIs resolved via dlsym");
+        save_api_cache(il2cpp_base);
     } else {
         // 方法2: 内存扫描（绕过 MHP 保护）
         LOGI("dlsym failed, falling back to memory scan...");
@@ -922,6 +1038,7 @@ static void *hack_thread(void *arg) {
             }
             return NULL;
         }
+        save_api_cache(il2cpp_base);
     }
 
     // 4. 验证所有 API 已就位

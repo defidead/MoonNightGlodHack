@@ -171,16 +171,16 @@ static uintptr_t find_il2cpp_base(void) {
     return 0;
 }
 
-// 获取 libil2cpp.so 在内存中的总映射大小（用作缓存校验 key）
-static size_t get_il2cpp_total_size(void) {
-    uintptr_t lo = UINTPTR_MAX, hi = 0;
-    for (int i = 0; i < g_region_count; i++) {
-        if (strstr(g_regions[i].path, "libil2cpp.so")) {
-            if (g_regions[i].start < lo) lo = g_regions[i].start;
-            if (g_regions[i].end > hi)   hi = g_regions[i].end;
-        }
+// 计算 libil2cpp.so ELF header 哈希（前256字节，稳定不受 ASLR 影响）
+static uint64_t get_il2cpp_elf_hash(uintptr_t il2cpp_base) {
+    // FNV-1a 64-bit
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    const uint8_t *p = (const uint8_t *)il2cpp_base;
+    for (int i = 0; i < 256; i++) {
+        hash ^= p[i];
+        hash *= 0x100000001b3ULL;
     }
-    return (hi > lo) ? (size_t)(hi - lo) : 0;
+    return hash;
 }
 
 // ========== API 偏移缓存（加速下次启动）==========
@@ -237,7 +237,7 @@ static const char *get_cache_path(void) {
 typedef struct {
     uint32_t magic;
     uint32_t api_count;
-    uint64_t il2cpp_size;   // 校验：libil2cpp.so 映射大小
+    uint64_t elf_hash;      // 校验：libil2cpp.so ELF header 哈希
     uint64_t offsets[API_COUNT]; // 每个 API 相对于 il2cpp_base 的偏移
 } ApiCache;
 
@@ -246,7 +246,7 @@ static void save_api_cache(uintptr_t il2cpp_base) {
     memset(&cache, 0, sizeof(cache));
     cache.magic = API_CACHE_MAGIC;
     cache.api_count = API_COUNT;
-    cache.il2cpp_size = (uint64_t)get_il2cpp_total_size();
+    cache.elf_hash = get_il2cpp_elf_hash(il2cpp_base);
     
     for (int i = 0; i < API_COUNT && g_api_table[i].name; i++) {
         void *fn = *g_api_table[i].func_ptr;
@@ -260,8 +260,8 @@ static void save_api_cache(uintptr_t il2cpp_base) {
     if (fp) {
         fwrite(&cache, sizeof(cache), 1, fp);
         fclose(fp);
-        LOGI("[cache] Saved API cache to %s (il2cpp_size=0x%llx)",
-             path, (unsigned long long)cache.il2cpp_size);
+        LOGI("[cache] Saved API cache to %s (elf_hash=0x%llx)",
+             path, (unsigned long long)cache.elf_hash);
     } else {
         LOGW("[cache] Failed to save cache: %s", path);
     }
@@ -285,11 +285,11 @@ static int load_api_cache(uintptr_t il2cpp_base) {
         return -1;
     }
     
-    // 校验 libil2cpp.so 大小是否一致（检测游戏更新）
-    uint64_t cur_size = (uint64_t)get_il2cpp_total_size();
-    if (cache.il2cpp_size != cur_size) {
-        LOGW("[cache] il2cpp size mismatch: cached=0x%llx cur=0x%llx (game updated?)",
-             (unsigned long long)cache.il2cpp_size, (unsigned long long)cur_size);
+    // 校验 ELF header 哈希（检测游戏更新）
+    uint64_t cur_hash = get_il2cpp_elf_hash(il2cpp_base);
+    if (cache.elf_hash != cur_hash) {
+        LOGW("[cache] elf_hash mismatch: cached=0x%llx cur=0x%llx (game updated?)",
+             (unsigned long long)cache.elf_hash, (unsigned long long)cur_hash);
         return -1;
     }
     
@@ -446,6 +446,8 @@ static void scan_api_strings(void) {
         // 跳过 GPU/DMA/框架相关的大区域以避免崩溃
         if (strstr(region->path, "/dmabuf") || strstr(region->path, "/gpu") ||
             strstr(region->path, "kgsl") || strstr(region->path, "mali")) continue;
+        // 跳过自身注入的 .so（其中包含 API 字符串字面量会干扰结果）
+        if (strstr(region->path, "goldhack") || strstr(region->path, "Inject So")) continue;
         // 跳过超大的匿名区域（>50MB，不太可能包含 API 字符串）
         if (region->path[0] == '\0' && size > 50 * 1024 * 1024) continue;
 

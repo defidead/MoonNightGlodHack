@@ -275,14 +275,15 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         if (id == BTN_TOGGLE) {
             collapsed = !collapsed;
             if (collapsed) {
-                contentArea.setVisibility(View.GONE);
+                container.removeView(contentArea);
                 toggleBtn.setText("+");
-                wmParams.width = dp(120);
+                wmParams.width = ViewGroup.LayoutParams.WRAP_CONTENT;
             } else {
-                contentArea.setVisibility(View.VISIBLE);
+                container.addView(contentArea);
                 toggleBtn.setText("\u2014");
                 wmParams.width = dp(220);
             }
+            wmParams.height = ViewGroup.LayoutParams.WRAP_CONTENT;
             try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
         } else if (id == BTN_GOLD) {
             doGoldModify();

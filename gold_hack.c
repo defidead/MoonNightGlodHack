@@ -184,9 +184,55 @@ static size_t get_il2cpp_total_size(void) {
 }
 
 // ========== API 偏移缓存（加速下次启动）==========
-// 使用游戏自身的 cache 目录，注入进程有读写权限
-#define API_CACHE_PATH "/data/data/com.ztgame.yyzy/cache/goldhack_api.bin"
 #define API_CACHE_MAGIC 0x47484B43  // "GHKC"
+#define API_CACHE_FILENAME "goldhack_api.bin"
+
+// 运行时获取缓存文件路径（从 /proc/self/cmdline 读包名 → /data/user/0/<pkg>/cache/）
+static char g_cache_path[512] = {0};
+
+static const char *get_cache_path(void) {
+    if (g_cache_path[0]) return g_cache_path;
+
+    char pkg[256] = {0};
+    FILE *fp = fopen("/proc/self/cmdline", "r");
+    if (fp) {
+        fread(pkg, 1, sizeof(pkg) - 1, fp);
+        fclose(fp);
+    }
+    // cmdline 可能含尾部 NUL/参数，只取第一段
+    for (int i = 0; i < (int)sizeof(pkg); i++) {
+        if (pkg[i] == '\0' || pkg[i] == '\n') { pkg[i] = '\0'; break; }
+    }
+    if (pkg[0] == '\0') {
+        strncpy(pkg, "com.ztgame.yyzy", sizeof(pkg) - 1); // fallback
+    }
+
+    // 优先尝试 /data/user/0/<pkg>/cache/ （多用户设备标准路径）
+    // 再 fallback /data/data/<pkg>/cache/
+    const char *bases[] = { "/data/user/0", "/data/data", NULL };
+    for (int i = 0; bases[i]; i++) {
+        snprintf(g_cache_path, sizeof(g_cache_path), "%s/%s/cache", bases[i], pkg);
+        // 测试目录是否可写：尝试打开一个临时文件
+        char test[560];
+        snprintf(test, sizeof(test), "%s/.goldhack_test", g_cache_path);
+        FILE *tf = fopen(test, "w");
+        if (tf) {
+            fclose(tf);
+            remove(test);
+            LOGI("[cache] Using cache dir: %s", g_cache_path);
+            // 拼接完整文件路径
+            char tmp[512];
+            snprintf(tmp, sizeof(tmp), "%s/%s", g_cache_path, API_CACHE_FILENAME);
+            strncpy(g_cache_path, tmp, sizeof(g_cache_path) - 1);
+            return g_cache_path;
+        }
+    }
+    // 都失败了，仍然用第一个路径（写入时会报错但不影响功能）
+    snprintf(g_cache_path, sizeof(g_cache_path), "%s/%s/cache/%s",
+             bases[0], pkg, API_CACHE_FILENAME);
+    LOGW("[cache] No writable cache dir found, will use: %s", g_cache_path);
+    return g_cache_path;
+}
 
 typedef struct {
     uint32_t magic;
@@ -209,20 +255,22 @@ static void save_api_cache(uintptr_t il2cpp_base) {
         }
     }
     
-    FILE *fp = fopen(API_CACHE_PATH, "wb");
+    const char *path = get_cache_path();
+    FILE *fp = fopen(path, "wb");
     if (fp) {
         fwrite(&cache, sizeof(cache), 1, fp);
         fclose(fp);
         LOGI("[cache] Saved API cache to %s (il2cpp_size=0x%llx)",
-             API_CACHE_PATH, (unsigned long long)cache.il2cpp_size);
+             path, (unsigned long long)cache.il2cpp_size);
     } else {
-        LOGW("[cache] Failed to save cache: %s", API_CACHE_PATH);
+        LOGW("[cache] Failed to save cache: %s", path);
     }
 }
 
 // 返回 0=成功加载, -1=无缓存或不匹配
 static int load_api_cache(uintptr_t il2cpp_base) {
-    FILE *fp = fopen(API_CACHE_PATH, "rb");
+    const char *path = get_cache_path();
+    FILE *fp = fopen(path, "rb");
     if (!fp) {
         LOGI("[cache] No cache file found");
         return -1;

@@ -323,6 +323,10 @@ static int resolve_apis_from_pairs(void) {
     int resolved = 0;
     int scanned_pair_regions = 0;
 
+    // 分两轮：第一轮只接受 offset+1，第二轮尝试 offset+2
+    // 确保同一张表的 API 优先（正确的表通常都是 offset+1）
+    for (int target_off = 1; target_off <= 2 && resolved < API_COUNT; target_off++) {
+    
     for (int r = 0; r < g_region_count; r++) {
         MemRegion *region = &g_regions[r];
         // 必须 rw-（非可执行）
@@ -339,7 +343,7 @@ static int resolve_apis_from_pairs(void) {
         // 跳过太大的匿名区域（>50MB）
         if (region->path[0] == '\0' && size > 50 * 1024 * 1024) continue;
 
-        scanned_pair_regions++;
+        if (target_off == 1) scanned_pair_regions++;
 
         install_sigsegv_handler();
 
@@ -350,7 +354,9 @@ static int resolve_apis_from_pairs(void) {
             g_in_safe_access = 1;
             if (sigsetjmp(g_jmpbuf, 1) != 0) {
                 g_in_safe_access = 0;
-                LOGW("[scan] SIGSEGV in resolve_apis_from_pairs at region 0x%" PRIxPTR, region->start);
+                if (target_off == 1) {
+                    LOGW("[scan] SIGSEGV in resolve_apis_from_pairs at region 0x%" PRIxPTR, region->start);
+                }
                 break; // 跳出 for 循环，跳到下一个区域
             }
             uintptr_t val1 = *(volatile uintptr_t *)addr;          // 可能是 string_ptr
@@ -367,9 +373,9 @@ static int resolve_apis_from_pairs(void) {
                     // 检查这个 API 是否已经解析过
                     if (*g_api_table[api_idx].func_ptr != NULL) continue;
 
-                    // 配对结构是 {name_ptr, ???, func_ptr}（3个指针，步长0x18）
-                    // 只尝试偏移 +1 和 +2，+3 是下一条 entry 的 name_ptr
-                    for (int off = 1; off <= 2; off++) {
+                    // 只尝试当前轮次的偏移
+                    {
+                        int off = target_off;
                         g_in_safe_access = 1;
                         if (sigsetjmp(g_jmpbuf, 1) != 0) {
                             g_in_safe_access = 0;
@@ -392,7 +398,7 @@ static int resolve_apis_from_pairs(void) {
                         }
                         if (is_known_string) continue;
 
-                        // 验证函数指针指向某个已映射的区域（不要求 r-x，MHP 可能重定向）
+                        // 验证函数指针指向某个已映射的区域
                         int valid_ptr = 0;
                         for (int c = 0; c < g_region_count; c++) {
                             if (candidate >= g_regions[c].start && candidate < g_regions[c].end) {
@@ -408,7 +414,6 @@ static int resolve_apis_from_pairs(void) {
                             resolved++;
                             LOGI("[scan] Resolved %s @ 0x%" PRIxPTR " (string @ 0x%" PRIxPTR ", pair @ 0x%" PRIxPTR ", offset +%d)",
                                  g_api_table[api_idx].name, candidate, val1, addr, off);
-                            break; // 找到了，不再尝试其他偏移
                         }
                     }
                 }
@@ -418,6 +423,12 @@ static int resolve_apis_from_pairs(void) {
             if (resolved >= API_COUNT) goto done;
         }
     }
+    
+    if (target_off == 1) {
+        LOGI("[scan] Pass 1 (offset+1): resolved %d/%d APIs", resolved, API_COUNT);
+    }
+    
+    } // end target_off loop
 
 done:
     uninstall_sigsegv_handler();
@@ -467,7 +478,9 @@ static int modify_gold(int target_gold) {
     LOGI("Found Assembly-CSharp.dll: %p", csharp_image);
 
     // 3. 查找 RoleInfo 类
+    LOGI("Calling il2cpp_class_from_name @ %p (image=%p, ns='', name='RoleInfo')", (void*)fn_class_from_name, csharp_image);
     Il2CppClass roleInfoClass = fn_class_from_name(csharp_image, "", "RoleInfo");
+    LOGI("il2cpp_class_from_name returned: %p", roleInfoClass);
     if (!roleInfoClass) {
         LOGE("RoleInfo class not found");
         return -1;

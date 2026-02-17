@@ -238,8 +238,17 @@ typedef struct {
     uint32_t magic;
     uint32_t api_count;
     uint64_t elf_hash;      // 校验：libil2cpp.so ELF header 哈希
-    uint64_t offsets[API_COUNT]; // 每个 API 相对于 il2cpp_base 的偏移
+    uint64_t str_offsets[API_COUNT];  // 各 API 字符串相对 il2cpp_base 的偏移
+    int32_t  func_delta[API_COUNT];   // 函数指针相对 pair entry 的偏移 (func - pair_addr)
+    uint64_t pair_stride;             // pair 表项间距（字节数）
 } ApiCache;
+
+// 全局记录 pair 信息（供缓存使用）
+static uintptr_t g_pair_addrs[API_COUNT] = {0};
+
+// 前向声明（memmem_find_safe 在后面定义，load_api_cache 需要提前引用）
+static uintptr_t memmem_find_safe(uintptr_t haystack, size_t haystack_len,
+                                   const void *needle, size_t needle_len);
 
 static void save_api_cache(uintptr_t il2cpp_base) {
     ApiCache cache;
@@ -248,11 +257,18 @@ static void save_api_cache(uintptr_t il2cpp_base) {
     cache.api_count = API_COUNT;
     cache.elf_hash = get_il2cpp_elf_hash(il2cpp_base);
     
+    // 保存字符串偏移和 func 相对 pair 的 delta
     for (int i = 0; i < API_COUNT && g_api_table[i].name; i++) {
         void *fn = *g_api_table[i].func_ptr;
-        if (fn) {
-            cache.offsets[i] = (uint64_t)((uintptr_t)fn - il2cpp_base);
+        if (fn && g_pair_addrs[i]) {
+            cache.str_offsets[i] = 0; // 不用，用 pair_stride 即可
+            cache.func_delta[i] = (int32_t)((intptr_t)(uintptr_t)fn - (intptr_t)g_pair_addrs[i]);
         }
+    }
+    // 计算 pair stride（前两个 pair 的间距）
+    if (g_pair_addrs[0] && g_pair_addrs[1]) {
+        cache.pair_stride = (uint64_t)(g_pair_addrs[1] > g_pair_addrs[0] ?
+            g_pair_addrs[1] - g_pair_addrs[0] : g_pair_addrs[0] - g_pair_addrs[1]);
     }
     
     const char *path = get_cache_path();
@@ -260,8 +276,8 @@ static void save_api_cache(uintptr_t il2cpp_base) {
     if (fp) {
         fwrite(&cache, sizeof(cache), 1, fp);
         fclose(fp);
-        LOGI("[cache] Saved API cache to %s (elf_hash=0x%llx)",
-             path, (unsigned long long)cache.elf_hash);
+        LOGI("[cache] Saved API cache to %s (elf_hash=0x%llx, pair_stride=%llu)",
+             path, (unsigned long long)cache.elf_hash, (unsigned long long)cache.pair_stride);
     } else {
         LOGW("[cache] Failed to save cache: %s", path);
     }
@@ -293,34 +309,101 @@ static int load_api_cache(uintptr_t il2cpp_base) {
         return -1;
     }
     
-    // 恢复 API 指针
+    if (cache.pair_stride == 0 || cache.func_delta[0] == 0) {
+        LOGW("[cache] Cache has no pair info, falling back to scan");
+        return -1;
+    }
+    
+    // 策略：在 rw- 区域搜索第一个 API 字符串的指针，然后用 stride+delta 恢复所有 API
+    // 计算第一个 API 字符串的当前地址（在 libil2cpp.so 的只读段中搜索）
+    const char *first_api = g_api_table[0].name;
+    size_t name_len = strlen(first_api) + 1;
+    uintptr_t str_addr = 0;
+    
+    install_sigsegv_handler();
+    for (int r = 0; r < g_region_count; r++) {
+        if (!g_regions[r].readable || g_regions[r].writable) continue; // 只看 r-- 或 r-x
+        if (!strstr(g_regions[r].path, "libil2cpp.so")) continue;
+        size_t size = g_regions[r].end - g_regions[r].start;
+        if (size < name_len) continue;
+        uintptr_t found = memmem_find_safe(g_regions[r].start, size, first_api, name_len);
+        if (found) { str_addr = found; break; }
+    }
+    if (!str_addr) {
+        uninstall_sigsegv_handler();
+        LOGW("[cache] Cannot find string '%s' in il2cpp ro sections", first_api);
+        return -1;
+    }
+    LOGI("[cache] Found string '%s' @ 0x%" PRIxPTR, first_api, str_addr);
+    
+    // 在 rw- 区域搜索包含该字符串指针的 pair entry
+    uintptr_t pair0_addr = 0;
+    for (int r = 0; r < g_region_count && !pair0_addr; r++) {
+        if (!g_regions[r].readable || !g_regions[r].writable || g_regions[r].executable) continue;
+        size_t size = g_regions[r].end - g_regions[r].start;
+        if (size < 16 || size > MAX_SCAN_SIZE) continue;
+        if (g_regions[r].path[0] == '\0' && size > 50 * 1024 * 1024) continue;
+        
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) {
+            g_in_safe_access = 0;
+            continue;
+        }
+        for (uintptr_t a = g_regions[r].start; a <= g_regions[r].end - cache.pair_stride * API_COUNT; a += sizeof(void*)) {
+            if (*(volatile uintptr_t *)a == str_addr) {
+                // 验证后续条目也匹配（第二个 API 字符串在 pair+stride 处）
+                uintptr_t next_name = *(volatile uintptr_t *)(a + cache.pair_stride);
+                if (next_name > 0x10000 && next_name != str_addr) {
+                    pair0_addr = a;
+                    break;
+                }
+            }
+        }
+        g_in_safe_access = 0;
+    }
+    
+    if (!pair0_addr) {
+        uninstall_sigsegv_handler();
+        LOGW("[cache] Cannot find pair table entry for '%s'", first_api);
+        return -1;
+    }
+    LOGI("[cache] Found pair table @ 0x%" PRIxPTR " (stride=%llu)", pair0_addr, (unsigned long long)cache.pair_stride);
+    
+    // 从 pair table + delta 恢复所有 API
     int loaded = 0;
     for (int i = 0; i < API_COUNT && g_api_table[i].name; i++) {
-        if (cache.offsets[i] == 0) continue;
-        uintptr_t addr = il2cpp_base + (uintptr_t)cache.offsets[i];
-        // 验证地址在某个可读区域内
+        uintptr_t pair_i = pair0_addr + i * (uintptr_t)cache.pair_stride;
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        uintptr_t func = (uintptr_t)((intptr_t)pair_i + cache.func_delta[i]);
+        g_in_safe_access = 0;
+        
+        // 验证函数地址对齐且可执行
+        if (func % 4 != 0 || func < 0x10000) continue;
         int valid = 0;
-        for (int r = 0; r < g_region_count; r++) {
-            if (g_regions[r].readable && addr >= g_regions[r].start && addr < g_regions[r].end) {
-                valid = 1; break;
+        for (int c = 0; c < g_region_count; c++) {
+            if (func >= g_regions[c].start && func < g_regions[c].end) {
+                if (g_regions[c].executable) valid = 1;
+                break;
             }
         }
         if (valid) {
-            *g_api_table[i].func_ptr = (void *)addr;
+            *g_api_table[i].func_ptr = (void *)func;
+            g_pair_addrs[i] = pair_i;
             loaded++;
-            LOGI("[cache] Restored %s @ %p (offset=0x%llx)",
-                 g_api_table[i].name, (void*)addr, (unsigned long long)cache.offsets[i]);
+            LOGI("[cache] Restored %s @ %p (pair=0x%" PRIxPTR ", delta=%d)",
+                 g_api_table[i].name, (void*)func, pair_i, cache.func_delta[i]);
         } else {
-            LOGW("[cache] Invalid address for %s: 0x%" PRIxPTR, g_api_table[i].name, addr);
+            LOGW("[cache] Invalid func for %s: 0x%" PRIxPTR, g_api_table[i].name, func);
         }
     }
+    uninstall_sigsegv_handler();
     
     if (loaded == API_COUNT) {
         LOGI("[cache] All %d APIs restored from cache", loaded);
         return 0;
     }
     
-    // 部分加载失败，清空
     LOGW("[cache] Only %d/%d APIs restored, falling back to scan", loaded, API_COUNT);
     for (int i = 0; g_api_table[i].name; i++) {
         *g_api_table[i].func_ptr = NULL;
@@ -361,12 +444,21 @@ static uintptr_t memmem_find(uintptr_t haystack, size_t haystack_len,
 // ========== 安全内存访问（SIGSEGV 保护）==========
 static sigjmp_buf g_jmpbuf;
 static volatile int g_in_safe_access = 0;
+static struct sigaction g_old_sigsegv;
+static struct sigaction g_old_sigbus;
+static int g_old_saved = 0;
 
 static void sigsegv_handler(int sig) {
     if (g_in_safe_access) {
         siglongjmp(g_jmpbuf, 1);
     }
-    // 不在安全访问中，恢复默认行为
+    // 不在安全访问中，转发给原始处理器
+    struct sigaction *old = (sig == SIGSEGV) ? &g_old_sigsegv : &g_old_sigbus;
+    if (old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN && old->sa_handler != NULL) {
+        old->sa_handler(sig);
+        return;
+    }
+    // 无原始处理器，恢复默认行为
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -376,13 +468,27 @@ static void install_sigsegv_handler(void) {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigsegv_handler;
     sa.sa_flags = SA_RESTART;
+    // 保存原始处理器（只保存一次）
+    if (!g_old_saved) {
+        sigaction(SIGSEGV, NULL, &g_old_sigsegv);
+        sigaction(SIGBUS, NULL, &g_old_sigbus);
+        g_old_saved = 1;
+        LOGI("[sig] Saved original handlers: SIGSEGV=%p, SIGBUS=%p",
+             (void*)g_old_sigsegv.sa_handler, (void*)g_old_sigbus.sa_handler);
+    }
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
 }
 
 static void uninstall_sigsegv_handler(void) {
-    signal(SIGSEGV, SIG_DFL);
-    signal(SIGBUS, SIG_DFL);
+    // 恢复原始处理器，而非 SIG_DFL（MHP 可能依赖自己的 SIGSEGV handler）
+    if (g_old_saved) {
+        sigaction(SIGSEGV, &g_old_sigsegv, NULL);
+        sigaction(SIGBUS, &g_old_sigbus, NULL);
+    } else {
+        signal(SIGSEGV, SIG_DFL);
+        signal(SIGBUS, SIG_DFL);
+    }
 }
 
 // 安全版 memmem_find，崩溃时返回 0
@@ -589,6 +695,8 @@ static int resolve_apis_from_pairs(void) {
                         g_in_safe_access = 0;
 
                         if (candidate < 0x10000) continue;
+                        // ARM64: 函数地址必须 4 字节对齐
+                        if (candidate % 4 != 0) continue;
                         // 跳过指向字符串自身的指针
                         if (candidate == val1) continue;
 
@@ -602,11 +710,11 @@ static int resolve_apis_from_pairs(void) {
                         }
                         if (is_known_string) continue;
 
-                        // 验证函数指针指向某个已映射的区域
+                        // 验证函数指针指向可执行的内存区域（r-x 或 rwx）
                         int valid_ptr = 0;
                         for (int c = 0; c < g_region_count; c++) {
                             if (candidate >= g_regions[c].start && candidate < g_regions[c].end) {
-                                if (g_regions[c].readable) {
+                                if (g_regions[c].executable) {
                                     valid_ptr = 1;
                                 }
                                 break;
@@ -615,6 +723,7 @@ static int resolve_apis_from_pairs(void) {
 
                         if (valid_ptr) {
                             *g_api_table[api_idx].func_ptr = (void *)candidate;
+                            g_pair_addrs[api_idx] = addr;
                             resolved++;
                             LOGI("[scan] Resolved %s @ 0x%" PRIxPTR " (string @ 0x%" PRIxPTR ", pair @ 0x%" PRIxPTR ", offset +%d)",
                                  g_api_table[api_idx].name, candidate, val1, addr, off);
@@ -1135,9 +1244,8 @@ static void *hack_thread(void *arg) {
         LOGI("API ready: %s @ %p", g_api_table[i].name, *g_api_table[i].func_ptr);
     }
 
-    // 确保信号处理器已彻底恢复（扫描阶段大量 SIGSEGV 可能遗留脏状态）
-    signal(SIGSEGV, SIG_DFL);
-    signal(SIGBUS, SIG_DFL);
+    // 确保信号处理器已恢复为 MHP 原始状态（不用 SIG_DFL，MHP 的 trampoline 可能需要自己的处理器）
+    uninstall_sigsegv_handler();
     // 给内核/ART 一点时间恢复信号状态
     usleep(100000); // 100ms
 

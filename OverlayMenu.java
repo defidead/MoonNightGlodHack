@@ -422,7 +422,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                         }
                     }
                 }).start();
-                if (autoSkillReset) autoResetHandler.postDelayed(this, 3000);
+                if (autoSkillReset) autoResetHandler.postDelayed(this, 1000);//设置自动重置间隔为1秒，过短可能会有性能影响，根据实际情况调整
             }
         };
         autoResetHandler.postDelayed(task, 500);

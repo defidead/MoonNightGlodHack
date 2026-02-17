@@ -90,10 +90,10 @@ typedef struct {
     int       writable;
     int       executable;
     int       is_private;  // p = private
-    char      path[256];
+    char      path[512];
 } MemRegion;
 
-#define MAX_REGIONS 4096
+#define MAX_REGIONS 8192
 static MemRegion g_regions[MAX_REGIONS];
 static int       g_region_count = 0;
 
@@ -122,9 +122,9 @@ static int parse_maps(void) {
         char perms[8] = {0};
         unsigned long long start, end, offset, inode;
         int dev_major, dev_minor;
-        char path[256] = {0};
+        char path[512] = {0};
 
-        int n = sscanf(line, "%llx-%llx %4s %llx %d:%d %llu %255[^\n]",
+        int n = sscanf(line, "%llx-%llx %4s %llx %d:%d %llu %511[^\n]",
                        &start, &end, perms, &offset, &dev_major, &dev_minor, &inode, path);
         if (n < 7) continue;
 

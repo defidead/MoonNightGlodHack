@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <dlfcn.h>
@@ -119,12 +120,12 @@ static int parse_maps(void) {
     while (fgets(line, sizeof(line), fp) && g_region_count < MAX_REGIONS) {
         MemRegion *r = &g_regions[g_region_count];
         char perms[8] = {0};
-        unsigned long start, end, offset, inode;
-        int major, minor;
+        unsigned long long start, end, offset, inode;
+        int dev_major, dev_minor;
         char path[256] = {0};
 
-        int n = sscanf(line, "%lx-%lx %4s %lx %d:%d %lu %255[^\n]",
-                       &start, &end, perms, &offset, &major, &minor, &inode, path);
+        int n = sscanf(line, "%llx-%llx %4s %llx %d:%d %llu %255[^\n]",
+                       &start, &end, perms, &offset, &dev_major, &dev_minor, &inode, path);
         if (n < 7) continue;
 
         r->start      = start;
@@ -151,7 +152,7 @@ static uintptr_t find_il2cpp_base(void) {
     for (int i = 0; i < g_region_count; i++) {
         if (strstr(g_regions[i].path, "libil2cpp.so") &&
             g_regions[i].readable && g_regions[i].executable) {
-            LOGI("libil2cpp.so base: 0x%lx", g_regions[i].start);
+            LOGI("libil2cpp.so base: 0x%" PRIxPTR, g_regions[i].start);
             return g_regions[i].start;
         }
     }
@@ -299,7 +300,7 @@ static int resolve_apis_from_pairs(void) {
                     if (valid_code) {
                         *g_api_table[api_idx].func_ptr = (void *)val2;
                         resolved++;
-                        LOGI("[scan] Resolved %s @ 0x%lx (string @ 0x%lx, pair @ 0x%lx)",
+                        LOGI("[scan] Resolved %s @ 0x%" PRIxPTR " (string @ 0x%" PRIxPTR ", pair @ 0x%" PRIxPTR ")",
                              g_api_table[api_idx].name, val2, val1, addr);
                     }
                 }
@@ -419,7 +420,7 @@ static int modify_gold(int target_gold) {
             int32_t old_gold = *gold_ptr;
 
             scanned_count++;
-            LOGI("Found RoleInfo instance @ 0x%lx: roleId=%d level=%d HP=%d/%d gold=%d",
+            LOGI("Found RoleInfo instance @ 0x%" PRIxPTR ": roleId=%d level=%d HP=%d/%d gold=%d",
                  obj_addr, roleId, level, curHp, maxHp, old_gold);
 
             // 修改金币

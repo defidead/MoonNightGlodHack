@@ -34,7 +34,21 @@ jobs:
 
       - name: Build arm64-v8a
         run: |
-          CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+          # 查找可用的 clang 编译器
+          echo "NDK_HOME: $ANDROID_NDK_HOME"
+          ls $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang 2>/dev/null | head -5
+          
+          # 优先使用 API 35 (Android 15), 降级到 31/21
+          TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          if [ -f "$TOOLCHAIN/aarch64-linux-android35-clang" ]; then
+            CC="$TOOLCHAIN/aarch64-linux-android35-clang"
+          elif [ -f "$TOOLCHAIN/aarch64-linux-android31-clang" ]; then
+            CC="$TOOLCHAIN/aarch64-linux-android31-clang"
+          else
+            CC="$TOOLCHAIN/aarch64-linux-android21-clang"
+          fi
+          echo "Using compiler: $CC"
+          $CC --version
           
           $CC \
             -shared -fPIC -O2 \
@@ -43,14 +57,25 @@ jobs:
             gold_hack.c \
             -lpthread -llog -lc \
             -Wno-pointer-to-int-cast \
-            -Wno-int-to-pointer-cast
+            -Wno-int-to-pointer-cast \
+            -Wno-format
           
           file libgoldhack.so
+          readelf -d libgoldhack.so | head -20
           ls -lh libgoldhack.so
 
       - name: Build armeabi-v7a
+        continue-on-error: true
         run: |
-          CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang
+          TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          if [ -f "$TOOLCHAIN/armv7a-linux-androideabi35-clang" ]; then
+            CC="$TOOLCHAIN/armv7a-linux-androideabi35-clang"
+          elif [ -f "$TOOLCHAIN/armv7a-linux-androideabi31-clang" ]; then
+            CC="$TOOLCHAIN/armv7a-linux-androideabi31-clang"
+          else
+            CC="$TOOLCHAIN/armv7a-linux-androideabi21-clang"
+          fi
+          echo "Using compiler: $CC"
           
           $CC \
             -shared -fPIC -O2 \
@@ -60,7 +85,7 @@ jobs:
             -lpthread -llog -lc \
             -Wno-pointer-to-int-cast \
             -Wno-int-to-pointer-cast \
-            || echo "armv7a build skipped (pointer size issues expected)"
+            -Wno-format
           
           ls -lh libgoldhack*.so 2>/dev/null || true
 

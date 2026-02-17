@@ -1,0 +1,74 @@
+name: Build libgoldhack.so
+
+on:
+  push:
+    paths:
+      - 'gold_hack.c'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      target_gold:
+        description: '目标金币值'
+        required: false
+        default: '99999'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set gold value
+        id: config
+        run: |
+          GOLD="${{ github.event.inputs.target_gold }}"
+          echo "gold=${GOLD:-99999}" >> $GITHUB_OUTPUT
+
+      - name: Find NDK
+        id: ndk
+        run: |
+          echo "NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_OUTPUT
+          ls $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang | tail -1
+
+      - name: Build arm64-v8a
+        run: |
+          CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang
+          
+          $CC \
+            -shared -fPIC -O2 \
+            -DTARGET_GOLD=${{ steps.config.outputs.gold }} \
+            -o libgoldhack.so \
+            gold_hack.c \
+            -lpthread -llog -lc \
+            -Wno-pointer-to-int-cast \
+            -Wno-int-to-pointer-cast
+          
+          file libgoldhack.so
+          ls -lh libgoldhack.so
+
+      - name: Build armeabi-v7a
+        run: |
+          CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang
+          
+          $CC \
+            -shared -fPIC -O2 \
+            -DTARGET_GOLD=${{ steps.config.outputs.gold }} \
+            -o libgoldhack_armv7a.so \
+            gold_hack.c \
+            -lpthread -llog -lc \
+            -Wno-pointer-to-int-cast \
+            -Wno-int-to-pointer-cast \
+            || echo "armv7a build skipped (pointer size issues expected)"
+          
+          ls -lh libgoldhack*.so 2>/dev/null || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libgoldhack
+          path: |
+            libgoldhack.so
+            libgoldhack_armv7a.so
+          if-no-files-found: error

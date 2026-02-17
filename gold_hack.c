@@ -33,7 +33,7 @@
 #define TARGET_GOLD     99999       // 目标金币值，编译时可用 -DTARGET_GOLD=888888 覆盖
 #endif
 #ifndef WAIT_SECONDS
-#define WAIT_SECONDS    15          // 等待游戏加载的秒数，编译时可用 -DWAIT_SECONDS=20 覆盖
+#define WAIT_SECONDS    5          // 等待游戏加载的秒数，编译时可用 -DWAIT_SECONDS=20 覆盖
 #endif
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
@@ -604,6 +604,7 @@ static int do_modify_gold(int target_gold) {
 }
 
 // ========== 重置所有技能 CD（返回重置的技能数）==========
+// 扫描 RoleInfo 偏移 0x78-0xB0，覆盖探索技能、战斗技能等
 static int do_reset_skill_cd(void) {
     if (init_il2cpp_context() != 0) return -1;
     int n = ensure_roleinfo_cached();
@@ -613,38 +614,52 @@ static int do_reset_skill_cd(void) {
     install_sigsegv_handler();
     for (int i = 0; i < g_cached_count; i++) {
         uintptr_t obj_addr = g_cached_roleinfo[i];
-        g_in_safe_access = 1;
-        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
         
-        // dungeonSkill @ 0x80
-        uintptr_t ds_ptr = *(volatile uintptr_t *)(obj_addr + 0x80);
-        if (ds_ptr > 0x10000) {
-            int32_t *cd = (int32_t *)(ds_ptr + 0x14);
-            if (*cd > 0) {
-                int32_t ds_id = *(int32_t *)(ds_ptr + 0x10);
-                LOGI("  => DungeonSkill id=%d CD: %d -> 0", ds_id, *cd);
-                *cd = 0; count++;
+        // 扫描 RoleInfo 偏移 0x78-0xB0 的所有指针字段
+        // 已知: dungeonSkill(0x80), skills(0x88)
+        // 扩展扫描以覆盖可能的战斗技能字段
+        for (int off = 0x78; off <= 0xB0; off += 8) {
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) {
+                g_in_safe_access = 0;
+                continue; // 该偏移访问出错，跳到下一个
             }
-        }
-        // skills list @ 0x88
-        uintptr_t sl = *(volatile uintptr_t *)(obj_addr + 0x88);
-        if (sl > 0x10000) {
-            uintptr_t items = *(volatile uintptr_t *)(sl + 0x10);
-            int32_t sz = *(volatile int32_t *)(sl + 0x18);
-            if (items > 0x10000 && sz > 0 && sz < 100) {
-                for (int si = 0; si < sz; si++) {
-                    uintptr_t sk = *(volatile uintptr_t *)(items + 0x20 + si * sizeof(void*));
-                    if (sk < 0x10000) continue;
-                    int32_t *scd = (int32_t *)(sk + 0x14);
-                    if (*scd > 0) {
-                        int32_t sid = *(int32_t *)(sk + 0x10);
-                        LOGI("  => Skill id=%d CD: %d -> 0", sid, *scd);
-                        *scd = 0; count++;
+            
+            uintptr_t ptr = *(volatile uintptr_t *)(obj_addr + off);
+            if (ptr < 0x10000) { g_in_safe_access = 0; continue; }
+            
+            // --- 尝试作为单个技能对象: id(+0x10), cd(+0x14) ---
+            int32_t sid = *(volatile int32_t *)(ptr + 0x10);
+            int32_t scd = *(volatile int32_t *)(ptr + 0x14);
+            if (sid >= 0 && sid < 10000 && scd > 0 && scd < 10000) {
+                LOGI("  => Skill @+0x%x id=%d CD: %d -> 0", off, sid, scd);
+                *(int32_t *)(ptr + 0x14) = 0;
+                count++;
+                g_in_safe_access = 0;
+                continue; // 已作为单技能处理
+            }
+            
+            // --- 尝试作为 List<Skill>: _items(+0x10), _size(+0x18) ---
+            uintptr_t items = *(volatile uintptr_t *)(ptr + 0x10);
+            int32_t sz = *(volatile int32_t *)(ptr + 0x18);
+            if (items < 0x10000 || sz <= 0 || sz >= 100) {
+                g_in_safe_access = 0; continue;
+            }
+            for (int si = 0; si < sz; si++) {
+                uintptr_t sk = *(volatile uintptr_t *)(items + 0x20 + si * sizeof(void*));
+                if (sk < 0x10000) continue;
+                int32_t *cd_ptr = (int32_t *)(sk + 0x14);
+                if (*cd_ptr > 0 && *cd_ptr < 10000) {
+                    int32_t sk_id = *(int32_t *)(sk + 0x10);
+                    if (sk_id >= 0 && sk_id < 10000) {
+                        LOGI("  => List[+0x%x][%d] id=%d CD: %d -> 0",
+                             off, si, sk_id, *cd_ptr);
+                        *cd_ptr = 0; count++;
                     }
                 }
             }
+            g_in_safe_access = 0;
         }
-        g_in_safe_access = 0;
     }
     uninstall_sigsegv_handler();
     LOGI("do_reset_skill_cd: reset %d skill(s)", count);
@@ -658,43 +673,8 @@ static int modify_gold(int target_gold) {
     scan_and_cache_roleinfo();
     if (g_cached_count == 0) return 0;
     
-    int gold_count = 0;
-    install_sigsegv_handler();
-    for (int i = 0; i < g_cached_count; i++) {
-        uintptr_t obj_addr = g_cached_roleinfo[i];
-        g_in_safe_access = 1;
-        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
-        
-        // 修改金币
-        int32_t *gold_ptr = (int32_t *)(obj_addr + 0x2c);
-        int32_t old_gold = *gold_ptr;
-        *gold_ptr = target_gold;
-        gold_count++;
-        LOGI("  => Gold: %d -> %d", old_gold, target_gold);
-
-        // dungeonSkill CD
-        uintptr_t ds_ptr = *(volatile uintptr_t *)(obj_addr + 0x80);
-        if (ds_ptr > 0x10000) {
-            int32_t *cd = (int32_t *)(ds_ptr + 0x14);
-            if (*cd > 0) { LOGI("  => DungeonSkill CD: %d -> 0", *cd); *cd = 0; }
-        }
-        // skills list CD
-        uintptr_t sl = *(volatile uintptr_t *)(obj_addr + 0x88);
-        if (sl > 0x10000) {
-            uintptr_t items = *(volatile uintptr_t *)(sl + 0x10);
-            int32_t sz = *(volatile int32_t *)(sl + 0x18);
-            if (items > 0x10000 && sz > 0 && sz < 100) {
-                for (int si = 0; si < sz; si++) {
-                    uintptr_t sk = *(volatile uintptr_t *)(items + 0x20 + si * sizeof(void*));
-                    if (sk < 0x10000) continue;
-                    int32_t *scd = (int32_t *)(sk + 0x14);
-                    if (*scd > 0) { LOGI("  => Skill CD: %d -> 0", *scd); *scd = 0; }
-                }
-            }
-        }
-        g_in_safe_access = 0;
-    }
-    uninstall_sigsegv_handler();
+    int gold_count = do_modify_gold(target_gold);
+    do_reset_skill_cd();
     return gold_count;
 }
 

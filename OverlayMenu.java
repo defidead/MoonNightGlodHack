@@ -28,7 +28,10 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     private TextView statusText;
     private EditText goldInput;
     private Button toggleBtn;
+    private Button autoSkillBtn;
     private boolean collapsed = false;
+    private boolean autoSkillReset = false;
+    private Handler autoResetHandler;
     private float density;
 
     // 拖动
@@ -44,6 +47,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     private static final int BTN_P2     = 0x7f000011;
     private static final int BTN_P3     = 0x7f000012;
     private static final int BTN_P4     = 0x7f000013;
+    private static final int BTN_SKILL_AUTO = 0x7f000004;
 
     // JNI 回调（C 代码注册实现）
     public static native String nativeModifyGold(int amount);
@@ -203,16 +207,29 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
 
         // --- 技能区域 ---
         TextView skillLabel = new TextView(activity);
-        skillLabel.setText("\u26A1 探索技能");
+        skillLabel.setText("\u26A1 技能CD");
         skillLabel.setTextColor(0xFF67E8F9);
         skillLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         contentArea.addView(skillLabel);
 
-        Button skillBtn = makeBtn("重置所有技能CD", 0xFF0E7490, BTN_SKILL);
-        LinearLayout.LayoutParams sblp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(34));
-        sblp.setMargins(0, dp(4), 0, 0);
-        skillBtn.setLayoutParams(sblp);
-        contentArea.addView(skillBtn);
+        LinearLayout skillRow = new LinearLayout(activity);
+        skillRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams srlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        srlp.setMargins(0, dp(4), 0, 0);
+        skillRow.setLayoutParams(srlp);
+
+        Button skillBtn = makeBtn("重置CD", 0xFF0E7490, BTN_SKILL);
+        skillBtn.setLayoutParams(new LinearLayout.LayoutParams(0, dp(34), 1f));
+        skillRow.addView(skillBtn);
+
+        autoSkillBtn = makeBtn("自动:关", 0xFF374151, BTN_SKILL_AUTO);
+        LinearLayout.LayoutParams asblp = new LinearLayout.LayoutParams(0, dp(34), 1f);
+        asblp.setMargins(dp(4), 0, 0, 0);
+        autoSkillBtn.setLayoutParams(asblp);
+        skillRow.addView(autoSkillBtn);
+
+        contentArea.addView(skillRow);
 
         // --- 状态文本 ---
         statusText = new TextView(activity);
@@ -289,6 +306,8 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             doGoldModify();
         } else if (id == BTN_SKILL) {
             doSkillReset();
+        } else if (id == BTN_SKILL_AUTO) {
+            toggleAutoReset();
         } else if (id == BTN_P1 || id == BTN_P2 || id == BTN_P3 || id == BTN_P4) {
             Object tag = v.getTag();
             if (tag != null) goldInput.setText(tag.toString());
@@ -357,6 +376,62 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                 });
             }
         }).start();
+    }
+
+    // ===== 自动重置技能CD =====
+    private void toggleAutoReset() {
+        autoSkillReset = !autoSkillReset;
+        if (autoSkillReset) {
+            autoSkillBtn.setText("自动:开");
+            GradientDrawable gd = new GradientDrawable();
+            gd.setColor(0xFF059669);
+            gd.setCornerRadius(dp(8));
+            autoSkillBtn.setBackground(gd);
+            startAutoReset();
+            statusText.setText("\uD83D\uDD04 自动重置已开启(每3秒)");
+        } else {
+            autoSkillBtn.setText("自动:关");
+            GradientDrawable gd = new GradientDrawable();
+            gd.setColor(0xFF374151);
+            gd.setCornerRadius(dp(8));
+            autoSkillBtn.setBackground(gd);
+            stopAutoReset();
+            statusText.setText("自动重置已关闭");
+        }
+    }
+
+    private void startAutoReset() {
+        if (autoResetHandler == null) {
+            autoResetHandler = new Handler(Looper.getMainLooper());
+        }
+        final Runnable task = new Runnable() {
+            @Override
+            public void run() {
+                if (!autoSkillReset) return;
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        final String result = nativeResetSkillCD();
+                        if (autoSkillReset) {
+                            autoResetHandler.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    if (autoSkillReset) statusText.setText("\uD83D\uDD04 " + result);
+                                }
+                            });
+                        }
+                    }
+                }).start();
+                if (autoSkillReset) autoResetHandler.postDelayed(this, 3000);
+            }
+        };
+        autoResetHandler.postDelayed(task, 500);
+    }
+
+    private void stopAutoReset() {
+        if (autoResetHandler != null) {
+            autoResetHandler.removeCallbacksAndMessages(null);
+        }
     }
 
     // 标题栏拖动

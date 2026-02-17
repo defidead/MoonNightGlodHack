@@ -426,64 +426,99 @@ static int try_dlsym_apis(void) {
 
 // ========== 方法2: 内存扫描发现 API（绕过 MHP 保护）==========
 
-// 步骤1: 扫描所有可读区域，查找 "il2cpp_xxx\0" 字符串
-static void scan_api_strings(void) {
-    g_string_match_count = 0;
-
-    install_sigsegv_handler();
-
-    int scanned_regions = 0;
-    int skipped_segv = 0;
-    for (int r = 0; r < g_region_count && g_string_match_count < MAX_API_STRINGS; r++) {
-        MemRegion *region = &g_regions[r];
-        if (!region->readable) continue;
-        
-        size_t size = region->end - region->start;
-        if (size < 16 || size > MAX_SCAN_SIZE) continue;
-
-        // 跳过某些不可能包含字符串的区域
-        if (strstr(region->path, "/dev/") || strstr(region->path, "dalvik")) continue;
-        // 跳过 GPU/DMA/框架相关的大区域以避免崩溃
-        if (strstr(region->path, "/dmabuf") || strstr(region->path, "/gpu") ||
-            strstr(region->path, "kgsl") || strstr(region->path, "mali")) continue;
-        // 跳过自身注入的 .so（其中包含 API 字符串字面量会干扰结果）
-        if (strstr(region->path, "goldhack") || strstr(region->path, "Inject So")) continue;
-        // 跳过超大的匿名区域（>50MB，不太可能包含 API 字符串）
-        if (region->path[0] == '\0' && size > 50 * 1024 * 1024) continue;
-
-        scanned_regions++;
-        if (scanned_regions % 500 == 0) {
-            LOGI("[scan] Progress: scanned %d regions, found %d strings so far",
-                 scanned_regions, g_string_match_count);
+// 检查是否每个 API 都至少有 min_copies 个字符串匹配
+static int all_apis_have_strings(int min_copies) {
+    for (int i = 0; i < API_COUNT && g_api_table[i].name; i++) {
+        int cnt = 0;
+        for (int s = 0; s < g_string_match_count; s++) {
+            if (g_string_matches[s].api_index == i) cnt++;
         }
+        if (cnt < min_copies) return 0;
+    }
+    return 1;
+}
 
-        for (int api_idx = 0; g_api_table[api_idx].name; api_idx++) {
-            const char *api_name = g_api_table[api_idx].name;
-            size_t name_len = strlen(api_name) + 1; // 包含 \0
+// 判断区域是否应跳过
+static int should_skip_region(MemRegion *region, size_t size) {
+    if (!region->readable) return 1;
+    if (size < 16 || size > MAX_SCAN_SIZE) return 1;
+    if (strstr(region->path, "/dev/") || strstr(region->path, "dalvik")) return 1;
+    if (strstr(region->path, "/dmabuf") || strstr(region->path, "/gpu") ||
+        strstr(region->path, "kgsl") || strstr(region->path, "mali")) return 1;
+    if (strstr(region->path, "goldhack") || strstr(region->path, "Inject So")) return 1;
+    return 0;
+}
 
-            // 在这个区域中搜索所有出现的 api_name
-            uintptr_t search_start = region->start;
-            size_t remaining = size;
-
-            while (remaining >= name_len && g_string_match_count < MAX_API_STRINGS) {
-                uintptr_t found = memmem_find_safe(search_start, remaining, api_name, name_len);
-                if (!found) break;
-
-                g_string_matches[g_string_match_count].addr = found;
-                g_string_matches[g_string_match_count].api_name = api_name;
-                g_string_matches[g_string_match_count].api_index = api_idx;
-                g_string_match_count++;
-                LOGI("[scan] Found string '%s' @ 0x%" PRIxPTR " in region %s",
-                     api_name, found, region->path[0] ? region->path : "[anon]");
-
-                size_t offset = found - search_start + name_len;
-                search_start += offset;
-                remaining -= offset;
-            }
+// 在单个区域中搜索所有 API 字符串
+static void scan_region_for_strings(MemRegion *region) {
+    size_t size = region->end - region->start;
+    for (int api_idx = 0; g_api_table[api_idx].name && g_string_match_count < MAX_API_STRINGS; api_idx++) {
+        const char *api_name = g_api_table[api_idx].name;
+        size_t name_len = strlen(api_name) + 1;
+        uintptr_t search_start = region->start;
+        size_t remaining = size;
+        while (remaining >= name_len && g_string_match_count < MAX_API_STRINGS) {
+            uintptr_t found = memmem_find_safe(search_start, remaining, api_name, name_len);
+            if (!found) break;
+            g_string_matches[g_string_match_count].addr = found;
+            g_string_matches[g_string_match_count].api_name = api_name;
+            g_string_matches[g_string_match_count].api_index = api_idx;
+            g_string_match_count++;
+            LOGI("[scan] Found string '%s' @ 0x%" PRIxPTR " in region %s",
+                 api_name, found, region->path[0] ? region->path : "[anon]");
+            size_t offset = found - search_start + name_len;
+            search_start += offset;
+            remaining -= offset;
         }
     }
+}
 
-    LOGI("[scan] Scanned %d readable regions, found %d API string occurrences", scanned_regions, g_string_match_count);
+// 步骤1: 扫描可读区域，查找 "il2cpp_xxx\0" 字符串
+// 策略：先扫 .so 文件区域（快+无 SIGSEGV），再扫其他区域（仅在需要时）
+static void scan_api_strings(void) {
+    g_string_match_count = 0;
+    install_sigsegv_handler();
+    int scanned = 0;
+
+    // === 第1轮：只扫 .so 文件区域（快速、安全）===
+    for (int r = 0; r < g_region_count && g_string_match_count < MAX_API_STRINGS; r++) {
+        MemRegion *region = &g_regions[r];
+        size_t size = region->end - region->start;
+        if (should_skip_region(region, size)) continue;
+        // 第1轮只扫有 .so 路径的区域
+        if (!strstr(region->path, ".so")) continue;
+        scanned++;
+        scan_region_for_strings(region);
+    }
+    LOGI("[scan] Phase 1 (.so regions): scanned %d, found %d strings", scanned, g_string_match_count);
+
+    // 如果每个 API 至少有2个字符串匹配，足够用于 pair 解析，跳过慢速扫描
+    if (all_apis_have_strings(2)) {
+        LOGI("[scan] All APIs have enough strings, skipping phase 2");
+        uninstall_sigsegv_handler();
+        return;
+    }
+
+    // === 第2轮：扫描剩余区域（包括匿名区域，用于找 MHP 的字符串副本）===
+    int phase2 = 0;
+    for (int r = 0; r < g_region_count && g_string_match_count < MAX_API_STRINGS; r++) {
+        MemRegion *region = &g_regions[r];
+        size_t size = region->end - region->start;
+        if (should_skip_region(region, size)) continue;
+        if (strstr(region->path, ".so")) continue; // 第1轮已扫
+        // 匿名区域只扫 <10MB 的（减少 SIGSEGV）
+        if (region->path[0] == '\0' && size > 10 * 1024 * 1024) continue;
+        scanned++; phase2++;
+        scan_region_for_strings(region);
+        // 每个 API 至少 2 个匹配就够了
+        if (all_apis_have_strings(2)) {
+            LOGI("[scan] All APIs found, stopping early at phase 2 region %d", phase2);
+            break;
+        }
+    }
+    LOGI("[scan] Phase 2: scanned %d more, total %d strings", phase2, g_string_match_count);
+
+    LOGI("[scan] Total: scanned %d readable regions, found %d API string occurrences", scanned, g_string_match_count);
     uninstall_sigsegv_handler();
 }
 
@@ -1099,6 +1134,12 @@ static void *hack_thread(void *arg) {
         }
         LOGI("API ready: %s @ %p", g_api_table[i].name, *g_api_table[i].func_ptr);
     }
+
+    // 确保信号处理器已彻底恢复（扫描阶段大量 SIGSEGV 可能遗留脏状态）
+    signal(SIGSEGV, SIG_DFL);
+    signal(SIGBUS, SIG_DFL);
+    // 给内核/ART 一点时间恢复信号状态
+    usleep(100000); // 100ms
 
     // 5. 初始化 il2cpp 上下文（domain/image/class 缓存到全局）
     if (init_il2cpp_context() != 0) {

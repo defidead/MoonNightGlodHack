@@ -560,6 +560,43 @@ static int modify_gold(int target_gold) {
             modified_count++;
 
             LOGI("  => Gold modified: %d -> %d", old_gold, target_gold);
+
+            // ========== 修改技能 CD ==========
+            // RoleInfo.dungeonSkill @ offset 0x80 (UserSkillState*)
+            // UserSkillState: [0x10] skillId, [0x14] cd
+            uintptr_t dungeon_skill_ptr = *(volatile uintptr_t *)(obj_addr + 0x80);
+            if (dungeon_skill_ptr > 0x10000) {
+                int32_t *ds_cd_ptr = (int32_t *)(dungeon_skill_ptr + 0x14);
+                int32_t old_cd = *ds_cd_ptr;
+                if (old_cd > 0) {
+                    *ds_cd_ptr = 0;
+                    int32_t ds_id = *(int32_t *)(dungeon_skill_ptr + 0x10);
+                    LOGI("  => DungeonSkill id=%d CD: %d -> 0", ds_id, old_cd);
+                }
+            }
+
+            // RoleInfo.skills @ offset 0x88 (List<UserSkillState>*)
+            // List<T> layout: [klass(8)] [monitor(8)] [_items(8)] [_size(4)]
+            // _items is a C# array: [klass(8)] [monitor(8)] [length(8)] [elements...]
+            uintptr_t skills_list_ptr = *(volatile uintptr_t *)(obj_addr + 0x88);
+            if (skills_list_ptr > 0x10000) {
+                uintptr_t items_arr = *(volatile uintptr_t *)(skills_list_ptr + 0x10);
+                int32_t list_size = *(volatile int32_t *)(skills_list_ptr + 0x18);
+                if (items_arr > 0x10000 && list_size > 0 && list_size < 100) {
+                    // 数组元素从 offset 0x20 开始 (klass 8 + monitor 8 + length 8 + bounds 8 = 0x20)
+                    for (int si = 0; si < list_size; si++) {
+                        uintptr_t skill_obj = *(volatile uintptr_t *)(items_arr + 0x20 + si * sizeof(void*));
+                        if (skill_obj < 0x10000) continue;
+                        int32_t *s_cd_ptr = (int32_t *)(skill_obj + 0x14);
+                        int32_t old_s_cd = *s_cd_ptr;
+                        if (old_s_cd > 0) {
+                            *s_cd_ptr = 0;
+                            int32_t s_id = *(int32_t *)(skill_obj + 0x10);
+                            LOGI("  => Skill id=%d CD: %d -> 0", s_id, old_s_cd);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -620,8 +657,8 @@ static void *hack_thread(void *arg) {
         LOGI("API ready: %s @ %p", g_api_table[i].name, *g_api_table[i].func_ptr);
     }
 
-    // 5. 修改金币
-    LOGI("=== Modifying gold to %d ===", target_gold);
+    // 5. 修改金币 + 技能 CD
+    LOGI("=== Modifying gold to %d & resetting skill CDs ===", target_gold);
     int count = modify_gold(target_gold);
     
     if (count > 0) {

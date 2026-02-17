@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-inject_gold.py - 月圆之夜金币修改器
-使用 Frida 的 CModule 在目标进程中编译执行 C 代码
+inject_gold.py - 月圆之夜金币修改器 + 探索技能解锁
+使用 Frida 在目标进程中执行修改逻辑
 无需 Android NDK，支持任意设备
+
+功能:
+  1. 修改金币为目标值
+  2. 清除所有探索技能 CD，使其始终可用
 
 使用:
   python3 inject_gold.py                     # 默认 99999 金币 (spawn 模式)
@@ -274,6 +278,53 @@ function doHack(il2cppModule) {
                     
                     send({t:"gold", m:"  ✅ Gold: " + oldGold + " -> " + TARGET_GOLD,
                           old: oldGold, new_val: TARGET_GOLD, addr: addr.toString()});
+                    
+                    // ========= 探索技能 CD 清零 =========
+                    // RoleInfo.[0x80] UserSkillState dungeonSkill (对象指针)
+                    // RoleInfo.[0x88] List<UserSkillState> skills
+                    // UserSkillState.[0x10] Int32 skillId
+                    // UserSkillState.[0x14] Int32 cd
+                    try {
+                        var dungeonSkill = addr.add(0x80).readPointer();
+                        if (!dungeonSkill.isNull() && parseInt(dungeonSkill.toString(16), 16) > 0x10000) {
+                            var dSkillId = dungeonSkill.add(0x10).readS32();
+                            var dCd = dungeonSkill.add(0x14).readS32();
+                            send({t:"log", m:"  DungeonSkill: id=" + dSkillId + " cd=" + dCd});
+                            if (dCd > 0) {
+                                dungeonSkill.add(0x14).writeS32(0);
+                                send({t:"log", m:"  ✅ DungeonSkill CD: " + dCd + " -> 0"});
+                            }
+                        }
+                    } catch(e) { send({t:"log", m:"  [warn] dungeonSkill access error: " + e}); }
+
+                    // 遍历 skills 列表，清除所有技能 CD
+                    try {
+                        var skillsList = addr.add(0x88).readPointer();
+                        if (!skillsList.isNull() && parseInt(skillsList.toString(16), 16) > 0x10000) {
+                            // List<T> 内部: [klass(8)] [monitor(8)] [_items(8)] [_size(4)]
+                            var items = skillsList.add(0x10).readPointer(); // _items (Array)
+                            var size = skillsList.add(0x18).readS32();      // _size
+                            send({t:"log", m:"  Skills list size: " + size});
+                            
+                            if (size > 0 && size < 100 && !items.isNull()) {
+                                // Array 内部: [klass(8)] [monitor(8)] [max_length(8)] [elements...]
+                                var elemBase = items.add(0x20); // 64位: 8+8+8 = 0x18, 但 il2cpp Array header 通常 0x20
+                                for (var si = 0; si < size; si++) {
+                                    var skillObj = elemBase.add(si * Process.pointerSize).readPointer();
+                                    if (skillObj.isNull()) continue;
+                                    var sId = skillObj.add(0x10).readS32();
+                                    var sCd = skillObj.add(0x14).readS32();
+                                    if (sCd > 0) {
+                                        skillObj.add(0x14).writeS32(0);
+                                        send({t:"log", m:"  ✅ Skill[" + si + "] id=" + sId + " CD: " + sCd + " -> 0"});
+                                    } else {
+                                        send({t:"log", m:"  Skill[" + si + "] id=" + sId + " CD=" + sCd + " (already 0)"});
+                                    }
+                                }
+                            }
+                        }
+                    } catch(e) { send({t:"log", m:"  [warn] skills list access error: " + e}); }
+                    // ========= 探索技能 CD 清零 END =========
                     
                 } catch(e) {}
             });

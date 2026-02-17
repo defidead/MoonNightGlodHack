@@ -4,7 +4,7 @@
  * 功能: 注入后自动查找 RoleInfo 实例并修改 curgold 字段
  * 兼容: 不同设备/不同基地址，运行时动态发现 il2cpp API
  *
- * 编译: aarch64-linux-android21-clang -shared -fPIC -O2 -o libgoldhack.so gold_hack.c -lpthread -llog
+ * 编译: aarch64-linux-android35-clang -shared -fPIC -O2 -o libgoldhack.so gold_hack.c -llog
  * 注入: 通过 Frida / zygisk / ptrace 注入到 com.ztgame.yyzy 进程
  */
 

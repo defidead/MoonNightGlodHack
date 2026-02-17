@@ -36,10 +36,10 @@ jobs:
         run: |
           # 查找可用的 clang 编译器
           echo "NDK_HOME: $ANDROID_NDK_HOME"
-          ls $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang 2>/dev/null | head -5
-          
-          # 优先使用 API 35 (Android 15), 降级到 31/21
           TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+          ls $TOOLCHAIN/aarch64-linux-android*-clang 2>/dev/null | head -5
+          
+          # 优先使用高版本 API
           if [ -f "$TOOLCHAIN/aarch64-linux-android35-clang" ]; then
             CC="$TOOLCHAIN/aarch64-linux-android35-clang"
           elif [ -f "$TOOLCHAIN/aarch64-linux-android31-clang" ]; then
@@ -50,19 +50,28 @@ jobs:
           echo "Using compiler: $CC"
           $CC --version
           
+          # 编译，将错误输出到文件
           $CC \
             -shared -fPIC -O2 \
             -DTARGET_GOLD=${{ steps.config.outputs.gold }} \
             -o libgoldhack.so \
             gold_hack.c \
-            -lpthread -llog -lc \
+            -llog -lc \
             -Wno-pointer-to-int-cast \
             -Wno-int-to-pointer-cast \
-            -Wno-format
+            -Wno-format \
+            2>&1 | tee build_log.txt
           
-          file libgoldhack.so
-          readelf -d libgoldhack.so | head -20
-          ls -lh libgoldhack.so
+          # 检查编译结果
+          if [ -f libgoldhack.so ]; then
+            file libgoldhack.so
+            readelf -d libgoldhack.so | head -20
+            ls -lh libgoldhack.so
+          else
+            echo "=== BUILD FAILED ==="
+            cat build_log.txt
+            exit 1
+          fi
 
       - name: Build armeabi-v7a
         continue-on-error: true
@@ -82,7 +91,7 @@ jobs:
             -DTARGET_GOLD=${{ steps.config.outputs.gold }} \
             -o libgoldhack_armv7a.so \
             gold_hack.c \
-            -lpthread -llog -lc \
+            -llog -lc \
             -Wno-pointer-to-int-cast \
             -Wno-int-to-pointer-cast \
             -Wno-format

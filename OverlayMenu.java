@@ -294,7 +294,26 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         }
     }
 
+    private volatile boolean busy = false;
+
+    private void setBusy(boolean b) {
+        busy = b;
+        // 在操作期间禁用所有功能按钮，防止重复点击
+        setButtonsEnabled(!b);
+    }
+
+    private void setButtonsEnabled(boolean enabled) {
+        View gold = container.findViewById(BTN_GOLD);
+        View skill = container.findViewById(BTN_SKILL);
+        if (gold != null) gold.setEnabled(enabled);
+        if (skill != null) skill.setEnabled(enabled);
+        float alpha = enabled ? 1.0f : 0.5f;
+        if (gold != null) gold.setAlpha(alpha);
+        if (skill != null) skill.setAlpha(alpha);
+    }
+
     private void doGoldModify() {
+        if (busy) return;
         String text = goldInput.getText().toString().trim();
         final int amount;
         try {
@@ -303,6 +322,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             statusText.setText("\u274C 请输入有效数字");
             return;
         }
+        setBusy(true);
         statusText.setText("\u23F3 修改中...");
         new Thread(new Runnable() {
             @Override
@@ -310,13 +330,18 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                 final String result = nativeModifyGold(amount);
                 new Handler(Looper.getMainLooper()).post(new Runnable() {
                     @Override
-                    public void run() { statusText.setText(result); }
+                    public void run() {
+                        statusText.setText(result);
+                        setBusy(false);
+                    }
                 });
             }
         }).start();
     }
 
     private void doSkillReset() {
+        if (busy) return;
+        setBusy(true);
         statusText.setText("\u23F3 重置中...");
         new Thread(new Runnable() {
             @Override
@@ -324,7 +349,10 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                 final String result = nativeResetSkillCD();
                 new Handler(Looper.getMainLooper()).post(new Runnable() {
                     @Override
-                    public void run() { statusText.setText(result); }
+                    public void run() {
+                        statusText.setText(result);
+                        setBusy(false);
+                    }
                 });
             }
         }).start();

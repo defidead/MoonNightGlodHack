@@ -43,6 +43,9 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// 全局互斥锁：保护内存扫描（parse_maps / SIGSEGV handler / g_regions 等全局状态）
+static pthread_mutex_t g_hack_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // ========== il2cpp API 类型定义 ==========
 typedef void* Il2CppDomain;
 typedef void* Il2CppThread;
@@ -483,61 +486,119 @@ static int init_il2cpp_context(void) {
     return 0;
 }
 
-// ========== 堆扫描 RoleInfo 实例的通用宏 ==========
-// callback(obj_addr) 中可以使用 obj_addr
-#define SCAN_ROLEINFO_INSTANCES(callback_body)                               \
-do {                                                                         \
-    parse_maps();                                                            \
-    uintptr_t klass_val = (uintptr_t)g_roleinfo_cls;                        \
-    install_sigsegv_handler();                                               \
-    for (int r = 0; r < g_region_count; r++) {                               \
-        MemRegion *region = &g_regions[r];                                   \
-        if (!region->readable || !region->writable) continue;                \
-        size_t size = region->end - region->start;                           \
-        if (size < 0x100 || size > MAX_SCAN_SIZE) continue;                  \
-        if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue; \
-        uint8_t *base = (uint8_t *)region->start;                            \
-        for (size_t off = 0; off <= size - 0x100; off += 8) {                \
-            g_in_safe_access = 1;                                            \
-            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; break; } \
-            uintptr_t *p = (uintptr_t *)(base + off);                        \
-            if (*p != klass_val) { g_in_safe_access = 0; continue; }         \
-            uintptr_t obj_addr = (uintptr_t)(base + off);                    \
-            /* 验证 monitor */                                                \
-            uintptr_t monitor = *(volatile uintptr_t *)(obj_addr + 8);       \
-            if (monitor != 0 && monitor < 0x10000) { g_in_safe_access = 0; continue; } \
-            /* 验证 roleId (0x10): 0-200 */                                   \
-            int32_t roleId = *(volatile int32_t *)(obj_addr + 0x10);         \
-            if (roleId < 0 || roleId > 200) { g_in_safe_access = 0; continue; } \
-            /* 验证 maxHp (0x14): 0-99999 */                                  \
-            int32_t maxHp = *(volatile int32_t *)(obj_addr + 0x14);          \
-            if (maxHp < 0 || maxHp > 99999) { g_in_safe_access = 0; continue; } \
-            /* 验证 curHp (0x18): 0-99999 */                                  \
-            int32_t curHp = *(volatile int32_t *)(obj_addr + 0x18);          \
-            if (curHp < 0 || curHp > 99999) { g_in_safe_access = 0; continue; } \
-            /* 验证 level (0x24): 0-100 */                                    \
-            int32_t level = *(volatile int32_t *)(obj_addr + 0x24);          \
-            if (level < 0 || level > 100) { g_in_safe_access = 0; continue; } \
-            g_in_safe_access = 0;                                            \
-            LOGI("RoleInfo @ 0x%" PRIxPTR ": roleId=%d level=%d HP=%d/%d",   \
-                 obj_addr, roleId, level, curHp, maxHp);                     \
-            { callback_body }                                                \
-        }                                                                    \
-    }                                                                        \
-    uninstall_sigsegv_handler();                                             \
-} while(0)
+// ========== RoleInfo 实例缓存（避免每次全量扫描）==========
+#define MAX_CACHED_ROLEINFO 8
+static uintptr_t g_cached_roleinfo[MAX_CACHED_ROLEINFO];
+static int        g_cached_count = 0;
+
+// 验证缓存的 RoleInfo 地址是否仍然有效
+static int validate_cached_roleinfo(void) {
+    if (g_cached_count == 0) return 0;
+    
+    uintptr_t klass_val = (uintptr_t)g_roleinfo_cls;
+    int valid = 0;
+    
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) {
+            g_in_safe_access = 0;
+            continue; // 地址无效，跳过
+        }
+        // 验证 klass 指针
+        uintptr_t klass = *(volatile uintptr_t *)obj;
+        if (klass != klass_val) { g_in_safe_access = 0; continue; }
+        // 验证 roleId
+        int32_t roleId = *(volatile int32_t *)(obj + 0x10);
+        if (roleId < 0 || roleId > 200) { g_in_safe_access = 0; continue; }
+        g_in_safe_access = 0;
+        // 仍然有效，保留
+        g_cached_roleinfo[valid++] = obj;
+    }
+    uninstall_sigsegv_handler();
+    
+    g_cached_count = valid;
+    return valid;
+}
+
+// 全量扫描并更新缓存
+static int scan_and_cache_roleinfo(void) {
+    g_cached_count = 0;
+    parse_maps();
+    uintptr_t klass_val = (uintptr_t)g_roleinfo_cls;
+    install_sigsegv_handler();
+    
+    for (int r = 0; r < g_region_count && g_cached_count < MAX_CACHED_ROLEINFO; r++) {
+        MemRegion *region = &g_regions[r];
+        if (!region->readable || !region->writable) continue;
+        size_t size = region->end - region->start;
+        if (size < 0x100 || size > MAX_SCAN_SIZE) continue;
+        if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue;
+        
+        uint8_t *base = (uint8_t *)region->start;
+        for (size_t off = 0; off <= size - 0x100 && g_cached_count < MAX_CACHED_ROLEINFO; off += 8) {
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; break; }
+            
+            uintptr_t *p = (uintptr_t *)(base + off);
+            if (*p != klass_val) { g_in_safe_access = 0; continue; }
+            
+            uintptr_t obj_addr = (uintptr_t)(base + off);
+            uintptr_t monitor = *(volatile uintptr_t *)(obj_addr + 8);
+            if (monitor != 0 && monitor < 0x10000) { g_in_safe_access = 0; continue; }
+            int32_t roleId = *(volatile int32_t *)(obj_addr + 0x10);
+            if (roleId < 0 || roleId > 200) { g_in_safe_access = 0; continue; }
+            int32_t maxHp = *(volatile int32_t *)(obj_addr + 0x14);
+            if (maxHp < 0 || maxHp > 99999) { g_in_safe_access = 0; continue; }
+            int32_t curHp = *(volatile int32_t *)(obj_addr + 0x18);
+            if (curHp < 0 || curHp > 99999) { g_in_safe_access = 0; continue; }
+            int32_t level = *(volatile int32_t *)(obj_addr + 0x24);
+            if (level < 0 || level > 100) { g_in_safe_access = 0; continue; }
+            g_in_safe_access = 0;
+            
+            LOGI("RoleInfo @ 0x%" PRIxPTR ": roleId=%d level=%d HP=%d/%d",
+                 obj_addr, roleId, level, curHp, maxHp);
+            g_cached_roleinfo[g_cached_count++] = obj_addr;
+        }
+    }
+    
+    uninstall_sigsegv_handler();
+    LOGI("scan_and_cache: found %d RoleInfo instance(s)", g_cached_count);
+    return g_cached_count;
+}
+
+// 获取有效的 RoleInfo 地址列表（优先用缓存，失效则重新扫描）
+static int ensure_roleinfo_cached(void) {
+    int valid = validate_cached_roleinfo();
+    if (valid > 0) {
+        LOGI("Cache hit: %d valid RoleInfo instance(s)", valid);
+        return valid;
+    }
+    LOGI("Cache miss, doing full scan...");
+    return scan_and_cache_roleinfo();
+}
 
 // ========== 修改金币（返回修改的实例数）==========
 static int do_modify_gold(int target_gold) {
     if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
     int count = 0;
-    SCAN_ROLEINFO_INSTANCES({
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
         int32_t *gold_ptr = (int32_t *)(obj_addr + 0x2c);
         int32_t old_gold = *gold_ptr;
         *gold_ptr = target_gold;
+        g_in_safe_access = 0;
         count++;
-        LOGI("  => Gold: %d -> %d", old_gold, target_gold);
-    });
+        LOGI("  => Gold: %d -> %d @ 0x%" PRIxPTR, old_gold, target_gold, obj_addr);
+    }
+    uninstall_sigsegv_handler();
     LOGI("do_modify_gold: modified %d instance(s)", count);
     return count;
 }
@@ -545,8 +606,16 @@ static int do_modify_gold(int target_gold) {
 // ========== 重置所有技能 CD（返回重置的技能数）==========
 static int do_reset_skill_cd(void) {
     if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
     int count = 0;
-    SCAN_ROLEINFO_INSTANCES({
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        
         // dungeonSkill @ 0x80
         uintptr_t ds_ptr = *(volatile uintptr_t *)(obj_addr + 0x80);
         if (ds_ptr > 0x10000) {
@@ -575,7 +644,9 @@ static int do_reset_skill_cd(void) {
                 }
             }
         }
-    });
+        g_in_safe_access = 0;
+    }
+    uninstall_sigsegv_handler();
     LOGI("do_reset_skill_cd: reset %d skill(s)", count);
     return count;
 }
@@ -583,8 +654,17 @@ static int do_reset_skill_cd(void) {
 // ========== 同时修改金币和技能（兼容旧的一次性模式）==========
 static int modify_gold(int target_gold) {
     if (init_il2cpp_context() != 0) return -1;
+    // 一次性模式直接全量扫描
+    scan_and_cache_roleinfo();
+    if (g_cached_count == 0) return 0;
+    
     int gold_count = 0;
-    SCAN_ROLEINFO_INSTANCES({
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        
         // 修改金币
         int32_t *gold_ptr = (int32_t *)(obj_addr + 0x2c);
         int32_t old_gold = *gold_ptr;
@@ -612,14 +692,21 @@ static int modify_gold(int target_gold) {
                 }
             }
         }
-    });
+        g_in_safe_access = 0;
+    }
+    uninstall_sigsegv_handler();
     return gold_count;
 }
 
 // ========== JNI native 方法实现（供 Java 悬浮菜单回调）==========
 static jstring JNICALL jni_modify_gold(JNIEnv *env, jclass clazz, jint amount) {
     LOGI("[JNI] nativeModifyGold(%d)", (int)amount);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0) {
+        LOGW("[JNI] nativeModifyGold busy, skipping");
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中，请稍候...");
+    }
     int count = do_modify_gold((int)amount);
+    pthread_mutex_unlock(&g_hack_mutex);
     char buf[128];
     if (count > 0)
         snprintf(buf, sizeof(buf), "\u2705 金币已修改为 %d (%d个实例)", (int)amount, count);
@@ -632,7 +719,12 @@ static jstring JNICALL jni_modify_gold(JNIEnv *env, jclass clazz, jint amount) {
 
 static jstring JNICALL jni_reset_skill_cd(JNIEnv *env, jclass clazz) {
     LOGI("[JNI] nativeResetSkillCD");
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0) {
+        LOGW("[JNI] nativeResetSkillCD busy, skipping");
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中，请稍候...");
+    }
     int count = do_reset_skill_cd();
+    pthread_mutex_unlock(&g_hack_mutex);
     char buf[128];
     if (count > 0)
         snprintf(buf, sizeof(buf), "\u2705 已重置 %d 个技能CD", count);

@@ -2185,6 +2185,13 @@ static void json_escape_append(char **dst, int *remaining, const char *src) {
 static char* do_enum_items(int item_type) {
     if (init_il2cpp_context() != 0) return NULL;
 
+    // 自动预加载: 确保 config 缓存已填充
+    if (g_cached_count == 0 || g_config_cache[item_type].addr == 0) {
+        LOGI("[enum] Auto prescan for type=%d...", item_type);
+        char *ps = do_prescan();
+        if (ps) free(ps);
+    }
+
     const char *class_name;
     int known_name_off;
     switch (item_type) {
@@ -2267,7 +2274,7 @@ static char* do_enum_items(int item_type) {
     // 自动检测 name 字段偏移 (如果未知)
     int name_off = known_name_off;
     if (name_off < 0) {
-        int candidates[] = {0x18, 0x28, 0x20, 0x30, -1};
+        int candidates[] = {0x18, 0x28, 0x20, 0x30, 0x38, 0x40, -1};
         for (int i = 0; i < iter_limit && name_off < 0; i++) {
             g_in_safe_access = 1;
             if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }

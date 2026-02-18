@@ -226,7 +226,6 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         // ==================== ⚔️ 装备槽 ====================
         addSectionLabel(contentArea, "\u2694\uFE0F 装备槽数量", 0xFFFB923C);
         equipSlotsInput = addInputRow(contentArea, "装备槽数", "6", BTN_EQUIP_SLOTS, "设置");
-        addBrowseRow(contentArea, BTN_MANAGE_EQUIP, "📋 查看当前装备");
         addDivider(contentArea);
 
         // ==================== 🃏 卡牌管理 ====================
@@ -517,8 +516,6 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             showCardManageDialog();
         } else if (id == BTN_MANAGE_BLESS) {
             showManageDialog(ITEM_TYPE_LOSTTHING, "祝福/遗物", "nativeRemoveLostThing");
-        } else if (id == BTN_MANAGE_EQUIP) {
-            showManageDialog(ITEM_TYPE_EQUIP, "装备", null);
         } else if (id == BTN_PRESCAN) {
             doPreScan();
         } else if (id == BTN_P1 || id == BTN_P2 || id == BTN_P3 || id == BTN_P4) {
@@ -885,13 +882,13 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             String label = "[" + cardId + "] " + name;
             displayNames.add(label);
 
-            // 每行: 名称 | [-] 数量 [+] | [删]
+            // 每行: 名称 | 数量输入框
             LinearLayout row = new LinearLayout(activity);
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.setGravity(Gravity.CENTER_VERTICAL);
             LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            rowLp.setMargins(0, dp(2), 0, dp(2));
+            rowLp.setMargins(0, dp(1), 0, dp(1));
             row.setLayoutParams(rowLp);
 
             // 卡牌名
@@ -903,75 +900,31 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             nameLabel.setSingleLine(true);
             row.addView(nameLabel);
 
-            // [-] 按钮
-            Button minusBtn = new Button(activity);
-            minusBtn.setText("-");
-            minusBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-            minusBtn.setTextColor(Color.WHITE);
-            minusBtn.setMinHeight(0); minusBtn.setMinimumHeight(0);
-            minusBtn.setPadding(dp(4), 0, dp(4), 0);
-            GradientDrawable mbg = new GradientDrawable();
-            mbg.setColor(0xFFDC2626); mbg.setCornerRadius(dp(4));
-            minusBtn.setBackground(mbg);
-            LinearLayout.LayoutParams mblp = new LinearLayout.LayoutParams(dp(28), dp(24));
-            mblp.setMargins(dp(2), 0, 0, 0);
-            minusBtn.setLayoutParams(mblp);
-            row.addView(minusBtn);
-
-            // 数量文本
-            final TextView countText = new TextView(activity);
-            countText.setText(String.valueOf(originalCounts[i]));
-            countText.setTextColor(0xFF000000);
-            countText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-            countText.setGravity(Gravity.CENTER);
-            countText.setLayoutParams(new LinearLayout.LayoutParams(dp(28), ViewGroup.LayoutParams.WRAP_CONTENT));
-            row.addView(countText);
-
-            // [+] 按钮
-            Button plusBtn = new Button(activity);
-            plusBtn.setText("+");
-            plusBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-            plusBtn.setTextColor(Color.WHITE);
-            plusBtn.setMinHeight(0); plusBtn.setMinimumHeight(0);
-            plusBtn.setPadding(dp(4), 0, dp(4), 0);
-            GradientDrawable pbg = new GradientDrawable();
-            pbg.setColor(0xFF16A34A); pbg.setCornerRadius(dp(4));
-            plusBtn.setBackground(pbg);
-            LinearLayout.LayoutParams pblp = new LinearLayout.LayoutParams(dp(28), dp(24));
-            pblp.setMargins(0, 0, dp(2), 0);
-            plusBtn.setLayoutParams(pblp);
-            row.addView(plusBtn);
-
-            minusBtn.setOnClickListener(new View.OnClickListener() {
+            // 可编辑数量输入框
+            final EditText countEdit = new EditText(activity);
+            countEdit.setText(String.valueOf(originalCounts[i]));
+            countEdit.setTextColor(0xFF000000);
+            countEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            countEdit.setGravity(Gravity.CENTER);
+            countEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
+            countEdit.setSingleLine(true);
+            countEdit.setPadding(dp(4), dp(1), dp(4), dp(1));
+            LinearLayout.LayoutParams celp = new LinearLayout.LayoutParams(dp(40), dp(26));
+            celp.setMargins(dp(4), 0, 0, 0);
+            countEdit.setLayoutParams(celp);
+            countEdit.addTextChangedListener(new android.text.TextWatcher() {
+                @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+                @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
                 @Override
-                public void onClick(View v) {
-                    if (newCounts[idx] > 0) {
-                        newCounts[idx]--;
-                        countText.setText(String.valueOf(newCounts[idx]));
-                        if (newCounts[idx] != originalCounts[idx]) {
-                            countText.setTextColor(0xFFFF4444);
-                        } else {
-                            countText.setTextColor(0xFF000000);
-                        }
-                        updateCardInfoLabel(infoLabel, uniqueIds, newCounts);
-                    }
+                public void afterTextChanged(android.text.Editable s) {
+                    int val = originalCounts[idx];
+                    try { val = Integer.parseInt(s.toString().trim()); } catch (Exception e) {}
+                    newCounts[idx] = val;
+                    countEdit.setTextColor(val != originalCounts[idx] ? 0xFFFF4444 : 0xFF000000);
+                    updateCardInfoLabel(infoLabel, uniqueIds, newCounts);
                 }
             });
-            plusBtn.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    if (newCounts[idx] < 99) {
-                        newCounts[idx]++;
-                        countText.setText(String.valueOf(newCounts[idx]));
-                        if (newCounts[idx] != originalCounts[idx]) {
-                            countText.setTextColor(0xFFFF4444);
-                        } else {
-                            countText.setTextColor(0xFF000000);
-                        }
-                        updateCardInfoLabel(infoLabel, uniqueIds, newCounts);
-                    }
-                }
-            });
+            row.addView(countEdit);
 
             cardRows[i] = row;
             listLayout.addView(row);

@@ -2655,6 +2655,9 @@ static jstring JNICALL jni_modify_equip_slots(JNIEnv *env, jclass clazz, jint sl
 
 // ========== 多线程预扫描 ==========
 #define NUM_SCAN_THREADS 4
+#define PRESCAN_SLOTS 5
+
+static char* do_prescan(void); // 前向声明
 
 typedef struct {
     int region_start;           // g_regions 起始索引 (含)
@@ -2751,7 +2754,6 @@ static char* do_prescan(void) {
     
     // ====== 收集所有要查找的 klass 指针 ======
     // 0=RoleInfo, 1=RoleInfoToWar, 2=CardsConfig, 3=LostThingConfig, 4=MinionEquipConfig
-    #define PRESCAN_SLOTS 5
     uintptr_t target_klass[PRESCAN_SLOTS] = {0};
     target_klass[0] = (uintptr_t)g_roleinfo_cls;
     target_klass[1] = g_warinfo_cls ? (uintptr_t)g_warinfo_cls : 0;

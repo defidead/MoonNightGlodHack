@@ -127,130 +127,126 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         // ===== 主容器 =====
         container = new LinearLayout(activity);
         container.setOrientation(LinearLayout.VERTICAL);
-        container.setPadding(dp(12), dp(8), dp(12), dp(10));
+        container.setPadding(dp(10), dp(6), dp(10), dp(8));
 
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0xDD1A1A2E);
-        bg.setCornerRadius(dp(14));
-        bg.setStroke(dp(1), 0xFF7C3AED);
+        GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0xF00D0D1F, 0xF0141430});
+        bg.setCornerRadius(dp(16));
+        bg.setStroke(dp(1), 0x44818CF8);
         container.setBackground(bg);
 
         // ===== 标题栏 (可拖动) =====
         LinearLayout titleBar = new LinearLayout(activity);
         titleBar.setOrientation(LinearLayout.HORIZONTAL);
         titleBar.setGravity(Gravity.CENTER_VERTICAL);
+        titleBar.setPadding(dp(2), dp(2), dp(2), dp(2));
         titleBar.setOnTouchListener(this);
 
         TextView title = new TextView(activity);
         title.setText("\uD83C\uDF15 月圆之夜");
         title.setTextColor(0xFFE0E7FF);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        title.setTypeface(null, android.graphics.Typeface.BOLD);
         title.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         titleBar.addView(title);
 
+        TextView verLabel = new TextView(activity);
+        verLabel.setText("v2.0");
+        verLabel.setTextColor(0x66A5B4FC);
+        verLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+        LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        vlp.setMargins(0, 0, dp(6), 0);
+        verLabel.setLayoutParams(vlp);
+        titleBar.addView(verLabel);
+
         toggleBtn = makeBtn("\u2014", 0x33FFFFFF, BTN_TOGGLE);
         toggleBtn.setTextColor(0xFFA5B4FC);
-        LinearLayout.LayoutParams tblp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(28));
-        tblp.setMargins(dp(6), 0, 0, 0);
-        toggleBtn.setLayoutParams(tblp);
+        toggleBtn.setLayoutParams(new LinearLayout.LayoutParams(dp(28), dp(28)));
         titleBar.addView(toggleBtn);
 
         container.addView(titleBar);
 
+        // 标题渐变下划线
+        View accentLine = new View(activity);
+        accentLine.setBackground(new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[]{0xFF6366F1, 0xFF7C3AED, 0x006366F1}));
+        LinearLayout.LayoutParams aclp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(2));
+        aclp.setMargins(0, dp(1), 0, dp(4));
+        accentLine.setLayoutParams(aclp);
+        container.addView(accentLine);
+
         // ===== 内容区 (可滚动) =====
         scrollView = new ScrollView(activity);
         LinearLayout.LayoutParams svlp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(380));
-        svlp.setMargins(0, dp(4), 0, 0);
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(400));
         scrollView.setLayoutParams(svlp);
+        scrollView.setVerticalScrollBarEnabled(false);
 
         contentArea = new LinearLayout(activity);
         contentArea.setOrientation(LinearLayout.VERTICAL);
         contentArea.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // ==================== � 预加载 ====================
-        Button prescanBtn = makeBtn("🔄 预加载内存数据", 0xFF0E7490, BTN_PRESCAN);
+        // ==================== 🔄 预加载 ====================
+        Button prescanBtn = makeGradientBtn("\uD83D\uDD04 预加载内存数据", 0xFF0E7490, 0xFF0D9488, BTN_PRESCAN);
         LinearLayout.LayoutParams pslp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(34));
-        pslp.setMargins(0, dp(2), 0, dp(2));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(32));
+        pslp.setMargins(0, 0, 0, dp(6));
         prescanBtn.setLayoutParams(pslp);
         prescanBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         contentArea.addView(prescanBtn);
-        addDivider(contentArea);
 
-        // ==================== �💰 金币 ====================
-        addSectionLabel(contentArea, "\uD83D\uDCB0 金币", 0xFFFCD34D);
-        goldInput = addInputRow(contentArea, "金币", "99999", BTN_GOLD, "修改");
+        // ==================== ⚔️ 战斗属性 ====================
+        LinearLayout statsCard = makeSectionCard(0xFF1A1A35, 0x337C3AED);
+        addCardHeader(statsCard, "\u2694\uFE0F 战斗属性", 0xFFFCD34D);
 
+        goldInput = addCompactInputRow(statsCard, "\uD83D\uDCB0 金币", "99999", BTN_GOLD, "修改");
+
+        // 金币快捷按钮
         LinearLayout quickRow = new LinearLayout(activity);
         quickRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams qrlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        qrlp.setMargins(0, dp(3), 0, 0);
+        qrlp.setMargins(0, dp(1), 0, dp(3));
         quickRow.setLayoutParams(qrlp);
         int[] presets = {9999, 99999, 888888, 999999};
-        int[] pids    = {BTN_P1, BTN_P2, BTN_P3, BTN_P4};
+        int[] pids = {BTN_P1, BTN_P2, BTN_P3, BTN_P4};
         for (int i = 0; i < presets.length; i++) {
-            Button qb = makeBtn(String.valueOf(presets[i]), 0xFF374151, pids[i]);
-            qb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+            Button qb = makeBtn(String.valueOf(presets[i]), 0xFF252545, pids[i]);
+            qb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+            qb.setTextColor(0xFFAAAACC);
             qb.setTag(presets[i]);
-            LinearLayout.LayoutParams qblp = new LinearLayout.LayoutParams(0, dp(24), 1f);
-            if (i > 0) qblp.setMargins(dp(3), 0, 0, 0);
+            LinearLayout.LayoutParams qblp = new LinearLayout.LayoutParams(0, dp(22), 1f);
+            if (i > 0) qblp.setMargins(dp(2), 0, 0, 0);
             qb.setLayoutParams(qblp);
             quickRow.addView(qb);
         }
-        contentArea.addView(quickRow);
-        addDivider(contentArea);
+        statsCard.addView(quickRow);
 
-        // ==================== ❤️ 血量上限 ====================
-        addSectionLabel(contentArea, "\u2764\uFE0F 血量上限 (同时回满)", 0xFFEF4444);
-        hpInput = addInputRow(contentArea, "血量", "999", BTN_HP, "修改");
-        addDivider(contentArea);
+        hpInput = addCompactInputRow(statsCard, "\u2764\uFE0F 血量上限", "999", BTN_HP, "修改");
+        mpInput = addCompactInputRow(statsCard, "\uD83D\uDD2E 法力值", "99", BTN_MP, "修改");
+        actionInput = addCompactInputRow(statsCard, "\u26A1 行动值", "99", BTN_ACTION, "修改");
+        handcardsInput = addCompactInputRow(statsCard, "\uD83C\uDCCF 手牌上限", "10", BTN_HANDCARDS, "修改");
+        equipSlotsInput = addCompactInputRow(statsCard, "\u2694\uFE0F 装备槽", "6", BTN_EQUIP_SLOTS, "设置");
 
-        // ==================== 🔮 法力值 ====================
-        addSectionLabel(contentArea, "\uD83D\uDD2E 法力值", 0xFF818CF8);
-        mpInput = addInputRow(contentArea, "法力", "99", BTN_MP, "修改");
-        addDivider(contentArea);
-
-        // ==================== ⚡ 行动值 ====================
-        addSectionLabel(contentArea, "\u26A1 行动值", 0xFF67E8F9);
-        actionInput = addInputRow(contentArea, "行动值", "99", BTN_ACTION, "修改");
-        addDivider(contentArea);
-
-        // ==================== 🃏 手牌上限 ====================
-        addSectionLabel(contentArea, "\uD83C\uDCCF 手牌上限", 0xFF4ADE80);
-        handcardsInput = addInputRow(contentArea, "手牌上限", "10", BTN_HANDCARDS, "修改");
-        addDivider(contentArea);
-
-        // ==================== ⚔️ 装备槽 ====================
-        addSectionLabel(contentArea, "\u2694\uFE0F 装备槽数量", 0xFFFB923C);
-        equipSlotsInput = addInputRow(contentArea, "装备槽数", "6", BTN_EQUIP_SLOTS, "设置");
-        addDivider(contentArea);
+        contentArea.addView(statsCard);
 
         // ==================== 🃏 卡牌管理 ====================
-        addSectionLabel(contentArea, "\uD83C\uDCCF 卡牌管理", 0xFF60A5FA);
-        // 卡牌ID + 数量 + 添加 (自定义行)
+        LinearLayout cardsCard = makeSectionCard(0xFF1A1A35, 0x3360A5FA);
+        addCardHeader(cardsCard, "\uD83C\uDCCF 卡牌管理", 0xFF60A5FA);
+
         {
             LinearLayout cardRow = new LinearLayout(activity);
             cardRow.setOrientation(LinearLayout.HORIZONTAL);
             cardRow.setGravity(Gravity.CENTER_VERTICAL);
             LinearLayout.LayoutParams crlp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            crlp.setMargins(0, dp(3), 0, 0);
+            crlp.setMargins(0, dp(2), 0, 0);
             cardRow.setLayoutParams(crlp);
 
-            cardInput = new EditText(activity);
-            cardInput.setHint("卡牌ID");
-            cardInput.setTextColor(Color.WHITE);
-            cardInput.setHintTextColor(0xFF666688);
-            cardInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-            cardInput.setInputType(InputType.TYPE_CLASS_NUMBER);
-            cardInput.setSingleLine(true);
-            cardInput.setPadding(dp(6), dp(3), dp(6), dp(3));
-            GradientDrawable cibg = new GradientDrawable();
-            cibg.setColor(0xFF1E1E3F); cibg.setCornerRadius(dp(6)); cibg.setStroke(dp(1), 0xFF4338CA);
-            cardInput.setBackground(cibg);
+            cardInput = makeStyledInput("卡牌ID");
             cardInput.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
             final EditText ciRef = cardInput;
             cardInput.setOnClickListener(new View.OnClickListener() {
@@ -263,23 +259,13 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
 
             TextView xLabel = new TextView(activity);
             xLabel.setText(" x");
-            xLabel.setTextColor(0xFFCCCCCC);
-            xLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            xLabel.setTextColor(0xFF888899);
+            xLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
             cardRow.addView(xLabel);
 
-            cardCountInput = new EditText(activity);
-            cardCountInput.setHint("1");
+            cardCountInput = makeStyledInput("1");
             cardCountInput.setText("1");
-            cardCountInput.setTextColor(Color.WHITE);
-            cardCountInput.setHintTextColor(0xFF666688);
-            cardCountInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-            cardCountInput.setInputType(InputType.TYPE_CLASS_NUMBER);
-            cardCountInput.setSingleLine(true);
-            cardCountInput.setPadding(dp(4), dp(3), dp(4), dp(3));
-            GradientDrawable ccbg = new GradientDrawable();
-            ccbg.setColor(0xFF1E1E3F); ccbg.setCornerRadius(dp(6)); ccbg.setStroke(dp(1), 0xFF4338CA);
-            cardCountInput.setBackground(ccbg);
-            cardCountInput.setLayoutParams(new LinearLayout.LayoutParams(dp(36), ViewGroup.LayoutParams.WRAP_CONTENT));
+            cardCountInput.setLayoutParams(new LinearLayout.LayoutParams(dp(32), ViewGroup.LayoutParams.WRAP_CONTENT));
             final EditText ccRef = cardCountInput;
             cardCountInput.setOnClickListener(new View.OnClickListener() {
                 @Override public void onClick(View v) {
@@ -289,60 +275,72 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             });
             cardRow.addView(cardCountInput);
 
-            Button cardAddBtn = makeBtn("添加", 0xFF7C3AED, BTN_CARD);
-            LinearLayout.LayoutParams cablp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30));
-            cablp.setMargins(dp(4), 0, 0, 0);
+            Button cardAddBtn = makeBtn("添加", 0xFF6366F1, BTN_CARD);
+            LinearLayout.LayoutParams cablp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(28));
+            cablp.setMargins(dp(3), 0, 0, 0);
             cardAddBtn.setLayoutParams(cablp);
             cardRow.addView(cardAddBtn);
 
-            contentArea.addView(cardRow);
+            cardsCard.addView(cardRow);
         }
-        addBrowseRow(contentArea, BTN_BROWSE_CARD, "📂 浏览全部卡牌");
-        addBrowseRow(contentArea, BTN_MANAGE_CARD, "📋 管理当前卡牌 (查看/删除)");
-        addDivider(contentArea);
 
-        // ==================== ✨ 祝福管理 ====================
-        addSectionLabel(contentArea, "\u2728 祝福/遗物管理", 0xFFFBBF24);
-        lostthingInput = addInputRow(contentArea, "遗物ID", "", BTN_LOSTTHING, "添加");
-        addBrowseRow(contentArea, BTN_BROWSE_BLESS, "📂 浏览全部祝福");
-        addBrowseRow(contentArea, BTN_MANAGE_BLESS, "📋 管理当前祝福 (查看/删除)");
-        addDivider(contentArea);
+        addDualActionRow(cardsCard, BTN_BROWSE_CARD, "\uD83D\uDCC2 浏览全部", BTN_MANAGE_CARD, "\uD83D\uDCCB 管理当前");
+        contentArea.addView(cardsCard);
+
+        // ==================== ✨ 祝福/遗物 ====================
+        LinearLayout blessCard = makeSectionCard(0xFF1A1A35, 0x33FBBF24);
+        addCardHeader(blessCard, "\u2728 祝福/遗物", 0xFFFBBF24);
+
+        lostthingInput = addCompactInputRow(blessCard, "遗物ID", "", BTN_LOSTTHING, "添加");
+        addDualActionRow(blessCard, BTN_BROWSE_BLESS, "\uD83D\uDCC2 浏览全部", BTN_MANAGE_BLESS, "\uD83D\uDCCB 管理当前");
+
+        contentArea.addView(blessCard);
 
         // ==================== ⚡ 技能CD ====================
-        addSectionLabel(contentArea, "\u26A1 技能CD", 0xFF67E8F9);
+        LinearLayout skillCard = makeSectionCard(0xFF1A1A35, 0x3367E8F9);
+        addCardHeader(skillCard, "\u26A1 技能CD", 0xFF67E8F9);
+
         LinearLayout skillRow = new LinearLayout(activity);
         skillRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams srlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        srlp.setMargins(0, dp(3), 0, 0);
+        srlp.setMargins(0, dp(2), 0, 0);
         skillRow.setLayoutParams(srlp);
 
         Button skillBtn = makeBtn("重置CD", 0xFF0E7490, BTN_SKILL);
-        skillBtn.setLayoutParams(new LinearLayout.LayoutParams(0, dp(32), 1f));
+        skillBtn.setLayoutParams(new LinearLayout.LayoutParams(0, dp(28), 1f));
         skillRow.addView(skillBtn);
 
-        autoSkillBtn = makeBtn("自动:关", 0xFF374151, BTN_SKILL_AUTO);
-        LinearLayout.LayoutParams asblp = new LinearLayout.LayoutParams(0, dp(32), 1f);
-        asblp.setMargins(dp(4), 0, 0, 0);
+        autoSkillBtn = makeBtn("自动:关", 0xFF2D2D4A, BTN_SKILL_AUTO);
+        LinearLayout.LayoutParams asblp = new LinearLayout.LayoutParams(0, dp(28), 1f);
+        asblp.setMargins(dp(3), 0, 0, 0);
         autoSkillBtn.setLayoutParams(asblp);
         skillRow.addView(autoSkillBtn);
-        contentArea.addView(skillRow);
-        addDivider(contentArea);
+
+        skillCard.addView(skillRow);
+        contentArea.addView(skillCard);
 
         // ==================== 🚀 一键修改 ====================
-        Button modAllBtn = makeBtn("\uD83D\uDE80 一键全部修改", 0xFF7C3AED, BTN_MODIFY_ALL);
+        Button modAllBtn = makeGradientBtn("\uD83D\uDE80 一键全部修改", 0xFF6366F1, 0xFF7C3AED, BTN_MODIFY_ALL);
         LinearLayout.LayoutParams mablp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(38));
-        mablp.setMargins(0, dp(3), 0, 0);
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(36));
+        mablp.setMargins(0, dp(6), 0, 0);
         modAllBtn.setLayoutParams(mablp);
         modAllBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        modAllBtn.setTypeface(null, android.graphics.Typeface.BOLD);
         contentArea.addView(modAllBtn);
 
-        // --- 状态文本 ---
+        // --- 状态栏 ---
         statusText = new TextView(activity);
-        statusText.setText("就绪 - 进入对局后使用");
+        statusText.setText("\u2705 就绪 - 进入对局后使用");
         statusText.setTextColor(0xFF9CA3AF);
-        statusText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        statusText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        statusText.setPadding(dp(6), dp(4), dp(6), dp(4));
+        GradientDrawable stBg = new GradientDrawable();
+        stBg.setColor(0x18FFFFFF);
+        stBg.setCornerRadius(dp(6));
+        statusText.setBackground(stBg);
         LinearLayout.LayoutParams stlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         stlp.setMargins(0, dp(6), 0, 0);
@@ -354,7 +352,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
 
         // ===== WindowManager 参数 =====
         wmParams = new WindowManager.LayoutParams(
-                dp(240),
+                dp(250),
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 2,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
@@ -364,56 +362,69 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         wmParams.y = dp(80);
 
         wm.addView(container, wmParams);
-        android.util.Log.i("GoldHack", "Overlay menu created");
+        android.util.Log.i("GoldHack", "Overlay menu created (v2.0)");
     }
 
-    // ===== 辅助: 添加区域标签 =====
-    private void addSectionLabel(LinearLayout parent, String text, int color) {
+    // ===== 辅助: 创建区段卡片 =====
+    private LinearLayout makeSectionCard(int bgColor, int borderColor) {
+        LinearLayout card = new LinearLayout(activity);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(8), dp(6), dp(8), dp(6));
+        GradientDrawable gd = new GradientDrawable();
+        gd.setColor(bgColor);
+        gd.setCornerRadius(dp(10));
+        gd.setStroke(dp(1), borderColor);
+        card.setBackground(gd);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, dp(4), 0, 0);
+        card.setLayoutParams(lp);
+        return card;
+    }
+
+    // ===== 辅助: 卡片标题 =====
+    private void addCardHeader(LinearLayout parent, String text, int color) {
         TextView label = new TextView(activity);
         label.setText(text);
         label.setTextColor(color);
         label.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        label.setTypeface(null, android.graphics.Typeface.BOLD);
+        label.setPadding(0, 0, 0, dp(2));
         parent.addView(label);
     }
 
-    // ===== 辅助: 添加输入行 =====
-    private EditText addInputRow(LinearLayout parent, String hint, String defVal, int btnId, String btnText) {
+    // ===== 辅助: 紧凑输入行 (标签+输入+按钮) =====
+    private EditText addCompactInputRow(LinearLayout parent, String label, String defVal, int btnId, String btnText) {
         LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        rlp.setMargins(0, dp(3), 0, 0);
+        rlp.setMargins(0, dp(2), 0, 0);
         row.setLayoutParams(rlp);
 
-        EditText input = new EditText(activity);
-        input.setHint(hint);
-        if (defVal != null && !defVal.isEmpty()) input.setText(defVal);
-        input.setTextColor(Color.WHITE);
-        input.setHintTextColor(0xFF666688);
-        input.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        input.setInputType(InputType.TYPE_CLASS_NUMBER);
-        input.setSingleLine(true);
-        input.setPadding(dp(6), dp(3), dp(6), dp(3));
-        GradientDrawable ibg = new GradientDrawable();
-        ibg.setColor(0xFF1E1E3F);
-        ibg.setCornerRadius(dp(6));
-        ibg.setStroke(dp(1), 0xFF4338CA);
-        input.setBackground(ibg);
-        input.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        // 左侧标签
+        TextView tv = new TextView(activity);
+        tv.setText(label);
+        tv.setTextColor(0xFFCCCCDD);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        tv.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.45f));
+        row.addView(tv);
 
+        // 输入框
+        EditText input = makeStyledInput("");
+        if (defVal != null && !defVal.isEmpty()) input.setText(defVal);
+        input.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.35f));
         final EditText fi = input;
         input.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
+            @Override public void onClick(View v) {
                 wmParams.flags = 0;
                 try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
                 fi.requestFocus();
             }
         });
         input.setOnFocusChangeListener(new View.OnFocusChangeListener() {
-            @Override
-            public void onFocusChange(View v, boolean hasFocus) {
+            @Override public void onFocusChange(View v, boolean hasFocus) {
                 if (!hasFocus) {
                     wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
                     try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
@@ -422,45 +433,73 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         });
         row.addView(input);
 
-        Button btn = makeBtn(btnText, 0xFF7C3AED, btnId);
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30));
-        blp.setMargins(dp(4), 0, 0, 0);
+        // 按钮
+        Button btn = makeBtn(btnText, 0xFF6366F1, btnId);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(26));
+        blp.setMargins(dp(3), 0, 0, 0);
         btn.setLayoutParams(blp);
+        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         row.addView(btn);
 
         parent.addView(row);
         return input;
     }
 
-    private void addDivider(LinearLayout parent) {
-        View div = new View(activity);
-        div.setBackgroundColor(0xFF333366);
-        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
-        dlp.setMargins(0, dp(6), 0, dp(6));
-        div.setLayoutParams(dlp);
-        parent.addView(div);
+    // ===== 辅助: 样式化输入框 =====
+    private EditText makeStyledInput(String hint) {
+        EditText input = new EditText(activity);
+        input.setHint(hint);
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(0xFF555577);
+        input.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        input.setInputType(InputType.TYPE_CLASS_NUMBER);
+        input.setSingleLine(true);
+        input.setPadding(dp(6), dp(3), dp(6), dp(3));
+        GradientDrawable ibg = new GradientDrawable();
+        ibg.setColor(0xFF16163A);
+        ibg.setCornerRadius(dp(6));
+        ibg.setStroke(dp(1), 0xFF333366);
+        input.setBackground(ibg);
+        return input;
     }
 
-    // 添加 "浏览" 按钮行
-    private void addBrowseRow(LinearLayout parent, int btnId, String label) {
-        Button btn = makeBtn(label, 0xFF374151, btnId);
-        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(26));
-        lp.setMargins(0, dp(2), 0, 0);
-        btn.setLayoutParams(lp);
-        parent.addView(btn);
+    // ===== 辅助: 双按钮行 =====
+    private void addDualActionRow(LinearLayout parent, int btn1Id, String btn1Text, int btn2Id, String btn2Text) {
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rlp.setMargins(0, dp(3), 0, 0);
+        row.setLayoutParams(rlp);
+
+        Button b1 = makeBtn(btn1Text, 0xFF252545, btn1Id);
+        b1.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        b1.setTextColor(0xFFCCCCDD);
+        b1.setLayoutParams(new LinearLayout.LayoutParams(0, dp(26), 1f));
+        row.addView(b1);
+
+        Button b2 = makeBtn(btn2Text, 0xFF252545, btn2Id);
+        b2.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        b2.setTextColor(0xFFCCCCDD);
+        LinearLayout.LayoutParams b2lp = new LinearLayout.LayoutParams(0, dp(26), 1f);
+        b2lp.setMargins(dp(3), 0, 0, 0);
+        b2.setLayoutParams(b2lp);
+        row.addView(b2);
+
+        parent.addView(row);
     }
 
-    private Button makeBtn(String text, int bgColor, int id) {
+    // ===== 辅助: 渐变按钮 =====
+    private Button makeGradientBtn(String text, int color1, int color2, int id) {
         Button btn = new Button(activity);
         btn.setText(text);
         btn.setTextColor(Color.WHITE);
         btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
         btn.setAllCaps(false);
-        GradientDrawable gd = new GradientDrawable();
-        gd.setColor(bgColor);
-        gd.setCornerRadius(dp(8));
+        GradientDrawable gd = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT,
+                new int[]{color1, color2});
+        gd.setCornerRadius(dp(10));
         btn.setBackground(gd);
         btn.setPadding(dp(10), dp(2), dp(10), dp(2));
         btn.setMinHeight(0);
@@ -469,6 +508,25 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         btn.setOnClickListener(this);
         return btn;
     }
+
+    private Button makeBtn(String text, int bgColor, int id) {
+        Button btn = new Button(activity);
+        btn.setText(text);
+        btn.setTextColor(Color.WHITE);
+        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        btn.setAllCaps(false);
+        GradientDrawable gd = new GradientDrawable();
+        gd.setColor(bgColor);
+        gd.setCornerRadius(dp(8));
+        btn.setBackground(gd);
+        btn.setPadding(dp(8), dp(2), dp(8), dp(2));
+        btn.setMinHeight(0);
+        btn.setMinimumHeight(0);
+        btn.setId(id);
+        btn.setOnClickListener(this);
+        return btn;
+    }
+
 
     @Override
     public void onClick(View v) {
@@ -482,7 +540,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             } else {
                 scrollView.setVisibility(View.VISIBLE);
                 toggleBtn.setText("\u2014");
-                wmParams.width = dp(240);
+                wmParams.width = dp(250);
             }
             wmParams.height = ViewGroup.LayoutParams.WRAP_CONTENT;
             try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
@@ -680,7 +738,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         } else {
             autoSkillBtn.setText("自动:关");
             GradientDrawable gd = new GradientDrawable();
-            gd.setColor(0xFF374151);
+            gd.setColor(0xFF2D2D4A);
             gd.setCornerRadius(dp(8));
             autoSkillBtn.setBackground(gd);
             stopAutoReset();

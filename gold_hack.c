@@ -2365,25 +2365,124 @@ static jstring JNICALL jni_modify_equip_slots(JNIEnv *env, jclass clazz, jint sl
 static char* do_prescan(void) {
     if (init_il2cpp_context() != 0) return strdup("\u274C il2cpp 初始化失败");
     
-    // 强制全量扫描 RoleInfo
-    int ri_count = scan_and_cache_roleinfo();
+    // ====== 收集所有要查找的 klass 指针 ======
+    // 0=RoleInfo, 1=RoleInfoToWar, 2=CardsConfig, 3=LostThingConfig, 4=MinionEquipConfig
+    #define PRESCAN_SLOTS 5
+    uintptr_t target_klass[PRESCAN_SLOTS] = {0};
+    target_klass[0] = (uintptr_t)g_roleinfo_cls;
+    target_klass[1] = g_warinfo_cls ? (uintptr_t)g_warinfo_cls : 0;
     
-    // 预缓存所有配置类实例
     const char *cfg_names[] = {"CardsConfig", "LostThingConfig", "MinionEquipConfig"};
     int cfg_types[] = {1, 2, 3};
-    int cached = 0;
     for (int c = 0; c < 3; c++) {
         Il2CppClass klass = fn_class_from_name(g_csharp_image, "", cfg_names[c]);
-        if (!klass) { LOGW("[prescan] Class %s not found", cfg_names[c]); continue; }
-        uintptr_t inst = get_cached_config(cfg_types[c], (uintptr_t)klass);
-        if (!inst) {
-            inst = find_single_class_instance((uintptr_t)klass);
-            if (inst) { set_config_cache(cfg_types[c], (uintptr_t)klass, inst); cached++; }
-            else { LOGW("[prescan] No instance for %s", cfg_names[c]); }
-        } else { cached++; }
+        target_klass[2 + c] = (uintptr_t)klass;
     }
     
-    // 输出 RoleInfo 详情 (调试用)
+    // 配置类: 记录最佳候选 (dict count 最大)
+    uintptr_t cfg_best_addr[3] = {0};
+    int32_t   cfg_best_count[3] = {0};
+    
+    // 重置缓存
+    g_cached_count = 0;
+    g_warinfo_count = 0;
+    
+    // ====== 单次遍历所有内存区域, 同时匹配 5 个 klass ======
+    parse_maps();
+    install_sigsegv_handler();
+    
+    for (int r = 0; r < g_region_count; r++) {
+        MemRegion *region = &g_regions[r];
+        if (!region->readable || !region->writable) continue;
+        if (region->executable) continue;
+        size_t size = region->end - region->start;
+        if (size < 0x40 || size > MAX_SCAN_SIZE) continue;
+        if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue;
+        
+        uint8_t *base = (uint8_t *)region->start;
+        for (size_t off = 0; off <= size - 0x40; off += 8) {
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; break; }
+            
+            uintptr_t val = *(volatile uintptr_t *)(base + off);
+            if (val == 0) { g_in_safe_access = 0; continue; }
+            
+            uintptr_t obj_addr = (uintptr_t)(base + off);
+            
+            // --- RoleInfo (slot 0) ---
+            if (val == target_klass[0] && g_cached_count < MAX_CACHED_ROLEINFO
+                && off + 0x100 <= size) {
+                int32_t roleId = *(volatile int32_t *)(obj_addr + 0x10);
+                int32_t maxHp  = *(volatile int32_t *)(obj_addr + 0x14);
+                int32_t curHp  = *(volatile int32_t *)(obj_addr + 0x18);
+                int32_t level  = *(volatile int32_t *)(obj_addr + 0x24);
+                if (roleId >= 0 && roleId <= 200 && maxHp >= 0 && maxHp <= 99999
+                    && curHp >= 0 && curHp <= 99999 && level >= 0 && level <= 100) {
+                    uintptr_t monitor = *(volatile uintptr_t *)(obj_addr + 8);
+                    if (monitor == 0 || monitor >= 0x10000) {
+                        LOGI("RoleInfo @ 0x%" PRIxPTR ": roleId=%d level=%d HP=%d/%d",
+                             obj_addr, roleId, level, curHp, maxHp);
+                        g_cached_roleinfo[g_cached_count++] = obj_addr;
+                    }
+                }
+                g_in_safe_access = 0; continue;
+            }
+            
+            // --- RoleInfoToWar (slot 1) ---
+            if (target_klass[1] && val == target_klass[1]
+                && g_warinfo_count < MAX_CACHED_WARINFO && off + 0x80 <= size) {
+                int32_t hp    = *(volatile int32_t *)(obj_addr + 0x10);
+                int32_t maxHp = *(volatile int32_t *)(obj_addr + 0x14);
+                int32_t level = *(volatile int32_t *)(obj_addr + 0x20);
+                if (hp >= 0 && hp <= 999999 && maxHp >= 0 && maxHp <= 999999
+                    && level >= 0 && level <= 100) {
+                    LOGI("RoleInfoToWar @ 0x%" PRIxPTR ": hp=%d/%d level=%d",
+                         obj_addr, hp, maxHp, level);
+                    g_cached_warinfo[g_warinfo_count++] = obj_addr;
+                }
+                g_in_safe_access = 0; continue;
+            }
+            
+            // --- 3 个 Config 类 (slots 2,3,4) ---
+            for (int c = 0; c < 3; c++) {
+                if (target_klass[2+c] && val == target_klass[2+c]) {
+                    uintptr_t dict_ptr = *(volatile uintptr_t *)(obj_addr + 0x10);
+                    if (dict_ptr >= 0x10000) {
+                        int32_t count = *(volatile int32_t *)(dict_ptr + 0x20);
+                        if (count > 0 && count < 100000 && count > cfg_best_count[c]) {
+                            cfg_best_count[c] = count;
+                            cfg_best_addr[c] = obj_addr;
+                        }
+                    }
+                    break;
+                }
+            }
+            g_in_safe_access = 0;
+        }
+    }
+    uninstall_sigsegv_handler();
+    
+    LOGI("[prescan] single-pass done: RoleInfo=%d, WarInfo=%d", g_cached_count, g_warinfo_count);
+    
+    // ====== 保存配置类缓存 ======
+    int cached = 0;
+    for (int c = 0; c < 3; c++) {
+        if (cfg_best_addr[c]) {
+            set_config_cache(cfg_types[c], target_klass[2+c], cfg_best_addr[c]);
+            cached++;
+            LOGI("[prescan] %s @ %p (dict count=%d)", cfg_names[c],
+                 (void*)cfg_best_addr[c], cfg_best_count[c]);
+        } else if (get_cached_config(cfg_types[c], target_klass[2+c])) {
+            cached++; // 之前已缓存且仍有效
+        } else {
+            LOGW("[prescan] No instance for %s", cfg_names[c]);
+        }
+    }
+    
+    // ====== 输出调试详情 ======
+    int ri_count = g_cached_count;
+    int wi_count = g_warinfo_count;
+    
     if (ri_count > 0) {
         install_sigsegv_handler();
         for (int i = 0; i < g_cached_count; i++) {
@@ -2393,42 +2492,12 @@ static char* do_prescan(void) {
             int32_t gold = *(volatile int32_t *)(obj + OFF_CURGOLD);
             int32_t hp = *(volatile int32_t *)(obj + OFF_CURHP);
             int32_t maxhp = *(volatile int32_t *)(obj + OFF_MAXHP);
-            uintptr_t cards_lib = *(volatile uintptr_t *)(obj + 0x90);
-            uintptr_t equip_slot = *(volatile uintptr_t *)(obj + OFF_EQUIPSLOT);
-            uintptr_t lostthing = *(volatile uintptr_t *)(obj + OFF_LOSTTHING);
-            uintptr_t cards_bat = *(volatile uintptr_t *)(obj + 0x100);
             g_in_safe_access = 0;
             LOGI("[prescan] RoleInfo[%d] @ %p: gold=%d hp=%d/%d", i, (void*)obj, gold, hp, maxhp);
-            LOGI("[prescan]   cardsLib=%p equipSlot=%p lostthing=%p cardsBattle=%p",
-                 (void*)cards_lib, (void*)equip_slot, (void*)lostthing, (void*)cards_bat);
-            // 显示各 List 的 size
-            if (cards_lib > 0x10000) {
-                g_in_safe_access = 1;
-                if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
-                int32_t s = *(volatile int32_t *)(cards_lib + 0x18);
-                g_in_safe_access = 0;
-                LOGI("[prescan]   cardsLibraryAll size=%d", s);
-            }
-            if (equip_slot > 0x10000) {
-                g_in_safe_access = 1;
-                if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
-                int32_t s = *(volatile int32_t *)(equip_slot + 0x18);
-                g_in_safe_access = 0;
-                LOGI("[prescan]   equipmentSlot size=%d", s);
-            }
-            if (lostthing > 0x10000) {
-                g_in_safe_access = 1;
-                if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
-                int32_t s = *(volatile int32_t *)(lostthing + 0x18);
-                g_in_safe_access = 0;
-                LOGI("[prescan]   lostThingList size=%d", s);
-            }
         }
         uninstall_sigsegv_handler();
     }
     
-    // 强制全量扫描 RoleInfoToWar (战斗数据)
-    int wi_count = scan_and_cache_warinfo();
     if (wi_count > 0) {
         install_sigsegv_handler();
         for (int i = 0; i < g_warinfo_count; i++) {
@@ -2437,19 +2506,10 @@ static char* do_prescan(void) {
             if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
             int32_t hp = *(volatile int32_t *)(wobj + 0x10);
             int32_t maxHp = *(volatile int32_t *)(wobj + 0x14);
-            int32_t level = *(volatile int32_t *)(wobj + 0x20);
             uintptr_t war_equipts = *(volatile uintptr_t *)(wobj + 0x60);
-            uintptr_t war_cards = *(volatile uintptr_t *)(wobj + 0x50);
             g_in_safe_access = 0;
-            LOGI("[prescan] RoleInfoToWar[%d] @ %p: hp=%d/%d level=%d", i, (void*)wobj, hp, maxHp, level);
-            LOGI("[prescan]   equipts=%p cards=%p", (void*)war_equipts, (void*)war_cards);
-            if (war_equipts > 0x10000) {
-                g_in_safe_access = 1;
-                if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
-                int32_t s = *(volatile int32_t *)(war_equipts + 0x18);
-                g_in_safe_access = 0;
-                LOGI("[prescan]   war equipts size=%d", s);
-            }
+            LOGI("[prescan] WarInfo[%d] @ %p: hp=%d/%d equipts=%p",
+                 i, (void*)wobj, hp, maxHp, (void*)war_equipts);
         }
         uninstall_sigsegv_handler();
     }

@@ -827,56 +827,11 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     }
 
     private void buildCardManageDialog(String currentJson, String enumJson) {
-        // 解析当前 ID 列表 (含重复)
-        final List<Integer> currentIds = new ArrayList<Integer>();
-        try {
-            String s = currentJson.trim();
-            if (s.startsWith("[")) s = s.substring(1);
-            if (s.endsWith("]")) s = s.substring(0, s.length() - 1);
-            if (!s.isEmpty()) {
-                for (String part : s.split(",")) {
-                    part = part.trim();
-                    if (!part.isEmpty()) {
-                        int id = Integer.parseInt(part);
-                        if (id > 0) currentIds.add(id);
-                    }
-                }
-            }
-        } catch (Exception e) { /* ignore */ }
+        final List<Integer> currentIds = parseIdList(currentJson);
+        if (currentIds.isEmpty()) { statusText.setText("\u26A0\uFE0F 当前没有卡牌"); return; }
 
-        if (currentIds.isEmpty()) {
-            statusText.setText("\u26A0\uFE0F 当前没有卡牌");
-            return;
-        }
+        final java.util.Map<Integer, String> nameMap = parseNameMap(enumJson);
 
-        // 解析枚举名称映射
-        final java.util.Map<Integer, String> nameMap = new java.util.HashMap<Integer, String>();
-        try {
-            String ej = enumJson.trim();
-            if (ej.startsWith("[")) ej = ej.substring(1);
-            if (ej.endsWith("]")) ej = ej.substring(0, ej.length() - 1);
-            String[] parts = ej.split("\\},\\s*\\{");
-            for (String part : parts) {
-                part = part.replace("{", "").replace("}", "").trim();
-                if (part.isEmpty()) continue;
-                int id = 0; String name = "";
-                String[] fields = part.split(",");
-                for (String f : fields) {
-                    f = f.trim();
-                    if (f.startsWith("\"id\":")) {
-                        try { id = Integer.parseInt(f.substring(5).trim()); } catch (Exception e) {}
-                    } else if (f.startsWith("\"n\":")) {
-                        name = f.substring(4).trim();
-                        if (name.startsWith("\"")) name = name.substring(1);
-                        if (name.endsWith("\"")) name = name.substring(0, name.length() - 1);
-                        name = name.replace("\\\"", "\"").replace("\\\\", "\\");
-                    }
-                }
-                if (id > 0 && !name.isEmpty()) nameMap.put(id, name);
-            }
-        } catch (Exception e) { /* ignore */ }
-
-        // 统计每种卡牌数量 (保持插入顺序)
         final java.util.Map<Integer, Integer> countMap = new java.util.LinkedHashMap<Integer, Integer>();
         for (int id : currentIds) {
             Integer c = countMap.get(id);
@@ -893,37 +848,33 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
 
         statusText.setText("\u2705 当前 " + currentIds.size() + " 张卡牌 (" + uniqueIds.size() + " 种)");
 
-        // 构建对话框
-        wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                       | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
+        // --- 构建深色风格对话框 ---
+        wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
         try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
 
         LinearLayout dialogRoot = new LinearLayout(activity);
         dialogRoot.setOrientation(LinearLayout.VERTICAL);
-        dialogRoot.setPadding(dp(8), dp(4), dp(8), dp(4));
+        dialogRoot.setPadding(dp(12), dp(8), dp(12), dp(8));
+        dialogRoot.setBackgroundColor(0xFF1A1A2E);
 
         // 标题信息
         final TextView infoLabel = new TextView(activity);
-        infoLabel.setText("当前共 " + currentIds.size() + " 张卡牌 (" + uniqueIds.size() + " 种)");
-        infoLabel.setTextColor(0xFF333333);
-        infoLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        infoLabel.setPadding(dp(4), dp(2), 0, dp(4));
+        infoLabel.setText("\uD83C\uDCCF " + currentIds.size() + " 张卡牌 (" + uniqueIds.size() + " 种)");
+        infoLabel.setTextColor(0xFFE0E7FF);
+        infoLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        infoLabel.setTypeface(null, android.graphics.Typeface.BOLD);
+        infoLabel.setPadding(0, 0, 0, dp(6));
         dialogRoot.addView(infoLabel);
 
         // 搜索框
-        final EditText searchBox = new EditText(activity);
-        searchBox.setHint("\uD83D\uDD0D 搜索...");
-        searchBox.setTextColor(0xFF000000);
-        searchBox.setHintTextColor(0xFF999999);
-        searchBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        searchBox.setSingleLine(true);
-        searchBox.setPadding(dp(8), dp(4), dp(8), dp(4));
+        final EditText searchBox = makeDialogSearchBox();
         dialogRoot.addView(searchBox);
 
         // 滚动列表
         ScrollView sv = new ScrollView(activity);
         sv.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(320)));
+        sv.setVerticalScrollBarEnabled(false);
 
         final LinearLayout listLayout = new LinearLayout(activity);
         listLayout.setOrientation(LinearLayout.VERTICAL);
@@ -940,39 +891,47 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             String label = "[" + cardId + "] " + name;
             displayNames.add(label);
 
-            // 每行: 名称 | 数量输入框
             LinearLayout row = new LinearLayout(activity);
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(dp(6), dp(4), dp(6), dp(4));
             LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             rowLp.setMargins(0, dp(1), 0, dp(1));
             row.setLayoutParams(rowLp);
 
-            // 卡牌名
+            GradientDrawable rowBg = new GradientDrawable();
+            rowBg.setColor(i % 2 == 0 ? 0xFF202040 : 0xFF1C1C38);
+            rowBg.setCornerRadius(dp(6));
+            row.setBackground(rowBg);
+
             TextView nameLabel = new TextView(activity);
             nameLabel.setText(label);
-            nameLabel.setTextColor(0xFF222222);
+            nameLabel.setTextColor(0xFFD0D0E0);
             nameLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
             nameLabel.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
             nameLabel.setSingleLine(true);
             row.addView(nameLabel);
 
-            // 可编辑数量输入框
             final EditText countEdit = new EditText(activity);
             countEdit.setText(String.valueOf(originalCounts[i]));
-            countEdit.setTextColor(0xFF000000);
+            countEdit.setTextColor(0xFFE0E7FF);
             countEdit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
             countEdit.setGravity(Gravity.CENTER);
             countEdit.setInputType(InputType.TYPE_CLASS_NUMBER);
             countEdit.setSingleLine(true);
-            countEdit.setPadding(dp(4), dp(1), dp(4), dp(1));
-            LinearLayout.LayoutParams celp = new LinearLayout.LayoutParams(dp(40), dp(26));
-            celp.setMargins(dp(4), 0, 0, 0);
-            countEdit.setLayoutParams(celp);
             countEdit.setFocusable(true);
             countEdit.setFocusableInTouchMode(true);
             countEdit.setClickable(true);
+            GradientDrawable ceBg = new GradientDrawable();
+            ceBg.setColor(0xFF16163A);
+            ceBg.setCornerRadius(dp(4));
+            ceBg.setStroke(dp(1), 0xFF444477);
+            countEdit.setBackground(ceBg);
+            countEdit.setPadding(dp(4), dp(2), dp(4), dp(2));
+            LinearLayout.LayoutParams celp = new LinearLayout.LayoutParams(dp(42), dp(28));
+            celp.setMargins(dp(4), 0, 0, 0);
+            countEdit.setLayoutParams(celp);
             countEdit.addTextChangedListener(new android.text.TextWatcher() {
                 @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
                 @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
@@ -981,7 +940,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                     int val = originalCounts[idx];
                     try { val = Integer.parseInt(s.toString().trim()); } catch (Exception e) {}
                     newCounts[idx] = val;
-                    countEdit.setTextColor(val != originalCounts[idx] ? 0xFFFF4444 : 0xFF000000);
+                    countEdit.setTextColor(val != originalCounts[idx] ? 0xFFFF6B6B : 0xFFE0E7FF);
                     updateCardInfoLabel(infoLabel, uniqueIds, newCounts);
                 }
             });
@@ -994,7 +953,6 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         sv.addView(listLayout);
         dialogRoot.addView(sv);
 
-        // 搜索过滤
         searchBox.addTextChangedListener(new android.text.TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
@@ -1008,32 +966,54 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             }
         });
 
+        // 底部按钮行
+        LinearLayout btnRow = new LinearLayout(activity);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams brlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        brlp.setMargins(0, dp(8), 0, 0);
+        btnRow.setLayoutParams(brlp);
+
+        Button applyBtn = makeDialogBtn("\u2705 应用修改", 0xFF6366F1);
+        applyBtn.setLayoutParams(new LinearLayout.LayoutParams(0, dp(34), 1f));
+        btnRow.addView(applyBtn);
+
+        Button closeBtn = makeDialogBtn("关闭", 0xFF374151);
+        LinearLayout.LayoutParams cblp = new LinearLayout.LayoutParams(0, dp(34), 0.5f);
+        cblp.setMargins(dp(4), 0, 0, 0);
+        closeBtn.setLayoutParams(cblp);
+        btnRow.addView(closeBtn);
+
+        dialogRoot.addView(btnRow);
+
+        // 显示对话框
         AlertDialog.Builder builder = new AlertDialog.Builder(activity);
-        builder.setTitle("\uD83C\uDCCF 管理当前卡牌");
         builder.setView(dialogRoot);
-        builder.setPositiveButton("\u2705 应用修改", new DialogInterface.OnClickListener() {
-            @Override
-            public void onClick(DialogInterface dialog, int which) {
+        builder.setCancelable(true);
+
+        final AlertDialog[] dlgRef = new AlertDialog[1];
+
+        final Runnable restoreFlags = new Runnable() {
+            @Override public void run() {
                 wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
                 try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+            }
+        };
 
-                // 收集有变化的卡牌
+        applyBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                restoreFlags.run();
+                if (dlgRef[0] != null) dlgRef[0].dismiss();
                 final List<int[]> changes = new ArrayList<int[]>();
                 for (int i = 0; i < uniqueIds.size(); i++) {
-                    if (newCounts[i] != originalCounts[i]) {
+                    if (newCounts[i] != originalCounts[i])
                         changes.add(new int[]{uniqueIds.get(i), newCounts[i]});
-                    }
                 }
-                if (changes.isEmpty()) {
-                    statusText.setText("未修改任何卡牌");
-                    return;
-                }
-
+                if (changes.isEmpty()) { statusText.setText("未修改任何卡牌"); return; }
                 setBusy(true);
                 statusText.setText("\u23F3 应用 " + changes.size() + " 项修改...");
                 new Thread(new Runnable() {
-                    @Override
-                    public void run() {
+                    @Override public void run() {
                         int ok = 0;
                         for (int[] ch : changes) {
                             String r = nativeSetCardCount(ch[0], ch[1]);
@@ -1041,8 +1021,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                         }
                         final int fOk = ok;
                         new Handler(Looper.getMainLooper()).post(new Runnable() {
-                            @Override
-                            public void run() {
+                            @Override public void run() {
                                 statusText.setText("\u2705 已修改 " + fOk + "/" + changes.size() + " 种卡牌");
                                 setBusy(false);
                             }
@@ -1051,36 +1030,29 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                 }).start();
             }
         });
-        builder.setNegativeButton("关闭", new DialogInterface.OnClickListener() {
-            @Override
-            public void onClick(DialogInterface dialog, int which) {
-                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+        closeBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                restoreFlags.run();
+                if (dlgRef[0] != null) dlgRef[0].dismiss();
             }
         });
-        builder.setCancelable(true);
         builder.setOnCancelListener(new DialogInterface.OnCancelListener() {
-            @Override
-            public void onCancel(DialogInterface dialog) {
-                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
-            }
+            @Override public void onCancel(DialogInterface d) { restoreFlags.run(); }
         });
 
         try {
             AlertDialog dlg = builder.create();
+            dlgRef[0] = dlg;
             if (dlg.getWindow() != null) {
-                dlg.getWindow().setType(2038); // TYPE_APPLICATION_OVERLAY
-                dlg.getWindow().setSoftInputMode(
-                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
-                dlg.getWindow().clearFlags(
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+                dlg.getWindow().setType(2038);
+                dlg.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+                dlg.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+                dlg.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
             }
             dlg.show();
         } catch (Exception e) {
             statusText.setText("\u274C 无法显示对话框: " + e.getMessage());
-            wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-            try { wm.updateViewLayout(container, wmParams); } catch (Exception e2) {}
+            restoreFlags.run();
         }
     }
 
@@ -1089,90 +1061,28 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         for (int c : newCounts) total += c;
         int kinds = 0;
         for (int c : newCounts) if (c > 0) kinds++;
-        label.setText("当前共 " + total + " 张卡牌 (" + kinds + " 种)");
+        label.setText("\uD83C\uDCCF " + total + " 张卡牌 (" + kinds + " 种)");
     }
 
     // ===== 管理当前物品 (查看 + 删除) =====
-    // 从 C 层读取当前已有物品 ID → 从枚举列表匹配名称 → 弹出可勾选列表 → 删除选中项
-    private void showManageDialog(final int itemType, final String title, final String nativeRemoveMethod) {
-        if (busy) return;
-        setBusy(true);
-        statusText.setText("\u23F3 读取当前" + title + "...");
-
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                // 1. 读取当前物品 ID 列表
-                final String currentJson = nativeGetCurrentItems(itemType);
-                // 2. 枚举所有物品名称 (用于匹配)
-                final String enumJson = nativeEnumItems(itemType);
-                new Handler(Looper.getMainLooper()).post(new Runnable() {
-                    @Override
-                    public void run() {
-                        setBusy(false);
-                        try {
-                            buildManageDialog(currentJson, enumJson, title, nativeRemoveMethod, itemType);
-                        } catch (Exception e) {
-                            statusText.setText("\u274C 解析失败: " + e.getMessage());
-                        }
-                    }
-                });
-            }
-        }).start();
-    }
+    // 通用管理对话框 - 深色主题 + 全选功能
+    //
+    // 使用方法:
+    //   buildManageDialog(currentJson, enumJson, "祝福", "nativeRemoveBlessing", ITEM_TYPE_BLESSING);
+    //
+    // currentJson: "[1,2,3,...]" 当前拥有的物品ID列表
+    // enumJson: "[{id:1,n:"名称"},...]" 所有可选物品的枚举
+    // title: 物品类型名称 (如 "祝福", "遗物")
+    // nativeRemoveMethod: 原生删除方法名
+    // itemType: 物品类型常量
 
     private void buildManageDialog(String currentJson, String enumJson, final String title,
                                     final String nativeRemoveMethod, final int itemType) {
-        // 解析当前 ID 列表: [1001,1002,...]
-        final List<Integer> currentIds = new ArrayList<Integer>();
-        try {
-            String s = currentJson.trim();
-            if (s.startsWith("[")) s = s.substring(1);
-            if (s.endsWith("]")) s = s.substring(0, s.length() - 1);
-            if (!s.isEmpty()) {
-                for (String part : s.split(",")) {
-                    part = part.trim();
-                    if (!part.isEmpty()) {
-                        int id = Integer.parseInt(part);
-                        if (id != 0) currentIds.add(id);
-                    }
-                }
-            }
-        } catch (Exception e) { /* ignore */ }
+        final List<Integer> currentIds = parseIdList(currentJson);
+        if (currentIds.isEmpty()) { statusText.setText("\u26A0\uFE0F 当前没有" + title); return; }
 
-        if (currentIds.isEmpty()) {
-            statusText.setText("\u26A0\uFE0F 当前没有" + title);
-            return;
-        }
+        final java.util.Map<Integer, String> nameMap = parseNameMap(enumJson);
 
-        // 解析枚举名称映射: id -> name
-        final java.util.Map<Integer, String> nameMap = new java.util.HashMap<Integer, String>();
-        try {
-            String ej = enumJson.trim();
-            if (ej.startsWith("[")) ej = ej.substring(1);
-            if (ej.endsWith("]")) ej = ej.substring(0, ej.length() - 1);
-            String[] parts = ej.split("\\},\\s*\\{");
-            for (String part : parts) {
-                part = part.replace("{", "").replace("}", "").trim();
-                if (part.isEmpty()) continue;
-                int id = 0; String name = "";
-                String[] fields = part.split(",");
-                for (String f : fields) {
-                    f = f.trim();
-                    if (f.startsWith("\"id\":")) {
-                        try { id = Integer.parseInt(f.substring(5).trim()); } catch (Exception e) {}
-                    } else if (f.startsWith("\"n\":")) {
-                        name = f.substring(4).trim();
-                        if (name.startsWith("\"")) name = name.substring(1);
-                        if (name.endsWith("\"")) name = name.substring(0, name.length() - 1);
-                        name = name.replace("\\\"", "\"").replace("\\\\", "\\");
-                    }
-                }
-                if (id > 0 && !name.isEmpty()) nameMap.put(id, name);
-            }
-        } catch (Exception e) { /* ignore */ }
-
-        // 构建显示列表 (统计每个 ID 出现次数)
         final java.util.Map<Integer, Integer> countMap = new java.util.LinkedHashMap<Integer, Integer>();
         for (int id : currentIds) {
             Integer c = countMap.get(id);
@@ -1185,68 +1095,109 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             String name = nameMap.containsKey(id) ? nameMap.get(id) : "???";
             int cnt = countMap.get(id);
             String label = "[" + id + "] " + name;
-            if (cnt > 1) label += " (x" + cnt + ")";
+            if (cnt > 1) label += " \u00D7" + cnt;
             displayNames.add(label);
         }
 
         statusText.setText("\u2705 当前 " + currentIds.size() + " 个" + title);
 
-        // 构建对话框
         wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
         try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
 
         LinearLayout dialogRoot = new LinearLayout(activity);
         dialogRoot.setOrientation(LinearLayout.VERTICAL);
-        dialogRoot.setPadding(dp(8), dp(4), dp(8), dp(4));
+        dialogRoot.setPadding(dp(12), dp(8), dp(12), dp(8));
+        dialogRoot.setBackgroundColor(0xFF1A1A2E);
 
         // 标题信息
         TextView infoLabel = new TextView(activity);
-        infoLabel.setText("当前共 " + currentIds.size() + " 个" + title + " (" + uniqueIds.size() + " 种)");
-        infoLabel.setTextColor(0xFF333333);
-        infoLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        infoLabel.setPadding(dp(4), dp(2), 0, dp(4));
+        infoLabel.setText("\uD83D\uDCCB 当前 " + currentIds.size() + " 个" + title + " (" + uniqueIds.size() + " 种)");
+        infoLabel.setTextColor(0xFFE0E7FF);
+        infoLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        infoLabel.setTypeface(null, android.graphics.Typeface.BOLD);
+        infoLabel.setPadding(0, 0, 0, dp(4));
         dialogRoot.addView(infoLabel);
 
         // 搜索框
-        final EditText searchBox = new EditText(activity);
-        searchBox.setHint("\uD83D\uDD0D 搜索...");
-        searchBox.setTextColor(0xFF000000);
-        searchBox.setHintTextColor(0xFF999999);
-        searchBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        searchBox.setSingleLine(true);
-        searchBox.setPadding(dp(8), dp(4), dp(8), dp(4));
+        final EditText searchBox = makeDialogSearchBox();
         dialogRoot.addView(searchBox);
+
+        // 计数 + 全选行
+        LinearLayout topRow = new LinearLayout(activity);
+        topRow.setOrientation(LinearLayout.HORIZONTAL);
+        topRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams trlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        trlp.setMargins(0, dp(2), 0, dp(4));
+        topRow.setLayoutParams(trlp);
+
+        final TextView countLabel = new TextView(activity);
+        countLabel.setText("已选 0 项");
+        countLabel.setTextColor(0xFF9CA3AF);
+        countLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        countLabel.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        topRow.addView(countLabel);
+
+        final boolean[] selected = new boolean[uniqueIds.size()];
+        final CheckBox[] checkBoxes = new CheckBox[uniqueIds.size()];
+
+        // 全选按钮
+        final Button selectAllBtn = makeDialogBtn("\u2611 全选", 0xFF2D2D4A);
+        selectAllBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        selectAllBtn.setTextColor(0xFFA5B4FC);
+        selectAllBtn.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(24)));
+        selectAllBtn.setOnClickListener(new View.OnClickListener() {
+            boolean allSelected = false;
+            @Override public void onClick(View v) {
+                allSelected = !allSelected;
+                for (int i = 0; i < checkBoxes.length; i++) {
+                    if (checkBoxes[i] != null && ((View)checkBoxes[i].getParent()).getVisibility() == View.VISIBLE)
+                        checkBoxes[i].setChecked(allSelected);
+                }
+                selectAllBtn.setText(allSelected ? "\u2612 取消全选" : "\u2611 全选");
+            }
+        });
+        topRow.addView(selectAllBtn);
+        dialogRoot.addView(topRow);
 
         // 滚动列表
         ScrollView sv = new ScrollView(activity);
         sv.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(300)));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(320)));
+        sv.setVerticalScrollBarEnabled(false);
 
         final LinearLayout listLayout = new LinearLayout(activity);
         listLayout.setOrientation(LinearLayout.VERTICAL);
         listLayout.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        final boolean[] selected = new boolean[uniqueIds.size()];
-        final CheckBox[] checkBoxes = new CheckBox[uniqueIds.size()];
-
-        // 计数标签
-        final TextView countLabel = new TextView(activity);
-        countLabel.setText("已选 0 项");
-        countLabel.setTextColor(0xFF666666);
-        countLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        countLabel.setPadding(dp(4), dp(2), 0, dp(2));
-
         for (int i = 0; i < uniqueIds.size(); i++) {
+            final int idx = i;
+
+            LinearLayout itemRow = new LinearLayout(activity);
+            itemRow.setOrientation(LinearLayout.HORIZONTAL);
+            itemRow.setGravity(Gravity.CENTER_VERTICAL);
+            itemRow.setPadding(dp(6), dp(5), dp(6), dp(5));
+            LinearLayout.LayoutParams irlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            irlp.setMargins(0, dp(1), 0, 0);
+            itemRow.setLayoutParams(irlp);
+            GradientDrawable irBg = new GradientDrawable();
+            irBg.setColor(i % 2 == 0 ? 0xFF202040 : 0xFF1C1C38);
+            irBg.setCornerRadius(dp(6));
+            itemRow.setBackground(irBg);
+
             CheckBox cb = new CheckBox(activity);
             cb.setText(displayNames.get(i));
-            cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            cb.setTextColor(0xFFD0D0E0);
+            cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
             cb.setChecked(false);
-            final int idx = i;
+            cb.setLayoutParams(new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             cb.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-                @Override
-                public void onCheckedChanged(CompoundButton b, boolean checked) {
+                @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
                     selected[idx] = checked;
                     int cnt = 0;
                     for (boolean s : selected) if (s) cnt++;
@@ -1254,14 +1205,13 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                 }
             });
             checkBoxes[i] = cb;
-            listLayout.addView(cb);
+            itemRow.addView(cb);
+            listLayout.addView(itemRow);
         }
 
-        dialogRoot.addView(countLabel);
         sv.addView(listLayout);
         dialogRoot.addView(sv);
 
-        // 搜索过滤
         searchBox.addTextChangedListener(new android.text.TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
@@ -1269,37 +1219,44 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             public void afterTextChanged(android.text.Editable s) {
                 String q = s.toString().toLowerCase().trim();
                 for (int i = 0; i < checkBoxes.length; i++) {
+                    View parent = (View) checkBoxes[i].getParent();
                     boolean visible = q.isEmpty() || displayNames.get(i).toLowerCase().contains(q);
-                    checkBoxes[i].setVisibility(visible ? View.VISIBLE : View.GONE);
+                    parent.setVisibility(visible ? View.VISIBLE : View.GONE);
                 }
             }
         });
 
-        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
-        builder.setTitle("\uD83D\uDCCB 当前" + title);
+        // 底部按钮行
+        LinearLayout btnRow = new LinearLayout(activity);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams brlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        brlp.setMargins(0, dp(8), 0, 0);
+        btnRow.setLayoutParams(brlp);
 
-        // 装备是只读的 (没有 remove 方法)
+        final AlertDialog[] dlgRef = new AlertDialog[1];
+        final Runnable restoreFlags = new Runnable() {
+            @Override public void run() {
+                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+            }
+        };
+
         if (nativeRemoveMethod != null) {
-            builder.setPositiveButton("\uD83D\uDDD1 删除选中", new DialogInterface.OnClickListener() {
-                @Override
-                public void onClick(DialogInterface dialog, int which) {
-                    wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-                    try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
-
+            Button deleteBtn = makeDialogBtn("\uD83D\uDDD1 删除选中", 0xFFDC2626);
+            deleteBtn.setLayoutParams(new LinearLayout.LayoutParams(0, dp(34), 1f));
+            deleteBtn.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    restoreFlags.run();
+                    if (dlgRef[0] != null) dlgRef[0].dismiss();
                     final List<Integer> toRemove = new ArrayList<Integer>();
-                    for (int i = 0; i < selected.length; i++) {
+                    for (int i = 0; i < selected.length; i++)
                         if (selected[i]) toRemove.add(uniqueIds.get(i));
-                    }
-                    if (toRemove.isEmpty()) {
-                        statusText.setText("未选择任何" + title);
-                        return;
-                    }
-
+                    if (toRemove.isEmpty()) { statusText.setText("未选择任何" + title); return; }
                     setBusy(true);
                     statusText.setText("\u23F3 删除 " + toRemove.size() + " 个" + title + "...");
                     new Thread(new Runnable() {
-                        @Override
-                        public void run() {
+                        @Override public void run() {
                             int ok = 0;
                             for (int itemId : toRemove) {
                                 try {
@@ -1307,12 +1264,11 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                                             nativeRemoveMethod, int.class);
                                     String r = (String) m.invoke(null, itemId);
                                     if (r != null && r.contains("\u2705")) ok++;
-                                } catch (Exception e) { /* skip */ }
+                                } catch (Exception e) {}
                             }
                             final int fOk = ok;
                             new Handler(Looper.getMainLooper()).post(new Runnable() {
-                                @Override
-                                public void run() {
+                                @Override public void run() {
                                     statusText.setText("\u2705 已删除 " + fOk + "/" + toRemove.size() + " 个" + title);
                                     setBusy(false);
                                 }
@@ -1321,68 +1277,54 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                     }).start();
                 }
             });
+            btnRow.addView(deleteBtn);
         }
 
-        builder.setNegativeButton("关闭", new DialogInterface.OnClickListener() {
-            @Override
-            public void onClick(DialogInterface dialog, int which) {
-                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+        Button closeBtn = makeDialogBtn("关闭", 0xFF374151);
+        LinearLayout.LayoutParams cblp = new LinearLayout.LayoutParams(0, dp(34),
+                nativeRemoveMethod != null ? 0.5f : 1f);
+        if (nativeRemoveMethod != null) cblp.setMargins(dp(4), 0, 0, 0);
+        closeBtn.setLayoutParams(cblp);
+        closeBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                restoreFlags.run();
+                if (dlgRef[0] != null) dlgRef[0].dismiss();
             }
         });
+        btnRow.addView(closeBtn);
+        dialogRoot.addView(btnRow);
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
         builder.setView(dialogRoot);
         builder.setCancelable(true);
         builder.setOnCancelListener(new DialogInterface.OnCancelListener() {
-            @Override
-            public void onCancel(DialogInterface dialog) {
-                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
-            }
+            @Override public void onCancel(DialogInterface d) { restoreFlags.run(); }
         });
 
         try {
             AlertDialog dlg = builder.create();
-            if (dlg.getWindow() != null) dlg.getWindow().setType(2);
+            dlgRef[0] = dlg;
+            if (dlg.getWindow() != null) {
+                dlg.getWindow().setType(2038);
+                dlg.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
+            }
             dlg.show();
         } catch (Exception e) {
             statusText.setText("\u274C 无法显示对话框: " + e.getMessage());
-            wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-            try { wm.updateViewLayout(container, wmParams); } catch (Exception e2) {}
+            restoreFlags.run();
         }
     }
 
     // ===== 可视化物品选择器 =====
-    // 从 C 层枚举物品 → 解析 JSON → 弹出搜索+多选对话框 → 添加选中项
-    private void showItemPicker(final int itemType, final EditText targetInput,
-                                 final String nativeAddMethod, final String title) {
-        if (busy) return;
-        setBusy(true);
-        statusText.setText("\u23F3 加载" + title + "列表...");
-
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                final String json = nativeEnumItems(itemType);
-                new Handler(Looper.getMainLooper()).post(new Runnable() {
-                    @Override
-                    public void run() {
-                        setBusy(false);
-                        try {
-                            showPickerDialog(json, title, nativeAddMethod, targetInput, itemType);
-                        } catch (Exception e) {
-                            statusText.setText("\u274C 解析失败: " + e.getMessage());
-                        }
-                    }
-                });
-            }
-        }).start();
-    }
+    // 通用物品浏览/添加对话框 - 深色主题
+    //
+    // 使用方法:
+    //   showPickerDialog(json, "卡牌", "nativeAddCard", cardIdInput, ITEM_TYPE_CARD);
 
     // 解析 JSON 并显示选择对话框
     private void showPickerDialog(String json, final String title,
                                    final String nativeAddMethod, final EditText targetInput,
                                    final int itemType) {
-        // 手动解析简单 JSON 数组 [{"id":1,"n":"名字"},...]
         final List<int[]> ids = new ArrayList<int[]>();
         final List<String> names = new ArrayList<String>();
 
@@ -1390,20 +1332,17 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             json = json.trim();
             if (json.startsWith("[")) json = json.substring(1);
             if (json.endsWith("]")) json = json.substring(0, json.length() - 1);
-
-            // 按 },{ 分割
             String[] parts = json.split("\\},\\s*\\{");
             for (String part : parts) {
                 part = part.replace("{", "").replace("}", "").trim();
                 if (part.isEmpty()) continue;
-                int id = 0;
-                String name = "???";
+                int id = 0; String name = "???";
                 String[] fields = part.split(",");
                 for (String f : fields) {
                     f = f.trim();
-                    if (f.startsWith("\"id\":")) {
+                    if (f.startsWith("\"id\":"))
                         try { id = Integer.parseInt(f.substring(5).trim()); } catch (Exception e) {}
-                    } else if (f.startsWith("\"n\":")) {
+                    else if (f.startsWith("\"n\":")) {
                         name = f.substring(4).trim();
                         if (name.startsWith("\"")) name = name.substring(1);
                         if (name.endsWith("\"")) name = name.substring(0, name.length() - 1);
@@ -1411,28 +1350,17 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                     }
                 }
                 if (id > 0) {
-                    // 对祝福/遗物列表进行分类标注
                     if (itemType == ITEM_TYPE_LOSTTHING) {
-                        String tag;
-                        if (id >= 8000 && id < 9000) {
-                            tag = "\uD83C\uDFAD 事件";
-                        } else if (id >= 10000) {
-                            tag = "\uD83C\uDFC6 成就";
-                        } else {
-                            tag = "\u2728 祝福";
-                        }
-                        ids.add(new int[]{id});
+                        String tag = (id >= 8000 && id < 9000) ? "\uD83C\uDFAD" :
+                                     (id >= 10000) ? "\uD83C\uDFC6" : "\u2728";
                         names.add(tag + " [" + id + "] " + name);
                     } else {
-                        ids.add(new int[]{id});
                         names.add("[" + id + "] " + name);
                     }
+                    ids.add(new int[]{id});
                 }
             }
-        } catch (Exception e) {
-            statusText.setText("\u274C JSON解析错误");
-            return;
-        }
+        } catch (Exception e) { statusText.setText("\u274C JSON解析错误"); return; }
 
         if (ids.isEmpty()) {
             statusText.setText("\u26A0\uFE0F 未找到" + title + "数据 (需先进入对局)");
@@ -1441,85 +1369,67 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
 
         statusText.setText("\u2705 找到 " + ids.size() + " 个" + title);
 
-        // ===== 构建对话框 =====
-        // 先让悬浮窗不抢焦点
         wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
         try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
 
         LinearLayout dialogRoot = new LinearLayout(activity);
         dialogRoot.setOrientation(LinearLayout.VERTICAL);
-        dialogRoot.setPadding(dp(8), dp(4), dp(8), dp(4));
+        dialogRoot.setPadding(dp(12), dp(8), dp(12), dp(8));
+        dialogRoot.setBackgroundColor(0xFF1A1A2E);
+
+        // 标题
+        TextView titleLabel = new TextView(activity);
+        titleLabel.setText("\u2728 选择" + title + " (共 " + ids.size() + " 项)");
+        titleLabel.setTextColor(0xFFE0E7FF);
+        titleLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        titleLabel.setTypeface(null, android.graphics.Typeface.BOLD);
+        titleLabel.setPadding(0, 0, 0, dp(4));
+        dialogRoot.addView(titleLabel);
 
         // 搜索框
-        final EditText searchBox = new EditText(activity);
-        searchBox.setHint("\uD83D\uDD0D 搜索...");
-        searchBox.setTextColor(0xFF000000);
-        searchBox.setHintTextColor(0xFF999999);
-        searchBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        searchBox.setSingleLine(true);
-        searchBox.setPadding(dp(8), dp(4), dp(8), dp(4));
+        final EditText searchBox = makeDialogSearchBox();
         dialogRoot.addView(searchBox);
 
-        // 物品计数
+        // 顶部操作行: 计数 + 全选
+        LinearLayout topRow = new LinearLayout(activity);
+        topRow.setOrientation(LinearLayout.HORIZONTAL);
+        topRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams trlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        trlp.setMargins(0, dp(2), 0, dp(4));
+        topRow.setLayoutParams(trlp);
+
         final TextView countLabel = new TextView(activity);
-        countLabel.setText("共 " + ids.size() + " 项 (已选 0)");
-        countLabel.setTextColor(0xFF666666);
-        countLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        countLabel.setPadding(dp(4), dp(2), 0, dp(2));
-        dialogRoot.addView(countLabel);
-
-        // 滚动列表
-        ScrollView sv = new ScrollView(activity);
-        sv.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(320)));
-
-        final LinearLayout listLayout = new LinearLayout(activity);
-        listLayout.setOrientation(LinearLayout.VERTICAL);
-        listLayout.setLayoutParams(new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        countLabel.setText("已选 0 项");
+        countLabel.setTextColor(0xFF9CA3AF);
+        countLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        countLabel.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        topRow.addView(countLabel);
 
         final boolean[] selected = new boolean[ids.size()];
         final CheckBox[] checkBoxes = new CheckBox[ids.size()];
 
-        for (int i = 0; i < ids.size(); i++) {
-            CheckBox cb = new CheckBox(activity);
-            cb.setText(names.get(i));
-            cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-            cb.setChecked(false);
-            final int idx = i;
-            cb.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-                @Override
-                public void onCheckedChanged(CompoundButton b, boolean checked) {
-                    selected[idx] = checked;
-                    int cnt = 0;
-                    for (boolean s : selected) if (s) cnt++;
-                    countLabel.setText("共 " + ids.size() + " 项 (已选 " + cnt + ")");
-                }
-            });
-            checkBoxes[i] = cb;
-            listLayout.addView(cb);
-        }
-
-        // 全选 checkbox (只影响当前可见项)
-        final CheckBox selectAllBox = new CheckBox(activity);
-        selectAllBox.setText("☑ 全选当前可见项");
-        selectAllBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        selectAllBox.setTextColor(0xFF1565C0);
-        selectAllBox.setChecked(false);
-        selectAllBox.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
-            @Override
-            public void onCheckedChanged(CompoundButton b, boolean checked) {
+        final Button selectAllBtn = makeDialogBtn("\u2611 全选", 0xFF2D2D4A);
+        selectAllBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        selectAllBtn.setTextColor(0xFFA5B4FC);
+        selectAllBtn.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(24)));
+        selectAllBtn.setOnClickListener(new View.OnClickListener() {
+            boolean allSelected = false;
+            @Override public void onClick(View v) {
+                allSelected = !allSelected;
                 for (int i = 0; i < checkBoxes.length; i++) {
-                    if (checkBoxes[i].getVisibility() == View.VISIBLE) {
-                        checkBoxes[i].setChecked(checked);
-                    }
+                    if (checkBoxes[i] != null && ((View)checkBoxes[i].getParent()).getVisibility() == View.VISIBLE)
+                        checkBoxes[i].setChecked(allSelected);
                 }
+                selectAllBtn.setText(allSelected ? "\u2612 取消全选" : "\u2611 全选");
             }
         });
-        dialogRoot.addView(selectAllBox);
+        topRow.addView(selectAllBtn);
+        dialogRoot.addView(topRow);
 
-        // 卡牌类型: 添加数量输入
+        // 卡牌: 每种数量输入
         final EditText pickerCountInput;
         if (itemType == ITEM_TYPE_CARD) {
             LinearLayout cntRow = new LinearLayout(activity);
@@ -1527,36 +1437,86 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             cntRow.setGravity(Gravity.CENTER_VERTICAL);
             LinearLayout.LayoutParams cntlp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            cntlp.setMargins(0, dp(2), 0, dp(2));
+            cntlp.setMargins(0, 0, 0, dp(4));
             cntRow.setLayoutParams(cntlp);
 
             TextView cntLabel = new TextView(activity);
-            cntLabel.setText("每种添加数量:");
-            cntLabel.setTextColor(0xFF555555);
-            cntLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            cntLabel.setText("每种添加:");
+            cntLabel.setTextColor(0xFF9CA3AF);
+            cntLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
             cntRow.addView(cntLabel);
 
             pickerCountInput = new EditText(activity);
             pickerCountInput.setText("1");
-            pickerCountInput.setTextColor(0xFF000000);
-            pickerCountInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            pickerCountInput.setTextColor(0xFFE0E7FF);
+            pickerCountInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
             pickerCountInput.setInputType(InputType.TYPE_CLASS_NUMBER);
             pickerCountInput.setSingleLine(true);
+            GradientDrawable pcBg = new GradientDrawable();
+            pcBg.setColor(0xFF16163A);
+            pcBg.setCornerRadius(dp(4));
+            pcBg.setStroke(dp(1), 0xFF444477);
+            pickerCountInput.setBackground(pcBg);
             pickerCountInput.setPadding(dp(6), dp(2), dp(6), dp(2));
             LinearLayout.LayoutParams cilp = new LinearLayout.LayoutParams(dp(40), ViewGroup.LayoutParams.WRAP_CONTENT);
             cilp.setMargins(dp(4), 0, 0, 0);
             pickerCountInput.setLayoutParams(cilp);
             cntRow.addView(pickerCountInput);
-
             dialogRoot.addView(cntRow);
         } else {
             pickerCountInput = null;
         }
 
+        // 滚动列表
+        ScrollView sv = new ScrollView(activity);
+        sv.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(320)));
+        sv.setVerticalScrollBarEnabled(false);
+
+        final LinearLayout listLayout = new LinearLayout(activity);
+        listLayout.setOrientation(LinearLayout.VERTICAL);
+        listLayout.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        for (int i = 0; i < ids.size(); i++) {
+            final int idx = i;
+
+            LinearLayout itemRow = new LinearLayout(activity);
+            itemRow.setOrientation(LinearLayout.HORIZONTAL);
+            itemRow.setGravity(Gravity.CENTER_VERTICAL);
+            itemRow.setPadding(dp(6), dp(4), dp(6), dp(4));
+            LinearLayout.LayoutParams irlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            irlp.setMargins(0, dp(1), 0, 0);
+            itemRow.setLayoutParams(irlp);
+            GradientDrawable irBg = new GradientDrawable();
+            irBg.setColor(i % 2 == 0 ? 0xFF202040 : 0xFF1C1C38);
+            irBg.setCornerRadius(dp(6));
+            itemRow.setBackground(irBg);
+
+            CheckBox cb = new CheckBox(activity);
+            cb.setText(names.get(i));
+            cb.setTextColor(0xFFD0D0E0);
+            cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            cb.setChecked(false);
+            cb.setLayoutParams(new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            cb.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+                @Override public void onCheckedChanged(CompoundButton b, boolean checked) {
+                    selected[idx] = checked;
+                    int cnt = 0;
+                    for (boolean s : selected) if (s) cnt++;
+                    countLabel.setText("已选 " + cnt + " 项");
+                }
+            });
+            checkBoxes[i] = cb;
+            itemRow.addView(cb);
+            listLayout.addView(itemRow);
+        }
+
         sv.addView(listLayout);
         dialogRoot.addView(sv);
 
-        // 搜索过滤
         searchBox.addTextChangedListener(new android.text.TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
             @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
@@ -1564,40 +1524,39 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             public void afterTextChanged(android.text.Editable s) {
                 String q = s.toString().toLowerCase().trim();
                 for (int i = 0; i < checkBoxes.length; i++) {
+                    View parent = (View) checkBoxes[i].getParent();
                     boolean visible = q.isEmpty() || names.get(i).toLowerCase().contains(q);
-                    checkBoxes[i].setVisibility(visible ? View.VISIBLE : View.GONE);
+                    parent.setVisibility(visible ? View.VISIBLE : View.GONE);
                 }
             }
         });
 
-        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
-        builder.setTitle("\u2728 选择" + title);
-        builder.setView(dialogRoot);
-        builder.setPositiveButton("添加选中", new DialogInterface.OnClickListener() {
-            @Override
-            public void onClick(DialogInterface dialog, int which) {
-                // 恢复悬浮窗
+        // 底部按钮行
+        LinearLayout btnRow = new LinearLayout(activity);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams brlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        brlp.setMargins(0, dp(8), 0, 0);
+        btnRow.setLayoutParams(brlp);
+
+        final AlertDialog[] dlgRef = new AlertDialog[1];
+        final Runnable restoreFlags = new Runnable() {
+            @Override public void run() {
                 wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
                 try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+            }
+        };
 
-                int addCount = 0;
-                for (int i = 0; i < selected.length; i++) {
-                    if (!selected[i]) continue;
-                    addCount++;
-                }
-
-                if (addCount == 0) {
-                    statusText.setText("未选择任何" + title);
-                    return;
-                }
-
-                // 在后台线程批量添加
+        Button addBtn = makeDialogBtn("\u2705 添加选中", 0xFF6366F1);
+        addBtn.setLayoutParams(new LinearLayout.LayoutParams(0, dp(34), 1f));
+        addBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                restoreFlags.run();
+                if (dlgRef[0] != null) dlgRef[0].dismiss();
                 final List<Integer> toAdd = new ArrayList<Integer>();
-                for (int i = 0; i < selected.length; i++) {
+                for (int i = 0; i < selected.length; i++)
                     if (selected[i]) toAdd.add(ids.get(i)[0]);
-                }
-
-                // 卡牌: 支持每种添加多张
+                if (toAdd.isEmpty()) { statusText.setText("未选择任何" + title); return; }
                 final int perCount;
                 if (pickerCountInput != null) {
                     int pc = 1;
@@ -1605,16 +1564,12 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                     catch (Exception e) { pc = 1; }
                     if (pc < 1) pc = 1; if (pc > 99) pc = 99;
                     perCount = pc;
-                } else {
-                    perCount = 1;
-                }
-
+                } else { perCount = 1; }
                 setBusy(true);
                 final int totalItems = toAdd.size() * perCount;
                 statusText.setText("\u23F3 添加 " + totalItems + " 个" + title + "...");
                 new Thread(new Runnable() {
-                    @Override
-                    public void run() {
+                    @Override public void run() {
                         int ok = 0;
                         for (int itemId : toAdd) {
                             for (int n = 0; n < perCount; n++) {
@@ -1623,13 +1578,12 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                                             nativeAddMethod, int.class);
                                     m.invoke(null, itemId);
                                     ok++;
-                                } catch (Exception e) { /* skip */ }
+                                } catch (Exception e) {}
                             }
                         }
                         final int fOk = ok;
                         new Handler(Looper.getMainLooper()).post(new Runnable() {
-                            @Override
-                            public void run() {
+                            @Override public void run() {
                                 statusText.setText("\u2705 已添加 " + fOk + " 个" + title);
                                 setBusy(false);
                             }
@@ -1638,33 +1592,125 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                 }).start();
             }
         });
-        builder.setNegativeButton("取消", new DialogInterface.OnClickListener() {
-            @Override
-            public void onClick(DialogInterface dialog, int which) {
-                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+        btnRow.addView(addBtn);
+
+        Button closeBtn = makeDialogBtn("取消", 0xFF374151);
+        LinearLayout.LayoutParams cblp = new LinearLayout.LayoutParams(0, dp(34), 0.5f);
+        cblp.setMargins(dp(4), 0, 0, 0);
+        closeBtn.setLayoutParams(cblp);
+        closeBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                restoreFlags.run();
+                if (dlgRef[0] != null) dlgRef[0].dismiss();
             }
         });
+        btnRow.addView(closeBtn);
+        dialogRoot.addView(btnRow);
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
+        builder.setView(dialogRoot);
         builder.setCancelable(true);
         builder.setOnCancelListener(new DialogInterface.OnCancelListener() {
-            @Override
-            public void onCancel(DialogInterface dialog) {
-                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
-            }
+            @Override public void onCancel(DialogInterface d) { restoreFlags.run(); }
         });
 
         try {
             AlertDialog dlg = builder.create();
+            dlgRef[0] = dlg;
             if (dlg.getWindow() != null) {
-                dlg.getWindow().setType(2);
+                dlg.getWindow().setType(2038);
+                dlg.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
             }
             dlg.show();
         } catch (Exception e) {
             statusText.setText("\u274C 无法显示对话框: " + e.getMessage());
-            wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
-            try { wm.updateViewLayout(container, wmParams); } catch (Exception e2) {}
+            restoreFlags.run();
         }
+    }
+
+    // ===== 对话框辅助方法 =====
+    private EditText makeDialogSearchBox() {
+        EditText searchBox = new EditText(activity);
+        searchBox.setHint("\uD83D\uDD0D 搜索...");
+        searchBox.setTextColor(0xFFE0E7FF);
+        searchBox.setHintTextColor(0xFF666688);
+        searchBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        searchBox.setSingleLine(true);
+        searchBox.setPadding(dp(8), dp(5), dp(8), dp(5));
+        GradientDrawable sbBg = new GradientDrawable();
+        sbBg.setColor(0xFF16163A);
+        sbBg.setCornerRadius(dp(8));
+        sbBg.setStroke(dp(1), 0xFF333366);
+        searchBox.setBackground(sbBg);
+        LinearLayout.LayoutParams sblp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sblp.setMargins(0, dp(2), 0, dp(4));
+        searchBox.setLayoutParams(sblp);
+        return searchBox;
+    }
+
+    private Button makeDialogBtn(String text, int bgColor) {
+        Button btn = new Button(activity);
+        btn.setText(text);
+        btn.setTextColor(Color.WHITE);
+        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        btn.setAllCaps(false);
+        GradientDrawable gd = new GradientDrawable();
+        gd.setColor(bgColor);
+        gd.setCornerRadius(dp(8));
+        btn.setBackground(gd);
+        btn.setPadding(dp(10), dp(2), dp(10), dp(2));
+        btn.setMinHeight(0);
+        btn.setMinimumHeight(0);
+        return btn;
+    }
+
+    private List<Integer> parseIdList(String json) {
+        List<Integer> result = new ArrayList<Integer>();
+        try {
+            String s = json.trim();
+            if (s.startsWith("[")) s = s.substring(1);
+            if (s.endsWith("]")) s = s.substring(0, s.length() - 1);
+            if (!s.isEmpty()) {
+                for (String part : s.split(",")) {
+                    part = part.trim();
+                    if (!part.isEmpty()) {
+                        int id = Integer.parseInt(part);
+                        if (id != 0) result.add(id);
+                    }
+                }
+            }
+        } catch (Exception e) {}
+        return result;
+    }
+
+    private java.util.Map<Integer, String> parseNameMap(String enumJson) {
+        java.util.Map<Integer, String> nameMap = new java.util.HashMap<Integer, String>();
+        try {
+            String ej = enumJson.trim();
+            if (ej.startsWith("[")) ej = ej.substring(1);
+            if (ej.endsWith("]")) ej = ej.substring(0, ej.length() - 1);
+            String[] parts = ej.split("\\},\\s*\\{");
+            for (String part : parts) {
+                part = part.replace("{", "").replace("}", "").trim();
+                if (part.isEmpty()) continue;
+                int id = 0; String name = "";
+                String[] fields = part.split(",");
+                for (String f : fields) {
+                    f = f.trim();
+                    if (f.startsWith("\"id\":"))
+                        try { id = Integer.parseInt(f.substring(5).trim()); } catch (Exception e) {}
+                    else if (f.startsWith("\"n\":")) {
+                        name = f.substring(4).trim();
+                        if (name.startsWith("\"")) name = name.substring(1);
+                        if (name.endsWith("\"")) name = name.substring(0, name.length() - 1);
+                        name = name.replace("\\\"", "\"").replace("\\\\", "\\");
+                    }
+                }
+                if (id > 0 && !name.isEmpty()) nameMap.put(id, name);
+            }
+        } catch (Exception e) {}
+        return nameMap;
     }
 
     // 标题栏拖动

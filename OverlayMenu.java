@@ -69,6 +69,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     private static final int BTN_BROWSE_CARD  = 0x7f000021;
     private static final int BTN_BROWSE_BLESS = 0x7f000022;
     private static final int BTN_EQUIP_SLOTS  = 0x7f000023;
+    private static final int BTN_PRESCAN      = 0x7f000024;
 
     // 物品类型常量 (与 C 层 do_enum_items 对应)
     private static final int ITEM_TYPE_CARD      = 1;
@@ -88,6 +89,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     public static native String nativeModifyAll(int gold, int maxHp, int mp, int action, int handcards);
     public static native String nativeEnumItems(int type);
     public static native String nativeModifyEquipSlots(int slots);
+    public static native String nativePreScan();
 
     /**
      * 从 C 代码调用的入口，在 UI 线程创建悬浮窗
@@ -160,7 +162,17 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         contentArea.setLayoutParams(new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        // ==================== 💰 金币 ====================
+        // ==================== � 预加载 ====================
+        Button prescanBtn = makeBtn("🔄 预加载内存数据", 0xFF0E7490, BTN_PRESCAN);
+        LinearLayout.LayoutParams pslp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(34));
+        pslp.setMargins(0, dp(2), 0, dp(2));
+        prescanBtn.setLayoutParams(pslp);
+        prescanBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        contentArea.addView(prescanBtn);
+        addDivider(contentArea);
+
+        // ==================== �💰 金币 ====================
         addSectionLabel(contentArea, "\uD83D\uDCB0 金币", 0xFFFCD34D);
         goldInput = addInputRow(contentArea, "金币", "99999", BTN_GOLD, "修改");
 
@@ -431,6 +443,8 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             showItemPicker(ITEM_TYPE_CARD, cardInput, "nativeAddCard", "卡牌");
         } else if (id == BTN_BROWSE_BLESS) {
             showItemPicker(ITEM_TYPE_LOSTTHING, lostthingInput, "nativeAddLostThing", "祝福/遗物");
+        } else if (id == BTN_PRESCAN) {
+            doPreScan();
         } else if (id == BTN_P1 || id == BTN_P2 || id == BTN_P3 || id == BTN_P4) {
             Object tag = v.getTag();
             if (tag != null) goldInput.setText(tag.toString());
@@ -598,6 +612,26 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         }
     }
 
+    // ===== 预加载内存数据 =====
+    private void doPreScan() {
+        if (busy) return;
+        setBusy(true);
+        statusText.setText("\u23F3 正在扫描内存...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final String result = nativePreScan();
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        statusText.setText(result);
+                        setBusy(false);
+                    }
+                });
+            }
+        }).start();
+    }
+
     // ===== 可视化物品选择器 =====
     // 从 C 层枚举物品 → 解析 JSON → 弹出搜索+多选对话框 → 添加选中项
     private void showItemPicker(final int itemType, final EditText targetInput,
@@ -747,6 +781,24 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             checkBoxes[i] = cb;
             listLayout.addView(cb);
         }
+
+        // 全选 checkbox (只影响当前可见项)
+        final CheckBox selectAllBox = new CheckBox(activity);
+        selectAllBox.setText("☑ 全选当前可见项");
+        selectAllBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        selectAllBox.setTextColor(0xFF1565C0);
+        selectAllBox.setChecked(false);
+        selectAllBox.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(CompoundButton b, boolean checked) {
+                for (int i = 0; i < checkBoxes.length; i++) {
+                    if (checkBoxes[i].getVisibility() == View.VISIBLE) {
+                        checkBoxes[i].setChecked(checked);
+                    }
+                }
+            }
+        });
+        dialogRoot.addView(selectAllBox);
 
         sv.addView(listLayout);
         dialogRoot.addView(sv);

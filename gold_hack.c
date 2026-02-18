@@ -1108,33 +1108,34 @@ static int do_modify_handcards(int handcards) {
 // 手动分配一个 Il2CppSZArray(Int32[]) —— 当原数组容量不够时用
 // 复制 klass/monitor 头部，重设 max_length，拷贝旧元素
 // 返回新数组指针 (mmap 分配, 不会被 GC 回收, 故意 leak)
-static uintptr_t alloc_int32_szarray(uintptr_t old_arr, int new_cap) {
-    // SZArray 头: klass(8) + monitor(8) + bounds(8,=0) + max_length(8) + elements(new_cap * 4)
-    size_t header_sz = 0x20;
+// compact=0: 标准SZArray - bounds(+0x10)=NULL, max_len(+0x18), elem(+0x20)
+// compact=1: 紧凑SZArray - max_len(+0x10), elem(+0x18), 无bounds字段
+static uintptr_t alloc_int32_szarray(uintptr_t old_arr, int new_cap, int compact) {
+    size_t header_sz = compact ? 0x18 : 0x20;
     size_t total = header_sz + (size_t)new_cap * 4;
-    // 页对齐 mmap
     size_t page_sz = 4096;
     size_t alloc_sz = (total + page_sz - 1) & ~(page_sz - 1);
     void *mem = mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
-        LOGE("  alloc_int32_szarray: mmap failed (size=%zu)", alloc_sz);
+        LOGE("  alloc_szarray: mmap failed (size=%zu)", alloc_sz);
         return 0;
     }
     memset(mem, 0, alloc_sz);
     uintptr_t arr = (uintptr_t)mem;
 
-    // 复制 klass 和 monitor 从旧数组
     if (old_arr > 0x10000) {
-        *(volatile uintptr_t *)(arr + 0x00) = *(volatile uintptr_t *)(old_arr + 0x00); // klass
-        *(volatile uintptr_t *)(arr + 0x08) = *(volatile uintptr_t *)(old_arr + 0x08); // monitor
+        *(volatile uintptr_t *)(arr + 0x00) = *(volatile uintptr_t *)(old_arr + 0x00);
+        *(volatile uintptr_t *)(arr + 0x08) = *(volatile uintptr_t *)(old_arr + 0x08);
     }
-    // bounds = NULL (SZArray)
-    *(volatile uintptr_t *)(arr + 0x10) = 0;
-    // max_length
-    *(volatile uintptr_t *)(arr + 0x18) = (uintptr_t)new_cap;
+    if (compact) {
+        *(volatile uintptr_t *)(arr + 0x10) = (uintptr_t)new_cap;
+    } else {
+        *(volatile uintptr_t *)(arr + 0x10) = 0; // bounds=NULL
+        *(volatile uintptr_t *)(arr + 0x18) = (uintptr_t)new_cap;
+    }
 
-    LOGI("  alloc_int32_szarray: new arr @ %p, cap=%d, total=%zu", mem, new_cap, alloc_sz);
+    LOGI("  alloc_szarray: @ %p, cap=%d, %s", mem, new_cap, compact ? "compact" : "standard");
     return arr;
 }
 
@@ -1199,11 +1200,12 @@ static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
         LOGI("  Expanding: old cap=%d, new cap=%d, copying %d elements",
              (int)max_length, new_cap, size);
         
-        uintptr_t new_arr = alloc_int32_szarray(items, new_cap);
+        int compact = !is_standard_layout;
+        uintptr_t new_arr = alloc_int32_szarray(items, new_cap, compact);
         if (!new_arr) return -1;
         
-        // 拷贝旧元素到新数组 (+0x20 = elements)
-        int32_t *new_elem = (int32_t *)(new_arr + 0x20);
+        // 拷贝旧元素到新数组 (偏移取决于布局)
+        int32_t *new_elem = (int32_t *)(new_arr + (compact ? 0x18 : 0x20));
         for (int i = 0; i < size; i++) {
             new_elem[i] = elem_base[i];
         }
@@ -1232,6 +1234,7 @@ static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
 }
 
 // ========== 添加装备到装备栏 ==========
+// 优先找空槽(value=0)填入, 无空槽则追加新槽
 static int do_add_equipment(int equip_id) {
     if (init_il2cpp_context() != 0) return -1;
     int n = ensure_roleinfo_cached();
@@ -1243,10 +1246,50 @@ static int do_add_equipment(int equip_id) {
         uintptr_t obj_addr = g_cached_roleinfo[i];
         g_in_safe_access = 1;
         if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        
         uintptr_t equip_list = *(volatile uintptr_t *)(obj_addr + OFF_EQUIPSLOT);
-        int ret = add_item_to_int_list(equip_list, equip_id);
+        if (equip_list < 0x10000) { g_in_safe_access = 0; continue; }
+        
+        uintptr_t items = *(volatile uintptr_t *)(equip_list + 0x10);
+        int32_t size = *(volatile int32_t *)(equip_list + 0x18);
+        
+        if (items < 0x10000 || size < 0 || size > 100) { g_in_safe_access = 0; continue; }
+        
+        // 探测 SZArray 布局
+        uintptr_t probe = *(volatile uintptr_t *)(items + 0x10);
+        int32_t *elem_base;
+        if (probe == 0) {
+            elem_base = (int32_t *)(items + 0x20);
+        } else if (probe > 0 && probe <= 200000) {
+            elem_base = (int32_t *)(items + 0x18);
+        } else {
+            elem_base = (int32_t *)(items + 0x20);
+        }
+        
+        LOGI("  equip slot: size=%d, looking for empty slot for equip %d", size, equip_id);
+        
+        // 寻找空槽 (value=0) 填入装备
+        int found = 0;
+        for (int s = 0; s < size; s++) {
+            if (elem_base[s] == 0) {
+                elem_base[s] = equip_id;
+                LOGI("  Filled empty slot [%d] with equip %d", s, equip_id);
+                found = 1;
+                break;
+            }
+        }
+        
+        // 无空槽则追加 (创建新槽)
+        if (!found) {
+            int ret = add_item_to_int_list(equip_list, equip_id);
+            if (ret > 0) {
+                LOGI("  Appended new slot with equip %d (size: %d -> %d)", equip_id, size, size + 1);
+                found = 1;
+            }
+        }
+        
         g_in_safe_access = 0;
-        if (ret >= 0) count++;
+        if (found) count++;
     }
     uninstall_sigsegv_handler();
     LOGI("do_add_equipment: added equip %d to %d instance(s)", equip_id, count);
@@ -1302,6 +1345,7 @@ static int add_card_to_ref_list(uintptr_t list_ptr, int card_id) {
     uintptr_t probe = *(volatile uintptr_t *)(items + 0x10);
     uintptr_t max_length;
     uintptr_t *elem_base;
+    int compact = 0;
     
     if (probe == 0) {
         max_length = *(volatile uintptr_t *)(items + 0x18);
@@ -1309,6 +1353,7 @@ static int add_card_to_ref_list(uintptr_t list_ptr, int card_id) {
     } else if (probe > 0 && probe <= 200000) {
         max_length = probe;
         elem_base = (uintptr_t *)(items + 0x18);
+        compact = 1;
     } else {
         max_length = *(volatile uintptr_t *)(items + 0x18);
         elem_base = (uintptr_t *)(items + 0x20);
@@ -1334,8 +1379,9 @@ static int add_card_to_ref_list(uintptr_t list_ptr, int card_id) {
         if (new_cap < size + 4) new_cap = size + 4;
         if (new_cap > 5000) new_cap = 5000;
         
-        // 分配新 SZArray<ref>: header(0x20) + new_cap * 8(ptr)
-        size_t total = 0x20 + (size_t)new_cap * 8;
+        // 分配新 SZArray<ref>: header + new_cap * 8(ptr)
+        size_t hdr_sz = compact ? 0x18 : 0x20;
+        size_t total = hdr_sz + (size_t)new_cap * 8;
         size_t page_sz = 4096;
         size_t alloc_sz = (total + page_sz - 1) & ~(page_sz - 1);
         void *mem = mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE,
@@ -1344,13 +1390,17 @@ static int add_card_to_ref_list(uintptr_t list_ptr, int card_id) {
         memset(mem, 0, alloc_sz);
         uintptr_t new_arr = (uintptr_t)mem;
         
-        // 复制头部
+        // 复制头部 (匹配原数组布局)
         *(volatile uintptr_t *)(new_arr + 0x00) = *(volatile uintptr_t *)(items + 0x00);
         *(volatile uintptr_t *)(new_arr + 0x08) = *(volatile uintptr_t *)(items + 0x08);
-        *(volatile uintptr_t *)(new_arr + 0x10) = 0; // bounds=NULL
-        *(volatile uintptr_t *)(new_arr + 0x18) = (uintptr_t)new_cap;
+        if (compact) {
+            *(volatile uintptr_t *)(new_arr + 0x10) = (uintptr_t)new_cap;
+        } else {
+            *(volatile uintptr_t *)(new_arr + 0x10) = 0; // bounds=NULL
+            *(volatile uintptr_t *)(new_arr + 0x18) = (uintptr_t)new_cap;
+        }
         
-        uintptr_t *new_elem = (uintptr_t *)(new_arr + 0x20);
+        uintptr_t *new_elem = (uintptr_t *)(new_arr + hdr_sz);
         for (int i = 0; i < size; i++) {
             new_elem[i] = elem_base[i];
         }
@@ -1466,17 +1516,20 @@ static int do_modify_equip_slots(int slot_count) {
         uintptr_t probe = *(volatile uintptr_t *)(items + 0x10);
         uintptr_t max_length;
         int32_t *elem_base;
+        int compact = 0;
         if (probe == 0) {
             max_length = *(volatile uintptr_t *)(items + 0x18);
             elem_base = (int32_t *)(items + 0x20);
         } else if (probe > 0 && probe <= 200000) {
             max_length = probe;
             elem_base = (int32_t *)(items + 0x18);
+            compact = 1;
         } else {
             uint32_t lo32 = (uint32_t)(probe & 0xFFFFFFFF);
             if (lo32 > 0 && lo32 <= 200000) {
                 max_length = lo32;
                 elem_base = (int32_t *)(items + 0x18);
+                compact = 1;
             } else {
                 max_length = *(volatile uintptr_t *)(items + 0x18);
                 elem_base = (int32_t *)(items + 0x20);
@@ -1493,13 +1546,13 @@ static int do_modify_equip_slots(int slot_count) {
             
             g_in_safe_access = 1;
             if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
-            uintptr_t new_arr = alloc_int32_szarray(items, new_cap);
+            uintptr_t new_arr = alloc_int32_szarray(items, new_cap, compact);
             g_in_safe_access = 0;
             
             if (!new_arr) continue;
             
-            // 拷贝旧元素
-            int32_t *new_elem = (int32_t *)(new_arr + 0x20);
+            // 拷贝旧元素 (偏移取决于布局)
+            int32_t *new_elem = (int32_t *)(new_arr + (compact ? 0x18 : 0x20));
             g_in_safe_access = 1;
             if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
             for (int s = 0; s < cur_size; s++) {
@@ -2174,6 +2227,88 @@ static jstring JNICALL jni_modify_equip_slots(JNIEnv *env, jclass clazz, jint sl
     return (*env)->NewStringUTF(env, buf);
 }
 
+// ========== JNI: 预加载内存数据 ==========
+static char* do_prescan(void) {
+    if (init_il2cpp_context() != 0) return strdup("\u274C il2cpp 初始化失败");
+    
+    // 强制全量扫描 RoleInfo
+    int ri_count = scan_and_cache_roleinfo();
+    
+    // 预缓存所有配置类实例
+    const char *cfg_names[] = {"CardsConfig", "LostThingConfig", "MinionEquipConfig"};
+    int cfg_types[] = {1, 2, 3};
+    int cached = 0;
+    for (int c = 0; c < 3; c++) {
+        Il2CppClass klass = fn_class_from_name(g_csharp_image, "", cfg_names[c]);
+        if (!klass) { LOGW("[prescan] Class %s not found", cfg_names[c]); continue; }
+        uintptr_t inst = get_cached_config(cfg_types[c], (uintptr_t)klass);
+        if (!inst) {
+            inst = find_single_class_instance((uintptr_t)klass);
+            if (inst) { set_config_cache(cfg_types[c], (uintptr_t)klass, inst); cached++; }
+            else { LOGW("[prescan] No instance for %s", cfg_names[c]); }
+        } else { cached++; }
+    }
+    
+    // 输出 RoleInfo 详情 (调试用)
+    if (ri_count > 0) {
+        install_sigsegv_handler();
+        for (int i = 0; i < g_cached_count; i++) {
+            uintptr_t obj = g_cached_roleinfo[i];
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+            int32_t gold = *(volatile int32_t *)(obj + OFF_CURGOLD);
+            int32_t hp = *(volatile int32_t *)(obj + OFF_CURHP);
+            int32_t maxhp = *(volatile int32_t *)(obj + OFF_MAXHP);
+            uintptr_t cards_lib = *(volatile uintptr_t *)(obj + 0x90);
+            uintptr_t equip_slot = *(volatile uintptr_t *)(obj + OFF_EQUIPSLOT);
+            uintptr_t lostthing = *(volatile uintptr_t *)(obj + OFF_LOSTTHING);
+            uintptr_t cards_bat = *(volatile uintptr_t *)(obj + 0x100);
+            g_in_safe_access = 0;
+            LOGI("[prescan] RoleInfo[%d] @ %p: gold=%d hp=%d/%d", i, (void*)obj, gold, hp, maxhp);
+            LOGI("[prescan]   cardsLib=%p equipSlot=%p lostthing=%p cardsBattle=%p",
+                 (void*)cards_lib, (void*)equip_slot, (void*)lostthing, (void*)cards_bat);
+            // 显示各 List 的 size
+            if (cards_lib > 0x10000) {
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+                int32_t s = *(volatile int32_t *)(cards_lib + 0x18);
+                g_in_safe_access = 0;
+                LOGI("[prescan]   cardsLibraryAll size=%d", s);
+            }
+            if (equip_slot > 0x10000) {
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+                int32_t s = *(volatile int32_t *)(equip_slot + 0x18);
+                g_in_safe_access = 0;
+                LOGI("[prescan]   equipmentSlot size=%d", s);
+            }
+            if (lostthing > 0x10000) {
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+                int32_t s = *(volatile int32_t *)(lostthing + 0x18);
+                g_in_safe_access = 0;
+                LOGI("[prescan]   lostThingList size=%d", s);
+            }
+        }
+        uninstall_sigsegv_handler();
+    }
+    
+    char *buf = (char *)malloc(256);
+    snprintf(buf, 256, "\u2705 预加载完成: %d个角色, %d/3个配置", ri_count, cached);
+    return buf;
+}
+
+static jstring JNICALL jni_prescan(JNIEnv *env, jclass clazz) {
+    LOGI("[JNI] nativePreScan");
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    char *result = do_prescan();
+    pthread_mutex_unlock(&g_hack_mutex);
+    jstring jresult = (*env)->NewStringUTF(env, result);
+    free(result);
+    return jresult;
+}
+
 static JNINativeMethod g_jni_methods[] = {
     { "nativeModifyGold",      "(I)Ljava/lang/String;",     (void *)jni_modify_gold },
     { "nativeResetSkillCD",    "()Ljava/lang/String;",      (void *)jni_reset_skill_cd },
@@ -2187,6 +2322,7 @@ static JNINativeMethod g_jni_methods[] = {
     { "nativeModifyAll",       "(IIIII)Ljava/lang/String;", (void *)jni_modify_all },
     { "nativeEnumItems",       "(I)Ljava/lang/String;",     (void *)jni_enum_items },
     { "nativeModifyEquipSlots","(I)Ljava/lang/String;",     (void *)jni_modify_equip_slots },
+    { "nativePreScan",         "()Ljava/lang/String;",      (void *)jni_prescan },
 };
 
 // ========== 通过 JNI 加载嵌入的 DEX 并创建悬浮菜单 ==========

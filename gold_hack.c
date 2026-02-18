@@ -1104,6 +1104,40 @@ static int do_modify_handcards(int handcards) {
 //   +0x10 bounds (= NULL for SZArray)
 //   +0x18 max_length (nint, 8 bytes on ARM64)
 //   +0x20 elements[] (int32)
+
+// 手动分配一个 Il2CppSZArray(Int32[]) —— 当原数组容量不够时用
+// 复制 klass/monitor 头部，重设 max_length，拷贝旧元素
+// 返回新数组指针 (mmap 分配, 不会被 GC 回收, 故意 leak)
+static uintptr_t alloc_int32_szarray(uintptr_t old_arr, int new_cap) {
+    // SZArray 头: klass(8) + monitor(8) + bounds(8,=0) + max_length(8) + elements(new_cap * 4)
+    size_t header_sz = 0x20;
+    size_t total = header_sz + (size_t)new_cap * 4;
+    // 页对齐 mmap
+    size_t page_sz = 4096;
+    size_t alloc_sz = (total + page_sz - 1) & ~(page_sz - 1);
+    void *mem = mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        LOGE("  alloc_int32_szarray: mmap failed (size=%zu)", alloc_sz);
+        return 0;
+    }
+    memset(mem, 0, alloc_sz);
+    uintptr_t arr = (uintptr_t)mem;
+
+    // 复制 klass 和 monitor 从旧数组
+    if (old_arr > 0x10000) {
+        *(volatile uintptr_t *)(arr + 0x00) = *(volatile uintptr_t *)(old_arr + 0x00); // klass
+        *(volatile uintptr_t *)(arr + 0x08) = *(volatile uintptr_t *)(old_arr + 0x08); // monitor
+    }
+    // bounds = NULL (SZArray)
+    *(volatile uintptr_t *)(arr + 0x10) = 0;
+    // max_length
+    *(volatile uintptr_t *)(arr + 0x18) = (uintptr_t)new_cap;
+
+    LOGI("  alloc_int32_szarray: new arr @ %p, cap=%d, total=%zu", mem, new_cap, alloc_sz);
+    return arr;
+}
+
 static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
     if (list_ptr < 0x10000) { LOGW("  add_item: list_ptr invalid (%p)", (void*)list_ptr); return -1; }
     
@@ -1119,11 +1153,13 @@ static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
     uintptr_t probe = *(volatile uintptr_t *)(items + 0x10);
     uintptr_t max_length;
     int32_t *elem_base;
+    int is_standard_layout = 0; // bounds=NULL 标准布局
     
     if (probe == 0) {
         // 标准 SZArray: bounds=NULL, max_length at +0x18, elements at +0x20
         max_length = *(volatile uintptr_t *)(items + 0x18);
         elem_base = (int32_t *)(items + 0x20);
+        is_standard_layout = 1;
     } else if (probe > 0 && probe <= 200000) {
         // 无 bounds 字段, +0x10 直接是 max_length, elements at +0x18
         max_length = probe;
@@ -1137,18 +1173,16 @@ static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
         } else {
             max_length = *(volatile uintptr_t *)(items + 0x18);
             elem_base = (int32_t *)(items + 0x20);
+            is_standard_layout = 1;
         }
     }
     
-    LOGI("  add_item: id=%d, list size=%d, arr cap=%d, elem_base=%p",
-         item_id, size, (int)max_length, (void*)elem_base);
+    LOGI("  add_item: id=%d, list size=%d, arr cap=%d, layout=%s, elem_base=%p",
+         item_id, size, (int)max_length,
+         is_standard_layout ? "standard(bounds=NULL)" : "compact",
+         (void*)elem_base);
     
-    if ((int64_t)max_length <= 0 || max_length > 10000 || (int64_t)max_length < size) {
-        LOGW("  add_item: bad capacity (%d), size=%d", (int)max_length, size);
-        return -1;
-    }
-    
-    // 检查是否已存在
+    // 检查是否已存在 (在扩容之前检查)
     for (int i = 0; i < size; i++) {
         if (elem_base[i] == item_id) {
             LOGI("  Item %d already in list at [%d]", item_id, i);
@@ -1156,9 +1190,37 @@ static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
         }
     }
     
-    // 检查容量是否足够（无法扩容，只在有空间时添加）
-    if ((uintptr_t)size >= max_length) {
-        LOGW("  List full (size=%d, cap=%d), cannot add item %d", size, (int)max_length, item_id);
+    // 容量不够时 → 分配新数组并替换
+    if (max_length == 0 || (uintptr_t)size >= max_length) {
+        int new_cap = (int)(max_length == 0 ? 16 : max_length * 2);
+        if (new_cap < size + 4) new_cap = size + 4;
+        if (new_cap > 200) new_cap = 200;
+        
+        LOGI("  Expanding: old cap=%d, new cap=%d, copying %d elements",
+             (int)max_length, new_cap, size);
+        
+        uintptr_t new_arr = alloc_int32_szarray(items, new_cap);
+        if (!new_arr) return -1;
+        
+        // 拷贝旧元素到新数组 (+0x20 = elements)
+        int32_t *new_elem = (int32_t *)(new_arr + 0x20);
+        for (int i = 0; i < size; i++) {
+            new_elem[i] = elem_base[i];
+        }
+        
+        // 替换 List._items 指针
+        *(volatile uintptr_t *)(list_ptr + 0x10) = new_arr;
+        
+        // 更新本地变量指向新数组
+        items = new_arr;
+        elem_base = new_elem;
+        max_length = (uintptr_t)new_cap;
+        
+        LOGI("  Replaced _items: old=%p -> new=%p", (void*)(*(volatile uintptr_t *)(list_ptr + 0x10)), (void*)new_arr);
+    }
+    
+    if ((int64_t)max_length <= 0 || max_length > 10000 || (int64_t)max_length < size) {
+        LOGW("  add_item: bad capacity (%d), size=%d", (int)max_length, size);
         return -1;
     }
     
@@ -1296,12 +1358,37 @@ static int do_modify_equip_slots(int slot_count) {
 
         LOGI("  equip_slots: cur_size=%d, cap=%d, target=%d", cur_size, (int)max_length, slot_count);
 
-        if ((int64_t)max_length <= 0 || max_length > 10000) continue;
+        // 如果目标 > 当前容量，需要扩容
+        if ((uintptr_t)slot_count > max_length) {
+            int new_cap = slot_count + 4;
+            LOGI("  equip_slots: expanding cap %d -> %d", (int)max_length, new_cap);
+            
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+            uintptr_t new_arr = alloc_int32_szarray(items, new_cap);
+            g_in_safe_access = 0;
+            
+            if (!new_arr) continue;
+            
+            // 拷贝旧元素
+            int32_t *new_elem = (int32_t *)(new_arr + 0x20);
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+            for (int s = 0; s < cur_size; s++) {
+                new_elem[s] = elem_base[s];
+            }
+            // 替换 _items
+            *(volatile uintptr_t *)(equip_list + 0x10) = new_arr;
+            g_in_safe_access = 0;
+            
+            items = new_arr;
+            elem_base = new_elem;
+            max_length = (uintptr_t)new_cap;
+        }
 
         int new_size = slot_count;
         if ((uintptr_t)new_size > max_length) {
             new_size = (int)max_length;
-            LOGW("  Capped to array capacity: %d", new_size);
         }
 
         // 新增的槽位填 0 (空槽)

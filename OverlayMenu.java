@@ -35,7 +35,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     private LinearLayout contentArea;
     private TextView statusText;
     private EditText goldInput, hpInput, mpInput, actionInput, handcardsInput;
-    private EditText equipInput, lostthingInput, cardInput, equipSlotsInput;
+    private EditText lostthingInput, cardInput, equipSlotsInput;
     private Button toggleBtn;
     private Button autoSkillBtn;
     private boolean collapsed = false;
@@ -70,6 +70,9 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     private static final int BTN_BROWSE_BLESS = 0x7f000022;
     private static final int BTN_EQUIP_SLOTS  = 0x7f000023;
     private static final int BTN_PRESCAN      = 0x7f000024;
+    private static final int BTN_MANAGE_CARD  = 0x7f000025;
+    private static final int BTN_MANAGE_BLESS = 0x7f000026;
+    private static final int BTN_MANAGE_EQUIP = 0x7f000027;
 
     // 物品类型常量 (与 C 层 do_enum_items 对应)
     private static final int ITEM_TYPE_CARD      = 1;
@@ -90,6 +93,9 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     public static native String nativeEnumItems(int type);
     public static native String nativeModifyEquipSlots(int slots);
     public static native String nativePreScan();
+    public static native String nativeGetCurrentItems(int type);
+    public static native String nativeRemoveCard(int cardId);
+    public static native String nativeRemoveLostThing(int lostThingId);
 
     /**
      * 从 C 代码调用的入口，在 UI 线程创建悬浮窗
@@ -216,23 +222,24 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         handcardsInput = addInputRow(contentArea, "手牌上限", "10", BTN_HANDCARDS, "修改");
         addDivider(contentArea);
 
-        // ==================== ⚔️ 添加装备 ====================
-        addSectionLabel(contentArea, "\u2694\uFE0F 添加装备 (装备ID)", 0xFFFB923C);
-        equipInput = addInputRow(contentArea, "装备ID", "", BTN_EQUIP, "添加");
-        addBrowseRow(contentArea, BTN_BROWSE_EQUIP, "📂 浏览装备列表");
+        // ==================== ⚔️ 装备槽 ====================
+        addSectionLabel(contentArea, "\u2694\uFE0F 装备槽数量", 0xFFFB923C);
         equipSlotsInput = addInputRow(contentArea, "装备槽数", "6", BTN_EQUIP_SLOTS, "设置");
+        addBrowseRow(contentArea, BTN_MANAGE_EQUIP, "📋 查看当前装备");
         addDivider(contentArea);
 
-        // ==================== 🃏 添加卡牌 ====================
-        addSectionLabel(contentArea, "\uD83C\uDCCF 添加卡牌 (卡牌ID)", 0xFF60A5FA);
+        // ==================== 🃏 卡牌管理 ====================
+        addSectionLabel(contentArea, "\uD83C\uDCCF 卡牌管理", 0xFF60A5FA);
         cardInput = addInputRow(contentArea, "卡牌ID", "", BTN_CARD, "添加");
-        addBrowseRow(contentArea, BTN_BROWSE_CARD, "📂 浏览卡牌列表");
+        addBrowseRow(contentArea, BTN_BROWSE_CARD, "📂 浏览全部卡牌");
+        addBrowseRow(contentArea, BTN_MANAGE_CARD, "📋 管理当前卡牌 (查看/删除)");
         addDivider(contentArea);
 
-        // ==================== ✨ 祝福/遗物 ====================
-        addSectionLabel(contentArea, "\u2728 添加祝福/遗物 (ID)", 0xFFFBBF24);
+        // ==================== ✨ 祝福管理 ====================
+        addSectionLabel(contentArea, "\u2728 祝福/遗物管理", 0xFFFBBF24);
         lostthingInput = addInputRow(contentArea, "遗物ID", "", BTN_LOSTTHING, "添加");
-        addBrowseRow(contentArea, BTN_BROWSE_BLESS, "📂 浏览祝福列表");
+        addBrowseRow(contentArea, BTN_BROWSE_BLESS, "📂 浏览全部祝福");
+        addBrowseRow(contentArea, BTN_MANAGE_BLESS, "📋 管理当前祝福 (查看/删除)");
         addDivider(contentArea);
 
         // ==================== ⚡ 技能CD ====================
@@ -423,8 +430,6 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             doIntModify(actionInput, "nativeModifyAction");
         } else if (id == BTN_HANDCARDS) {
             doIntModify(handcardsInput, "nativeModifyHandcards");
-        } else if (id == BTN_EQUIP) {
-            doIntModify(equipInput, "nativeAddEquipment");
         } else if (id == BTN_EQUIP_SLOTS) {
             doIntModify(equipSlotsInput, "nativeModifyEquipSlots");
         } else if (id == BTN_LOSTTHING) {
@@ -437,12 +442,16 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             toggleAutoReset();
         } else if (id == BTN_MODIFY_ALL) {
             doModifyAll();
-        } else if (id == BTN_BROWSE_EQUIP) {
-            showItemPicker(ITEM_TYPE_EQUIP, equipInput, "nativeAddEquipment", "装备");
         } else if (id == BTN_BROWSE_CARD) {
             showItemPicker(ITEM_TYPE_CARD, cardInput, "nativeAddCard", "卡牌");
         } else if (id == BTN_BROWSE_BLESS) {
             showItemPicker(ITEM_TYPE_LOSTTHING, lostthingInput, "nativeAddLostThing", "祝福/遗物");
+        } else if (id == BTN_MANAGE_CARD) {
+            showManageDialog(ITEM_TYPE_CARD, "卡牌", "nativeRemoveCard");
+        } else if (id == BTN_MANAGE_BLESS) {
+            showManageDialog(ITEM_TYPE_LOSTTHING, "祝福/遗物", "nativeRemoveLostThing");
+        } else if (id == BTN_MANAGE_EQUIP) {
+            showManageDialog(ITEM_TYPE_EQUIP, "装备", null);
         } else if (id == BTN_PRESCAN) {
             doPreScan();
         } else if (id == BTN_P1 || id == BTN_P2 || id == BTN_P3 || id == BTN_P4) {
@@ -630,6 +639,265 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                 });
             }
         }).start();
+    }
+
+    // ===== 管理当前物品 (查看 + 删除) =====
+    // 从 C 层读取当前已有物品 ID → 从枚举列表匹配名称 → 弹出可勾选列表 → 删除选中项
+    private void showManageDialog(final int itemType, final String title, final String nativeRemoveMethod) {
+        if (busy) return;
+        setBusy(true);
+        statusText.setText("\u23F3 读取当前" + title + "...");
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                // 1. 读取当前物品 ID 列表
+                final String currentJson = nativeGetCurrentItems(itemType);
+                // 2. 枚举所有物品名称 (用于匹配)
+                final String enumJson = nativeEnumItems(itemType);
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        try {
+                            buildManageDialog(currentJson, enumJson, title, nativeRemoveMethod, itemType);
+                        } catch (Exception e) {
+                            statusText.setText("\u274C 解析失败: " + e.getMessage());
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void buildManageDialog(String currentJson, String enumJson, final String title,
+                                    final String nativeRemoveMethod, final int itemType) {
+        // 解析当前 ID 列表: [1001,1002,...]
+        final List<Integer> currentIds = new ArrayList<Integer>();
+        try {
+            String s = currentJson.trim();
+            if (s.startsWith("[")) s = s.substring(1);
+            if (s.endsWith("]")) s = s.substring(0, s.length() - 1);
+            if (!s.isEmpty()) {
+                for (String part : s.split(",")) {
+                    part = part.trim();
+                    if (!part.isEmpty()) {
+                        int id = Integer.parseInt(part);
+                        if (id != 0) currentIds.add(id);
+                    }
+                }
+            }
+        } catch (Exception e) { /* ignore */ }
+
+        if (currentIds.isEmpty()) {
+            statusText.setText("\u26A0\uFE0F 当前没有" + title);
+            return;
+        }
+
+        // 解析枚举名称映射: id -> name
+        final java.util.Map<Integer, String> nameMap = new java.util.HashMap<Integer, String>();
+        try {
+            String ej = enumJson.trim();
+            if (ej.startsWith("[")) ej = ej.substring(1);
+            if (ej.endsWith("]")) ej = ej.substring(0, ej.length() - 1);
+            String[] parts = ej.split("\\},\\s*\\{");
+            for (String part : parts) {
+                part = part.replace("{", "").replace("}", "").trim();
+                if (part.isEmpty()) continue;
+                int id = 0; String name = "";
+                String[] fields = part.split(",");
+                for (String f : fields) {
+                    f = f.trim();
+                    if (f.startsWith("\"id\":")) {
+                        try { id = Integer.parseInt(f.substring(5).trim()); } catch (Exception e) {}
+                    } else if (f.startsWith("\"n\":")) {
+                        name = f.substring(4).trim();
+                        if (name.startsWith("\"")) name = name.substring(1);
+                        if (name.endsWith("\"")) name = name.substring(0, name.length() - 1);
+                        name = name.replace("\\\"", "\"").replace("\\\\", "\\");
+                    }
+                }
+                if (id > 0 && !name.isEmpty()) nameMap.put(id, name);
+            }
+        } catch (Exception e) { /* ignore */ }
+
+        // 构建显示列表 (统计每个 ID 出现次数)
+        final java.util.Map<Integer, Integer> countMap = new java.util.LinkedHashMap<Integer, Integer>();
+        for (int id : currentIds) {
+            Integer c = countMap.get(id);
+            countMap.put(id, c == null ? 1 : c + 1);
+        }
+
+        final List<Integer> uniqueIds = new ArrayList<Integer>(countMap.keySet());
+        final List<String> displayNames = new ArrayList<String>();
+        for (int id : uniqueIds) {
+            String name = nameMap.containsKey(id) ? nameMap.get(id) : "???";
+            int cnt = countMap.get(id);
+            String label = "[" + id + "] " + name;
+            if (cnt > 1) label += " (x" + cnt + ")";
+            displayNames.add(label);
+        }
+
+        statusText.setText("\u2705 当前 " + currentIds.size() + " 个" + title);
+
+        // 构建对话框
+        wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                       | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
+        try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+
+        LinearLayout dialogRoot = new LinearLayout(activity);
+        dialogRoot.setOrientation(LinearLayout.VERTICAL);
+        dialogRoot.setPadding(dp(8), dp(4), dp(8), dp(4));
+
+        // 标题信息
+        TextView infoLabel = new TextView(activity);
+        infoLabel.setText("当前共 " + currentIds.size() + " 个" + title + " (" + uniqueIds.size() + " 种)");
+        infoLabel.setTextColor(0xFF333333);
+        infoLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        infoLabel.setPadding(dp(4), dp(2), 0, dp(4));
+        dialogRoot.addView(infoLabel);
+
+        // 搜索框
+        final EditText searchBox = new EditText(activity);
+        searchBox.setHint("\uD83D\uDD0D 搜索...");
+        searchBox.setTextColor(0xFF000000);
+        searchBox.setHintTextColor(0xFF999999);
+        searchBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        searchBox.setSingleLine(true);
+        searchBox.setPadding(dp(8), dp(4), dp(8), dp(4));
+        dialogRoot.addView(searchBox);
+
+        // 滚动列表
+        ScrollView sv = new ScrollView(activity);
+        sv.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(300)));
+
+        final LinearLayout listLayout = new LinearLayout(activity);
+        listLayout.setOrientation(LinearLayout.VERTICAL);
+        listLayout.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        final boolean[] selected = new boolean[uniqueIds.size()];
+        final CheckBox[] checkBoxes = new CheckBox[uniqueIds.size()];
+
+        // 计数标签
+        final TextView countLabel = new TextView(activity);
+        countLabel.setText("已选 0 项");
+        countLabel.setTextColor(0xFF666666);
+        countLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        countLabel.setPadding(dp(4), dp(2), 0, dp(2));
+
+        for (int i = 0; i < uniqueIds.size(); i++) {
+            CheckBox cb = new CheckBox(activity);
+            cb.setText(displayNames.get(i));
+            cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            cb.setChecked(false);
+            final int idx = i;
+            cb.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+                @Override
+                public void onCheckedChanged(CompoundButton b, boolean checked) {
+                    selected[idx] = checked;
+                    int cnt = 0;
+                    for (boolean s : selected) if (s) cnt++;
+                    countLabel.setText("已选 " + cnt + " 项");
+                }
+            });
+            checkBoxes[i] = cb;
+            listLayout.addView(cb);
+        }
+
+        dialogRoot.addView(countLabel);
+        sv.addView(listLayout);
+        dialogRoot.addView(sv);
+
+        // 搜索过滤
+        searchBox.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override
+            public void afterTextChanged(android.text.Editable s) {
+                String q = s.toString().toLowerCase().trim();
+                for (int i = 0; i < checkBoxes.length; i++) {
+                    boolean visible = q.isEmpty() || displayNames.get(i).toLowerCase().contains(q);
+                    checkBoxes[i].setVisibility(visible ? View.VISIBLE : View.GONE);
+                }
+            }
+        });
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
+        builder.setTitle("\uD83D\uDCCB 当前" + title);
+
+        // 装备是只读的 (没有 remove 方法)
+        if (nativeRemoveMethod != null) {
+            builder.setPositiveButton("\uD83D\uDDD1 删除选中", new DialogInterface.OnClickListener() {
+                @Override
+                public void onClick(DialogInterface dialog, int which) {
+                    wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                    try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+
+                    final List<Integer> toRemove = new ArrayList<Integer>();
+                    for (int i = 0; i < selected.length; i++) {
+                        if (selected[i]) toRemove.add(uniqueIds.get(i));
+                    }
+                    if (toRemove.isEmpty()) {
+                        statusText.setText("未选择任何" + title);
+                        return;
+                    }
+
+                    setBusy(true);
+                    statusText.setText("\u23F3 删除 " + toRemove.size() + " 个" + title + "...");
+                    new Thread(new Runnable() {
+                        @Override
+                        public void run() {
+                            int ok = 0;
+                            for (int itemId : toRemove) {
+                                try {
+                                    java.lang.reflect.Method m = OverlayMenu.class.getDeclaredMethod(
+                                            nativeRemoveMethod, int.class);
+                                    String r = (String) m.invoke(null, itemId);
+                                    if (r != null && r.contains("\u2705")) ok++;
+                                } catch (Exception e) { /* skip */ }
+                            }
+                            final int fOk = ok;
+                            new Handler(Looper.getMainLooper()).post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    statusText.setText("\u2705 已删除 " + fOk + "/" + toRemove.size() + " 个" + title);
+                                    setBusy(false);
+                                }
+                            });
+                        }
+                    }).start();
+                }
+            });
+        }
+
+        builder.setNegativeButton("关闭", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+            }
+        });
+        builder.setView(dialogRoot);
+        builder.setCancelable(true);
+        builder.setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override
+            public void onCancel(DialogInterface dialog) {
+                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+            }
+        });
+
+        try {
+            AlertDialog dlg = builder.create();
+            if (dlg.getWindow() != null) dlg.getWindow().setType(2);
+            dlg.show();
+        } catch (Exception e) {
+            statusText.setText("\u274C 无法显示对话框: " + e.getMessage());
+            wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+            try { wm.updateViewLayout(container, wmParams); } catch (Exception e2) {}
+        }
     }
 
     // ===== 可视化物品选择器 =====

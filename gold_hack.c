@@ -1286,14 +1286,6 @@ static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
          is_standard_layout ? "standard(bounds=NULL)" : "compact",
          (void*)elem_base);
     
-    // 检查是否已存在 (在扩容之前检查)
-    for (int i = 0; i < size; i++) {
-        if (elem_base[i] == item_id) {
-            LOGI("  Item %d already in list at [%d]", item_id, i);
-            return 0;
-        }
-    }
-    
     // 容量不够时 → 分配新数组并替换
     if (max_length == 0 || (uintptr_t)size >= max_length) {
         int new_cap = (int)(max_length == 0 ? 16 : max_length * 2);
@@ -1495,17 +1487,7 @@ static int add_card_to_ref_list(uintptr_t list_ptr, int card_id) {
     
     LOGI("  add_card_ref: card=%d, size=%d, cap=%d", card_id, size, (int)max_length);
     
-    // 检查是否已存在 (CardInfoInDeck.id at +0x10)
-    for (int i = 0; i < size; i++) {
-        uintptr_t obj = elem_base[i];
-        if (obj > 0x10000) {
-            int32_t eid = *(volatile int32_t *)(obj + 0x10);
-            if (eid == card_id) {
-                LOGI("  Card %d already in library at [%d]", card_id, i);
-                return 0;
-            }
-        }
-    }
+    // 注意: 不做去重检查, 游戏允许套牌中有多张相同卡牌
     
     // 扩容 (分配新 pointer array)
     if (max_length == 0 || (uintptr_t)size >= max_length) {
@@ -1720,6 +1702,206 @@ static int do_modify_equip_slots(int slot_count) {
     }
     uninstall_sigsegv_handler();
     LOGI("do_modify_equip_slots: set to %d on %d instance(s)", slot_count, count);
+    return count;
+}
+
+// ========== 读取当前物品列表 (返回 JSON 数组) ==========
+// type: 1=卡牌(cardsBattle 0x100), 2=祝福(lostThingList 0xb8), 3=装备(equipmentSlot 0x98)
+static char* do_get_current_items(int type) {
+    if (init_il2cpp_context() != 0) return strdup("[]");
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return strdup("[]");
+    
+    uintptr_t list_offset;
+    switch (type) {
+        case 1: list_offset = 0x100; break;  // cardsBattle
+        case 2: list_offset = OFF_LOSTTHING; break;
+        case 3: list_offset = OFF_EQUIPSLOT; break;
+        default: return strdup("[]");
+    }
+    
+    // 从第一个 RoleInfo 实例读取
+    uintptr_t obj_addr = g_cached_roleinfo[0];
+    
+    install_sigsegv_handler();
+    g_in_safe_access = 1;
+    if (sigsetjmp(g_jmpbuf, 1) != 0) {
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        return strdup("[]");
+    }
+    
+    uintptr_t list_ptr = *(volatile uintptr_t *)(obj_addr + list_offset);
+    if (list_ptr < 0x10000) { g_in_safe_access = 0; uninstall_sigsegv_handler(); return strdup("[]"); }
+    
+    uintptr_t items = *(volatile uintptr_t *)(list_ptr + 0x10);
+    int32_t size = *(volatile int32_t *)(list_ptr + 0x18);
+    
+    if (items < 0x10000 || size <= 0 || size > 2000) {
+        g_in_safe_access = 0; uninstall_sigsegv_handler(); return strdup("[]");
+    }
+    
+    // 探测 SZArray 布局
+    uintptr_t probe = *(volatile uintptr_t *)(items + 0x10);
+    int32_t *elem_base;
+    if (probe == 0) {
+        elem_base = (int32_t *)(items + 0x20);
+    } else if (probe > 0 && probe <= 200000) {
+        elem_base = (int32_t *)(items + 0x18);
+    } else {
+        elem_base = (int32_t *)(items + 0x20);
+    }
+    
+    // 构建 JSON 数组
+    size_t buf_size = (size_t)size * 12 + 8;
+    char *buf = (char *)malloc(buf_size);
+    if (!buf) { g_in_safe_access = 0; uninstall_sigsegv_handler(); return strdup("[]"); }
+    
+    int pos = 0;
+    buf[pos++] = '[';
+    for (int i = 0; i < size; i++) {
+        int32_t val = elem_base[i];
+        if (val == 0 && type == 3) continue; // 跳过装备空槽
+        if (i > 0 && pos > 1) buf[pos++] = ',';
+        pos += snprintf(buf + pos, buf_size - pos, "%d", val);
+    }
+    buf[pos++] = ']';
+    buf[pos] = '\0';
+    
+    g_in_safe_access = 0;
+    uninstall_sigsegv_handler();
+    
+    LOGI("do_get_current_items(type=%d): size=%d, json=%s", type, size, buf);
+    return buf;
+}
+
+// ========== 从 List<Int32> 中移除指定 ID ==========
+// 找到 item_id, 将后续元素左移, size-1
+// 返回: 1=已移除, 0=未找到, -1=错误
+static int remove_item_from_int_list(uintptr_t list_ptr, int item_id) {
+    if (list_ptr < 0x10000) return -1;
+    
+    uintptr_t items = *(volatile uintptr_t *)(list_ptr + 0x10);
+    int32_t size = *(volatile int32_t *)(list_ptr + 0x18);
+    
+    if (items < 0x10000 || size <= 0 || size > 2000) return -1;
+    
+    uintptr_t probe = *(volatile uintptr_t *)(items + 0x10);
+    int32_t *elem_base;
+    if (probe == 0) {
+        elem_base = (int32_t *)(items + 0x20);
+    } else if (probe > 0 && probe <= 200000) {
+        elem_base = (int32_t *)(items + 0x18);
+    } else {
+        elem_base = (int32_t *)(items + 0x20);
+    }
+    
+    // 查找并移除
+    for (int i = 0; i < size; i++) {
+        if (elem_base[i] == item_id) {
+            // 左移后续元素
+            for (int j = i; j < size - 1; j++) {
+                elem_base[j] = elem_base[j + 1];
+            }
+            elem_base[size - 1] = 0;
+            *(int32_t *)(list_ptr + 0x18) = size - 1;
+            LOGI("  Removed item %d from list (size: %d -> %d)", item_id, size, size - 1);
+            return 1;
+        }
+    }
+    return 0; // 未找到
+}
+
+// ========== 从 List<CardInfoInDeck> 中按 id 移除 ==========
+static int remove_card_from_ref_list(uintptr_t list_ptr, int card_id) {
+    if (list_ptr < 0x10000) return -1;
+    
+    uintptr_t items = *(volatile uintptr_t *)(list_ptr + 0x10);
+    int32_t size = *(volatile int32_t *)(list_ptr + 0x18);
+    
+    if (items < 0x10000 || size <= 0 || size > 5000) return -1;
+    
+    uintptr_t probe = *(volatile uintptr_t *)(items + 0x10);
+    uintptr_t *elem_base;
+    if (probe == 0) {
+        elem_base = (uintptr_t *)(items + 0x20);
+    } else if (probe > 0 && probe <= 200000) {
+        elem_base = (uintptr_t *)(items + 0x18);
+    } else {
+        elem_base = (uintptr_t *)(items + 0x20);
+    }
+    
+    for (int i = 0; i < size; i++) {
+        uintptr_t obj = elem_base[i];
+        if (obj < 0x10000) continue;
+        int32_t eid = *(volatile int32_t *)(obj + 0x10);
+        if (eid == card_id) {
+            for (int j = i; j < size - 1; j++) {
+                elem_base[j] = elem_base[j + 1];
+            }
+            elem_base[size - 1] = 0;
+            *(int32_t *)(list_ptr + 0x18) = size - 1;
+            LOGI("  Removed CardInfoInDeck(id=%d) from ref list (size: %d -> %d)", card_id, size, size - 1);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// ========== 删除卡牌 ==========
+static int do_remove_card(int card_id) {
+    if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        
+        int ok = 0;
+        
+        // 1. 从 cardsLibraryAll (List<CardInfoInDeck>) 移除
+        uintptr_t lib_cards = *(volatile uintptr_t *)(obj_addr + 0x90);
+        if (lib_cards > 0x10000) {
+            if (remove_card_from_ref_list(lib_cards, card_id) > 0) ok = 1;
+        }
+        
+        // 2. 从 cardsBattle (List<Int32>) 移除
+        uintptr_t battle_cards = *(volatile uintptr_t *)(obj_addr + 0x100);
+        if (battle_cards > 0x10000) {
+            remove_item_from_int_list(battle_cards, card_id);
+        }
+        
+        g_in_safe_access = 0;
+        if (ok) count++;
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_remove_card: removed card %d from %d instance(s)", card_id, count);
+    return count;
+}
+
+// ========== 删除祝福/遗物 ==========
+static int do_remove_lostthing(int lostthing_id) {
+    if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        uintptr_t lt_list = *(volatile uintptr_t *)(obj_addr + OFF_LOSTTHING);
+        int ret = remove_item_from_int_list(lt_list, lostthing_id);
+        g_in_safe_access = 0;
+        if (ret > 0) count++;
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_remove_lostthing: removed %d from %d instance(s)", lostthing_id, count);
     return count;
 }
 
@@ -2530,6 +2712,46 @@ static jstring JNICALL jni_prescan(JNIEnv *env, jclass clazz) {
     return jresult;
 }
 
+// ========== JNI: 读取当前物品列表 ==========
+static jstring JNICALL jni_get_current_items(JNIEnv *env, jclass clazz, jint type) {
+    LOGI("[JNI] nativeGetCurrentItems(%d)", (int)type);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "[]");
+    char *json = do_get_current_items((int)type);
+    pthread_mutex_unlock(&g_hack_mutex);
+    jstring result = (*env)->NewStringUTF(env, json);
+    free(json);
+    return result;
+}
+
+// ========== JNI: 删除卡牌 ==========
+static jstring JNICALL jni_remove_card(JNIEnv *env, jclass clazz, jint card_id) {
+    LOGI("[JNI] nativeRemoveCard(%d)", (int)card_id);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    char buf[128];
+    int ret = do_remove_card((int)card_id);
+    if (ret > 0) snprintf(buf, sizeof(buf), "\u2705 已删除卡牌 %d", (int)card_id);
+    else if (ret == 0) snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到卡牌 %d", (int)card_id);
+    else snprintf(buf, sizeof(buf), "\u274C 删除失败");
+    pthread_mutex_unlock(&g_hack_mutex);
+    return (*env)->NewStringUTF(env, buf);
+}
+
+// ========== JNI: 删除祝福 ==========
+static jstring JNICALL jni_remove_lostthing(JNIEnv *env, jclass clazz, jint lt_id) {
+    LOGI("[JNI] nativeRemoveLostThing(%d)", (int)lt_id);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    char buf[128];
+    int ret = do_remove_lostthing((int)lt_id);
+    if (ret > 0) snprintf(buf, sizeof(buf), "\u2705 已删除祝福 %d", (int)lt_id);
+    else if (ret == 0) snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到祝福 %d", (int)lt_id);
+    else snprintf(buf, sizeof(buf), "\u274C 删除失败");
+    pthread_mutex_unlock(&g_hack_mutex);
+    return (*env)->NewStringUTF(env, buf);
+}
+
 static JNINativeMethod g_jni_methods[] = {
     { "nativeModifyGold",      "(I)Ljava/lang/String;",     (void *)jni_modify_gold },
     { "nativeResetSkillCD",    "()Ljava/lang/String;",      (void *)jni_reset_skill_cd },
@@ -2544,6 +2766,9 @@ static JNINativeMethod g_jni_methods[] = {
     { "nativeEnumItems",       "(I)Ljava/lang/String;",     (void *)jni_enum_items },
     { "nativeModifyEquipSlots","(I)Ljava/lang/String;",     (void *)jni_modify_equip_slots },
     { "nativePreScan",         "()Ljava/lang/String;",      (void *)jni_prescan },
+    { "nativeGetCurrentItems", "(I)Ljava/lang/String;",     (void *)jni_get_current_items },
+    { "nativeRemoveCard",      "(I)Ljava/lang/String;",     (void *)jni_remove_card },
+    { "nativeRemoveLostThing", "(I)Ljava/lang/String;",     (void *)jni_remove_lostthing },
 };
 
 // ========== 通过 JNI 加载嵌入的 DEX 并创建悬浮菜单 ==========

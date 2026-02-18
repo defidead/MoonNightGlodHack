@@ -2432,7 +2432,8 @@ static void create_overlay_menu(void) {
     LOGI("[overlay] OverlayMenu class loaded");
 
     // 5. 注册 native 方法
-    if ((*env)->RegisterNatives(env, menuClass, g_jni_methods, 12) != JNI_OK) {
+    if ((*env)->RegisterNatives(env, menuClass, g_jni_methods,
+            sizeof(g_jni_methods) / sizeof(g_jni_methods[0])) != JNI_OK) {
         LOGE("[overlay] RegisterNatives failed");
         if ((*env)->ExceptionCheck(env)) {
             (*env)->ExceptionDescribe(env);

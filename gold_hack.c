@@ -278,8 +278,8 @@ static uintptr_t memmem_find_safe(uintptr_t haystack, size_t haystack_len,
                                    const void *needle, size_t needle_len);
 static void install_sigsegv_handler(void);
 static void uninstall_sigsegv_handler(void);
-static sigjmp_buf g_jmpbuf;
-static volatile int g_in_safe_access = 0;
+static __thread sigjmp_buf g_jmpbuf;
+static __thread volatile int g_in_safe_access = 0;
 
 static void save_api_cache(uintptr_t il2cpp_base) {
     ApiCache cache;
@@ -2653,6 +2653,98 @@ static jstring JNICALL jni_modify_equip_slots(JNIEnv *env, jclass clazz, jint sl
     return (*env)->NewStringUTF(env, buf);
 }
 
+// ========== 多线程预扫描 ==========
+#define NUM_SCAN_THREADS 4
+
+typedef struct {
+    int region_start;           // g_regions 起始索引 (含)
+    int region_end;             // g_regions 结束索引 (不含)
+    uintptr_t target_klass[PRESCAN_SLOTS];
+    // 每线程本地结果
+    uintptr_t local_roleinfo[MAX_CACHED_ROLEINFO];
+    int       local_ri_count;
+    uintptr_t local_warinfo[MAX_CACHED_WARINFO];
+    int       local_wi_count;
+    uintptr_t local_cfg_addr[3];
+    int32_t   local_cfg_count[3];
+} PrescanWorkerArg;
+
+static void* prescan_worker(void *arg) {
+    PrescanWorkerArg *wa = (PrescanWorkerArg *)arg;
+    wa->local_ri_count = 0;
+    wa->local_wi_count = 0;
+    memset(wa->local_cfg_addr, 0, sizeof(wa->local_cfg_addr));
+    memset(wa->local_cfg_count, 0, sizeof(wa->local_cfg_count));
+
+    for (int r = wa->region_start; r < wa->region_end; r++) {
+        MemRegion *region = &g_regions[r];
+        if (!region->readable || !region->writable) continue;
+        if (region->executable) continue;
+        size_t size = region->end - region->start;
+        if (size < 0x40 || size > MAX_SCAN_SIZE) continue;
+        if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue;
+
+        uint8_t *base = (uint8_t *)region->start;
+        for (size_t off = 0; off <= size - 0x40; off += 8) {
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; break; }
+
+            uintptr_t val = *(volatile uintptr_t *)(base + off);
+            if (val == 0) { g_in_safe_access = 0; continue; }
+
+            uintptr_t obj_addr = (uintptr_t)(base + off);
+
+            // --- RoleInfo (slot 0) ---
+            if (val == wa->target_klass[0] && wa->local_ri_count < MAX_CACHED_ROLEINFO
+                && off + 0x100 <= size) {
+                int32_t roleId = *(volatile int32_t *)(obj_addr + 0x10);
+                int32_t maxHp  = *(volatile int32_t *)(obj_addr + 0x14);
+                int32_t curHp  = *(volatile int32_t *)(obj_addr + 0x18);
+                int32_t level  = *(volatile int32_t *)(obj_addr + 0x24);
+                if (roleId >= 0 && roleId <= 200 && maxHp >= 0 && maxHp <= 99999
+                    && curHp >= 0 && curHp <= 99999 && level >= 0 && level <= 100) {
+                    uintptr_t monitor = *(volatile uintptr_t *)(obj_addr + 8);
+                    if (monitor == 0 || monitor >= 0x10000) {
+                        wa->local_roleinfo[wa->local_ri_count++] = obj_addr;
+                    }
+                }
+                g_in_safe_access = 0; continue;
+            }
+
+            // --- RoleInfoToWar (slot 1) ---
+            if (wa->target_klass[1] && val == wa->target_klass[1]
+                && wa->local_wi_count < MAX_CACHED_WARINFO && off + 0x80 <= size) {
+                int32_t hp    = *(volatile int32_t *)(obj_addr + 0x10);
+                int32_t maxHp = *(volatile int32_t *)(obj_addr + 0x14);
+                int32_t level = *(volatile int32_t *)(obj_addr + 0x20);
+                if (hp >= 0 && hp <= 999999 && maxHp >= 0 && maxHp <= 999999
+                    && level >= 0 && level <= 100) {
+                    wa->local_warinfo[wa->local_wi_count++] = obj_addr;
+                }
+                g_in_safe_access = 0; continue;
+            }
+
+            // --- 3 个 Config 类 (slots 2,3,4) ---
+            for (int c = 0; c < 3; c++) {
+                if (wa->target_klass[2+c] && val == wa->target_klass[2+c]) {
+                    uintptr_t dict_ptr = *(volatile uintptr_t *)(obj_addr + 0x10);
+                    if (dict_ptr >= 0x10000) {
+                        int32_t count = *(volatile int32_t *)(dict_ptr + 0x20);
+                        if (count > 0 && count < 100000 && count > wa->local_cfg_count[c]) {
+                            wa->local_cfg_count[c] = count;
+                            wa->local_cfg_addr[c] = obj_addr;
+                        }
+                    }
+                    break;
+                }
+            }
+            g_in_safe_access = 0;
+        }
+    }
+    g_in_safe_access = 0;
+    return NULL;
+}
+
 // ========== JNI: 预加载内存数据 ==========
 static char* do_prescan(void) {
     if (init_il2cpp_context() != 0) return strdup("\u274C il2cpp 初始化失败");
@@ -2679,82 +2771,70 @@ static char* do_prescan(void) {
     g_cached_count = 0;
     g_warinfo_count = 0;
     
-    // ====== 单次遍历所有内存区域, 同时匹配 5 个 klass ======
+    // ====== 多线程并行扫描所有内存区域 ======
     parse_maps();
     install_sigsegv_handler();
     
-    for (int r = 0; r < g_region_count; r++) {
-        MemRegion *region = &g_regions[r];
-        if (!region->readable || !region->writable) continue;
-        if (region->executable) continue;
-        size_t size = region->end - region->start;
-        if (size < 0x40 || size > MAX_SCAN_SIZE) continue;
-        if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue;
-        
-        uint8_t *base = (uint8_t *)region->start;
-        for (size_t off = 0; off <= size - 0x40; off += 8) {
-            g_in_safe_access = 1;
-            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; break; }
-            
-            uintptr_t val = *(volatile uintptr_t *)(base + off);
-            if (val == 0) { g_in_safe_access = 0; continue; }
-            
-            uintptr_t obj_addr = (uintptr_t)(base + off);
-            
-            // --- RoleInfo (slot 0) ---
-            if (val == target_klass[0] && g_cached_count < MAX_CACHED_ROLEINFO
-                && off + 0x100 <= size) {
-                int32_t roleId = *(volatile int32_t *)(obj_addr + 0x10);
-                int32_t maxHp  = *(volatile int32_t *)(obj_addr + 0x14);
-                int32_t curHp  = *(volatile int32_t *)(obj_addr + 0x18);
-                int32_t level  = *(volatile int32_t *)(obj_addr + 0x24);
-                if (roleId >= 0 && roleId <= 200 && maxHp >= 0 && maxHp <= 99999
-                    && curHp >= 0 && curHp <= 99999 && level >= 0 && level <= 100) {
-                    uintptr_t monitor = *(volatile uintptr_t *)(obj_addr + 8);
-                    if (monitor == 0 || monitor >= 0x10000) {
-                        LOGI("RoleInfo @ 0x%" PRIxPTR ": roleId=%d level=%d HP=%d/%d",
-                             obj_addr, roleId, level, curHp, maxHp);
-                        g_cached_roleinfo[g_cached_count++] = obj_addr;
-                    }
-                }
-                g_in_safe_access = 0; continue;
-            }
-            
-            // --- RoleInfoToWar (slot 1) ---
-            if (target_klass[1] && val == target_klass[1]
-                && g_warinfo_count < MAX_CACHED_WARINFO && off + 0x80 <= size) {
-                int32_t hp    = *(volatile int32_t *)(obj_addr + 0x10);
-                int32_t maxHp = *(volatile int32_t *)(obj_addr + 0x14);
-                int32_t level = *(volatile int32_t *)(obj_addr + 0x20);
-                if (hp >= 0 && hp <= 999999 && maxHp >= 0 && maxHp <= 999999
-                    && level >= 0 && level <= 100) {
-                    LOGI("RoleInfoToWar @ 0x%" PRIxPTR ": hp=%d/%d level=%d",
-                         obj_addr, hp, maxHp, level);
-                    g_cached_warinfo[g_warinfo_count++] = obj_addr;
-                }
-                g_in_safe_access = 0; continue;
-            }
-            
-            // --- 3 个 Config 类 (slots 2,3,4) ---
-            for (int c = 0; c < 3; c++) {
-                if (target_klass[2+c] && val == target_klass[2+c]) {
-                    uintptr_t dict_ptr = *(volatile uintptr_t *)(obj_addr + 0x10);
-                    if (dict_ptr >= 0x10000) {
-                        int32_t count = *(volatile int32_t *)(dict_ptr + 0x20);
-                        if (count > 0 && count < 100000 && count > cfg_best_count[c]) {
-                            cfg_best_count[c] = count;
-                            cfg_best_addr[c] = obj_addr;
-                        }
-                    }
-                    break;
-                }
-            }
-            g_in_safe_access = 0;
+    // 分配工作线程参数
+    int nthreads = NUM_SCAN_THREADS;
+    if (g_region_count < nthreads) nthreads = g_region_count;
+    if (nthreads < 1) nthreads = 1;
+    
+    PrescanWorkerArg workers[NUM_SCAN_THREADS];
+    pthread_t tids[NUM_SCAN_THREADS];
+    int regions_per_thread = g_region_count / nthreads;
+    int remainder = g_region_count % nthreads;
+    int offset = 0;
+    
+    for (int t = 0; t < nthreads; t++) {
+        workers[t].region_start = offset;
+        int chunk = regions_per_thread + (t < remainder ? 1 : 0);
+        workers[t].region_end = offset + chunk;
+        offset += chunk;
+        memcpy(workers[t].target_klass, target_klass, sizeof(target_klass));
+    }
+    
+    // 启动工作线程
+    LOGI("[prescan] launching %d scan threads for %d regions", nthreads, g_region_count);
+    for (int t = 0; t < nthreads; t++) {
+        if (pthread_create(&tids[t], NULL, prescan_worker, &workers[t]) != 0) {
+            LOGW("[prescan] pthread_create failed for thread %d, running inline", t);
+            prescan_worker(&workers[t]);
+            tids[t] = 0;
         }
     }
+    
+    // 等待所有线程完成
+    for (int t = 0; t < nthreads; t++) {
+        if (tids[t]) pthread_join(tids[t], NULL);
+    }
+    
     uninstall_sigsegv_handler();
     
-    LOGI("[prescan] single-pass done: RoleInfo=%d, WarInfo=%d", g_cached_count, g_warinfo_count);
+    // ====== 合并各线程结果 ======
+    for (int t = 0; t < nthreads; t++) {
+        PrescanWorkerArg *wa = &workers[t];
+        // 合并 RoleInfo
+        for (int i = 0; i < wa->local_ri_count && g_cached_count < MAX_CACHED_ROLEINFO; i++) {
+            LOGI("RoleInfo @ 0x%" PRIxPTR " (thread %d)", wa->local_roleinfo[i], t);
+            g_cached_roleinfo[g_cached_count++] = wa->local_roleinfo[i];
+        }
+        // 合并 RoleInfoToWar
+        for (int i = 0; i < wa->local_wi_count && g_warinfo_count < MAX_CACHED_WARINFO; i++) {
+            LOGI("RoleInfoToWar @ 0x%" PRIxPTR " (thread %d)", wa->local_warinfo[i], t);
+            g_cached_warinfo[g_warinfo_count++] = wa->local_warinfo[i];
+        }
+        // 合并 Config 最佳候选
+        for (int c = 0; c < 3; c++) {
+            if (wa->local_cfg_count[c] > cfg_best_count[c]) {
+                cfg_best_count[c] = wa->local_cfg_count[c];
+                cfg_best_addr[c] = wa->local_cfg_addr[c];
+            }
+        }
+    }
+    
+    LOGI("[prescan] multi-thread done (%d threads): RoleInfo=%d, WarInfo=%d",
+         nthreads, g_cached_count, g_warinfo_count);
     
     // ====== 保存配置类缓存 ======
     int cached = 0;

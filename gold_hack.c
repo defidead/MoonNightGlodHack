@@ -782,6 +782,7 @@ done:
 static Il2CppDomain  g_domain       = NULL;
 static Il2CppImage   g_csharp_image = NULL;
 static Il2CppClass   g_roleinfo_cls = NULL;
+static Il2CppClass   g_warinfo_cls  = NULL;  // RoleInfoToWar
 
 // 初始化 il2cpp 上下文（domain / image / class），只需调用一次
 static int init_il2cpp_context(void) {
@@ -815,6 +816,13 @@ static int init_il2cpp_context(void) {
     g_roleinfo_cls = fn_class_from_name(g_csharp_image, "", "RoleInfo");
     if (!g_roleinfo_cls) { LOGE("RoleInfo class not found"); return -1; }
     LOGI("RoleInfo klass: %p", g_roleinfo_cls);
+
+    g_warinfo_cls = fn_class_from_name(g_csharp_image, "", "RoleInfoToWar");
+    if (g_warinfo_cls) {
+        LOGI("RoleInfoToWar klass: %p", g_warinfo_cls);
+    } else {
+        LOGW("RoleInfoToWar class not found (non-fatal)");
+    }
     return 0;
 }
 
@@ -822,6 +830,11 @@ static int init_il2cpp_context(void) {
 #define MAX_CACHED_ROLEINFO 8
 static uintptr_t g_cached_roleinfo[MAX_CACHED_ROLEINFO];
 static int        g_cached_count = 0;
+
+// ========== RoleInfoToWar 实例缓存 ==========
+#define MAX_CACHED_WARINFO 8
+static uintptr_t g_cached_warinfo[MAX_CACHED_WARINFO];
+static int        g_warinfo_count = 0;
 
 // 验证缓存的 RoleInfo 地址是否仍然有效
 static int validate_cached_roleinfo(void) {
@@ -909,6 +922,96 @@ static int ensure_roleinfo_cached(void) {
     }
     LOGI("Cache miss, doing full scan...");
     return scan_and_cache_roleinfo();
+}
+
+// ========== RoleInfoToWar 实例扫描与缓存 ==========
+// RoleInfoToWar 字段布局:
+//   [0x10] Int32 hp       [0x14] Int32 maxHp
+//   [0x18] Int32 mp       [0x1c] Int32 action
+//   [0x20] Int32 level    [0x24] Int32 maxHandCard
+//   [0x50] List<Int32> cards
+//   [0x58] List<Int32> initCards
+//   [0x60] List<Int32> equipts  <-- 战斗装备列表
+//   [0x68] List<CardInfo> enemySkills
+//   [0x70] List<UserSkillState> heroSkills
+//   [0x78] List<EventBuffStr> buffs
+
+static int scan_and_cache_warinfo(void) {
+    g_warinfo_count = 0;
+    if (!g_warinfo_cls) return 0;
+    parse_maps();
+    uintptr_t klass_val = (uintptr_t)g_warinfo_cls;
+    install_sigsegv_handler();
+    
+    for (int r = 0; r < g_region_count && g_warinfo_count < MAX_CACHED_WARINFO; r++) {
+        MemRegion *region = &g_regions[r];
+        if (!region->readable || !region->writable) continue;
+        size_t size = region->end - region->start;
+        if (size < 0x80 || size > MAX_SCAN_SIZE) continue;
+        if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue;
+        
+        uint8_t *base = (uint8_t *)region->start;
+        for (size_t off = 0; off <= size - 0x80 && g_warinfo_count < MAX_CACHED_WARINFO; off += 8) {
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; break; }
+            
+            uintptr_t *p = (uintptr_t *)(base + off);
+            if (*p != klass_val) { g_in_safe_access = 0; continue; }
+            
+            uintptr_t obj_addr = (uintptr_t)(base + off);
+            // 验证: hp, maxHp, mp, action, level 应合理
+            int32_t hp = *(volatile int32_t *)(obj_addr + 0x10);
+            int32_t maxHp = *(volatile int32_t *)(obj_addr + 0x14);
+            int32_t level = *(volatile int32_t *)(obj_addr + 0x20);
+            if (hp < 0 || hp > 999999) { g_in_safe_access = 0; continue; }
+            if (maxHp < 0 || maxHp > 999999) { g_in_safe_access = 0; continue; }
+            if (level < 0 || level > 100) { g_in_safe_access = 0; continue; }
+            g_in_safe_access = 0;
+            
+            LOGI("RoleInfoToWar @ 0x%" PRIxPTR ": hp=%d/%d level=%d",
+                 obj_addr, hp, maxHp, level);
+            g_cached_warinfo[g_warinfo_count++] = obj_addr;
+        }
+    }
+    
+    uninstall_sigsegv_handler();
+    LOGI("scan_and_cache_warinfo: found %d RoleInfoToWar instance(s)", g_warinfo_count);
+    return g_warinfo_count;
+}
+
+static int validate_cached_warinfo(void) {
+    if (g_warinfo_count == 0) return 0;
+    if (!g_warinfo_cls) return 0;
+    
+    uintptr_t klass_val = (uintptr_t)g_warinfo_cls;
+    int valid = 0;
+    
+    install_sigsegv_handler();
+    for (int i = 0; i < g_warinfo_count; i++) {
+        uintptr_t obj = g_cached_warinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        uintptr_t klass = *(volatile uintptr_t *)obj;
+        if (klass != klass_val) { g_in_safe_access = 0; continue; }
+        int32_t hp = *(volatile int32_t *)(obj + 0x10);
+        if (hp < 0 || hp > 999999) { g_in_safe_access = 0; continue; }
+        g_in_safe_access = 0;
+        g_cached_warinfo[valid++] = obj;
+    }
+    uninstall_sigsegv_handler();
+    
+    g_warinfo_count = valid;
+    return valid;
+}
+
+static int ensure_warinfo_cached(void) {
+    int valid = validate_cached_warinfo();
+    if (valid > 0) {
+        LOGI("WarInfo cache hit: %d valid instance(s)", valid);
+        return valid;
+    }
+    LOGI("WarInfo cache miss, scanning...");
+    return scan_and_cache_warinfo();
 }
 
 // ========== 修改金币（返回修改的实例数）==========
@@ -1235,6 +1338,7 @@ static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
 
 // ========== 添加装备到装备栏 ==========
 // 优先找空槽(value=0)填入, 无空槽则追加新槽
+// 双写: RoleInfo.equipmentSlot(0x98) + RoleInfoToWar.equipts(0x60)
 static int do_add_equipment(int equip_id) {
     if (init_il2cpp_context() != 0) return -1;
     int n = ensure_roleinfo_cached();
@@ -1292,7 +1396,37 @@ static int do_add_equipment(int equip_id) {
         if (found) count++;
     }
     uninstall_sigsegv_handler();
-    LOGI("do_add_equipment: added equip %d to %d instance(s)", equip_id, count);
+    LOGI("do_add_equipment: added equip %d to %d RoleInfo instance(s)", equip_id, count);
+    
+    // ====== 同步写入 RoleInfoToWar.equipts(0x60) ======
+    int war_count = ensure_warinfo_cached();
+    if (war_count > 0) {
+        int wc = 0;
+        install_sigsegv_handler();
+        for (int i = 0; i < g_warinfo_count; i++) {
+            uintptr_t wobj = g_cached_warinfo[i];
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+            
+            uintptr_t war_equip_list = *(volatile uintptr_t *)(wobj + 0x60);
+            g_in_safe_access = 0;
+            
+            if (war_equip_list > 0x10000) {
+                int ret = add_item_to_int_list(war_equip_list, equip_id);
+                if (ret >= 0) {
+                    wc++;
+                    LOGI("  Also added equip %d to RoleInfoToWar.equipts @ %p", equip_id, (void*)wobj);
+                }
+            } else {
+                LOGW("  RoleInfoToWar @ %p: equipts list is NULL/invalid (%p)", (void*)wobj, (void*)war_equip_list);
+            }
+        }
+        uninstall_sigsegv_handler();
+        LOGI("do_add_equipment: synced equip %d to %d RoleInfoToWar instance(s)", equip_id, wc);
+    } else {
+        LOGI("do_add_equipment: no RoleInfoToWar instances found (not in battle?)");
+    }
+    
     return count;
 }
 
@@ -2293,8 +2427,35 @@ static char* do_prescan(void) {
         uninstall_sigsegv_handler();
     }
     
+    // 强制全量扫描 RoleInfoToWar (战斗数据)
+    int wi_count = scan_and_cache_warinfo();
+    if (wi_count > 0) {
+        install_sigsegv_handler();
+        for (int i = 0; i < g_warinfo_count; i++) {
+            uintptr_t wobj = g_cached_warinfo[i];
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+            int32_t hp = *(volatile int32_t *)(wobj + 0x10);
+            int32_t maxHp = *(volatile int32_t *)(wobj + 0x14);
+            int32_t level = *(volatile int32_t *)(wobj + 0x20);
+            uintptr_t war_equipts = *(volatile uintptr_t *)(wobj + 0x60);
+            uintptr_t war_cards = *(volatile uintptr_t *)(wobj + 0x50);
+            g_in_safe_access = 0;
+            LOGI("[prescan] RoleInfoToWar[%d] @ %p: hp=%d/%d level=%d", i, (void*)wobj, hp, maxHp, level);
+            LOGI("[prescan]   equipts=%p cards=%p", (void*)war_equipts, (void*)war_cards);
+            if (war_equipts > 0x10000) {
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+                int32_t s = *(volatile int32_t *)(war_equipts + 0x18);
+                g_in_safe_access = 0;
+                LOGI("[prescan]   war equipts size=%d", s);
+            }
+        }
+        uninstall_sigsegv_handler();
+    }
+    
     char *buf = (char *)malloc(256);
-    snprintf(buf, 256, "\u2705 预加载完成: %d个角色, %d/3个配置", ri_count, cached);
+    snprintf(buf, 256, "\u2705 预加载完成: %d个角色, %d个战斗角色, %d/3个配置", ri_count, wi_count, cached);
     return buf;
 }
 

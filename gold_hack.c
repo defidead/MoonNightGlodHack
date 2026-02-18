@@ -35,6 +35,33 @@
 #ifndef WAIT_SECONDS
 #define WAIT_SECONDS    5          // 等待游戏加载的秒数，编译时可用 -DWAIT_SECONDS=20 覆盖
 #endif
+
+// ========== RoleInfo 字段偏移定义 ==========
+// 从 dump.txt 中 RoleInfo 类提取 (Assembly-CSharp.dll)
+#define OFF_ROLEID      0x10
+#define OFF_MODEID      0x14
+#define OFF_MAXHP       0x18
+#define OFF_CURHP       0x1c
+#define OFF_CURMP       0x20
+#define OFF_CUREXP      0x24
+#define OFF_CURVESSEL   0x28
+#define OFF_CURGOLD     0x2c
+#define OFF_HANDCARDS   0x30
+#define OFF_LEVEL       0x34
+#define OFF_CURACTION   0x38
+#define OFF_AREA        0x3c
+#define OFF_REPUTATION  0x40
+#define OFF_COURAGE     0x48
+#define OFF_DUNGEONSKILL 0x80
+#define OFF_SKILLS      0x88
+#define OFF_CARDSLIBRARY 0x90
+#define OFF_EQUIPSLOT   0x98
+#define OFF_TALENTBUFF  0xa0
+#define OFF_EVENTBUFF   0xb0
+#define OFF_LOSTTHING   0xb8
+#define OFF_APPEARLT    0xc0
+#define OFF_CURSELIST   0xd0
+#define OFF_POCKETS     0xe0
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
@@ -971,6 +998,503 @@ static int do_reset_skill_cd(void) {
     return count;
 }
 
+// ========== 修改血量上限和当前血量 ==========
+static int do_modify_hp(int max_hp) {
+    if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        int32_t old_maxhp = *(int32_t *)(obj_addr + OFF_MAXHP);
+        int32_t old_curhp = *(int32_t *)(obj_addr + OFF_CURHP);
+        *(int32_t *)(obj_addr + OFF_MAXHP) = max_hp;
+        *(int32_t *)(obj_addr + OFF_CURHP) = max_hp; // 回满血
+        g_in_safe_access = 0;
+        count++;
+        LOGI("  => HP: %d/%d -> %d/%d @ 0x%" PRIxPTR, old_curhp, old_maxhp, max_hp, max_hp, obj_addr);
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_modify_hp: modified %d instance(s)", count);
+    return count;
+}
+
+// ========== 修改法力值 ==========
+static int do_modify_mp(int mp) {
+    if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        int32_t old_mp = *(int32_t *)(obj_addr + OFF_CURMP);
+        *(int32_t *)(obj_addr + OFF_CURMP) = mp;
+        g_in_safe_access = 0;
+        count++;
+        LOGI("  => MP: %d -> %d @ 0x%" PRIxPTR, old_mp, mp, obj_addr);
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_modify_mp: modified %d instance(s)", count);
+    return count;
+}
+
+// ========== 修改行动值 ==========
+static int do_modify_action(int action) {
+    if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        int32_t old_action = *(int32_t *)(obj_addr + OFF_CURACTION);
+        *(int32_t *)(obj_addr + OFF_CURACTION) = action;
+        g_in_safe_access = 0;
+        count++;
+        LOGI("  => Action: %d -> %d @ 0x%" PRIxPTR, old_action, action, obj_addr);
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_modify_action: modified %d instance(s)", count);
+    return count;
+}
+
+// ========== 修改手牌上限 ==========
+static int do_modify_handcards(int handcards) {
+    if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        int32_t old_handcards = *(int32_t *)(obj_addr + OFF_HANDCARDS);
+        *(int32_t *)(obj_addr + OFF_HANDCARDS) = handcards;
+        g_in_safe_access = 0;
+        count++;
+        LOGI("  => Handcards: %d -> %d @ 0x%" PRIxPTR, old_handcards, handcards, obj_addr);
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_modify_handcards: modified %d instance(s)", count);
+    return count;
+}
+
+// ========== 向 List<Int32> 添加物品 ID ==========
+// il2cpp List<int> 内存布局:
+//   +0x00 klass ptr
+//   +0x08 monitor
+//   +0x10 _items (System.Int32[] 数组指针)
+//   +0x18 _size (int32)
+// System.Int32[] 数组布局:
+//   +0x00 klass ptr
+//   +0x08 monitor
+//   +0x10 max_length (uint64 / nint)
+//   +0x18 elements[] (int32)
+static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
+    if (list_ptr < 0x10000) return -1;
+    
+    uintptr_t items = *(volatile uintptr_t *)(list_ptr + 0x10);
+    int32_t size = *(volatile int32_t *)(list_ptr + 0x18);
+    
+    if (items < 0x10000 || size < 0 || size > 1000) return -1;
+    
+    // 读取数组容量
+    uintptr_t max_length = *(volatile uintptr_t *)(items + 0x10);
+    if ((int64_t)max_length < size || max_length > 10000) return -1;
+    
+    // 检查是否已存在
+    int32_t *elem_base = (int32_t *)(items + 0x18);
+    for (int i = 0; i < size; i++) {
+        if (elem_base[i] == item_id) {
+            LOGI("  Item %d already in list", item_id);
+            return 0;
+        }
+    }
+    
+    // 检查容量是否足够（无法扩容，只在有空间时添加）
+    if ((uintptr_t)size >= max_length) {
+        LOGW("  List full (size=%d, cap=%d), cannot add item %d", size, (int)max_length, item_id);
+        return -1;
+    }
+    
+    // 添加到末尾
+    elem_base[size] = item_id;
+    *(int32_t *)(list_ptr + 0x18) = size + 1;
+    LOGI("  Added item %d to list (size: %d -> %d)", item_id, size, size + 1);
+    return 1;
+}
+
+// ========== 添加装备到装备栏 ==========
+static int do_add_equipment(int equip_id) {
+    if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        uintptr_t equip_list = *(volatile uintptr_t *)(obj_addr + OFF_EQUIPSLOT);
+        int ret = add_item_to_int_list(equip_list, equip_id);
+        g_in_safe_access = 0;
+        if (ret >= 0) count++;
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_add_equipment: added equip %d to %d instance(s)", equip_id, count);
+    return count;
+}
+
+// ========== 添加遗物/祝福 ==========
+static int do_add_lostthing(int lostthing_id) {
+    if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        uintptr_t lt_list = *(volatile uintptr_t *)(obj_addr + OFF_LOSTTHING);
+        int ret = add_item_to_int_list(lt_list, lostthing_id);
+        g_in_safe_access = 0;
+        if (ret >= 0) count++;
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_add_lostthing: added lostthing %d to %d instance(s)", lostthing_id, count);
+    return count;
+}
+
+// ========== 添加卡牌到卡组 ==========
+// cardsLibraryAll 是 List<CardInfoInDeck>，每个元素有 id(+0x10) 和 idx(+0x14)
+static int do_add_card(int card_id) {
+    if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        
+        // 向 cardsBattle (List<Int32>) 添加卡牌（战斗用卡组）
+        uintptr_t battle_cards = *(volatile uintptr_t *)(obj_addr + 0x100); // cardsBattle
+        if (battle_cards > 0x10000) {
+            add_item_to_int_list(battle_cards, card_id);
+        }
+        
+        g_in_safe_access = 0;
+        count++;
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_add_card: added card %d to %d instance(s)", card_id, count);
+    return count;
+}
+
+// ========== IL2CPP 字符串读取 (UTF-16LE → UTF-8) ==========
+// Il2CppString: klass(8) + monitor(8) + length(4) + chars[](UTF-16LE)
+static int utf16_to_utf8(const uint16_t *src, int src_len, char *dst, int dst_max) {
+    int j = 0;
+    for (int i = 0; i < src_len && j < dst_max - 4; i++) {
+        uint16_t c = src[i];
+        if (c < 0x80) {
+            dst[j++] = (char)c;
+        } else if (c < 0x800) {
+            dst[j++] = (char)(0xC0 | (c >> 6));
+            dst[j++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            if (c >= 0xD800 && c <= 0xDBFF && i + 1 < src_len) {
+                uint16_t c2 = src[i + 1];
+                if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
+                    uint32_t cp = 0x10000 + ((uint32_t)(c - 0xD800) << 10) + (c2 - 0xDC00);
+                    dst[j++] = (char)(0xF0 | (cp >> 18));
+                    dst[j++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                    dst[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                    dst[j++] = (char)(0x80 | (cp & 0x3F));
+                    i++;
+                    continue;
+                }
+            }
+            dst[j++] = (char)(0xE0 | (c >> 12));
+            dst[j++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            dst[j++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    dst[j] = '\0';
+    return j;
+}
+
+// 安全读取 il2cpp String 到 UTF-8 (带 SIGSEGV 保护)
+static int safe_read_il2cpp_string(uintptr_t str_ptr, char *buf, int buf_size) {
+    if (str_ptr < 0x10000 || buf_size < 4) { buf[0] = '\0'; return 0; }
+    g_in_safe_access = 1;
+    if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; buf[0] = '\0'; return 0; }
+    int32_t len = *(volatile int32_t *)(str_ptr + 0x10);
+    if (len <= 0 || len > 200) { g_in_safe_access = 0; buf[0] = '\0'; return 0; }
+    uint16_t *chars = (uint16_t *)(str_ptr + 0x14);
+    int result = utf16_to_utf8(chars, len, buf, buf_size);
+    g_in_safe_access = 0;
+    return result;
+}
+
+// ========== 扫描堆查找某个类的单一实例 ==========
+// 用于找到 CardsConfig / LostThingConfig 等单例配置类
+static uintptr_t find_single_class_instance(uintptr_t klass_val) {
+    if (klass_val == 0) return 0;
+    parse_maps();
+    install_sigsegv_handler();
+    uintptr_t result = 0;
+
+    for (int r = 0; r < g_region_count && result == 0; r++) {
+        MemRegion *region = &g_regions[r];
+        if (!region->readable || !region->writable) continue;
+        if (region->executable) continue;
+        size_t size = region->end - region->start;
+        if (size < 0x100 || size > MAX_SCAN_SIZE) continue;
+        if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue;
+
+        uint8_t *base = (uint8_t *)region->start;
+        for (size_t off = 0; off <= size - 0x40 && result == 0; off += 8) {
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; break; }
+            uintptr_t val = *(volatile uintptr_t *)(base + off);
+            if (val != klass_val) { g_in_safe_access = 0; continue; }
+            // 验证: +0x10 (configs dict) 应该是有效指针
+            uintptr_t dict_ptr = *(volatile uintptr_t *)(base + off + 0x10);
+            if (dict_ptr < 0x10000) { g_in_safe_access = 0; continue; }
+            // 进一步验证: dict 的 count 字段应合理
+            int32_t count = *(volatile int32_t *)(dict_ptr + 0x20);
+            if (count > 0 && count < 100000) {
+                result = (uintptr_t)(base + off);
+            }
+            g_in_safe_access = 0;
+        }
+    }
+    uninstall_sigsegv_handler();
+    return result;
+}
+
+// JSON 转义辅助
+static void json_escape_append(char **dst, int *remaining, const char *src) {
+    char *p = *dst;
+    int rem = *remaining;
+    while (*src && rem > 6) {
+        char c = *src++;
+        if (c == '"' || c == '\\') { *p++ = '\\'; *p++ = c; rem -= 2; }
+        else if ((unsigned char)c >= 0x20) { *p++ = c; rem--; }
+    }
+    *dst = p;
+    *remaining = rem;
+}
+
+// ========== 枚举配置项 (运行时从内存读取) ==========
+// item_type: 1=卡牌(CardsConfig), 2=祝福/遗物(LostThingConfig)
+// 返回 JSON 数组: [{"id":1001,"n":"金剑"},...]
+// 调用者负责 free 返回的字符串
+//
+// Dictionary<Int32, T> 内存布局 (ARM64):
+//   +0x10 int[]   _buckets
+//   +0x18 Entry[] _entries
+//   +0x20 int     _count
+//   +0x24 int     _version
+// Entry<Int32, T> 布局 (24 bytes):
+//   +0  int hashCode (-1 = empty)
+//   +4  int next
+//   +8  int key (= item id)
+//   +12 padding (4)
+//   +16 T value (pointer, 8)
+//
+// CardInfo fields: [0x10] id, [0x28] String name
+// LostThing: 自动检测 name 字段偏移
+static char* do_enum_items(int item_type) {
+    if (init_il2cpp_context() != 0) return NULL;
+
+    const char *class_name;
+    int known_name_off;
+    switch (item_type) {
+        case 1: class_name = "CardsConfig"; known_name_off = 0x28; break;
+        case 2: class_name = "LostThingConfig"; known_name_off = -1; break;
+        default: return NULL;
+    }
+
+    LOGI("[enum] Looking for %s...", class_name);
+    Il2CppClass klass = fn_class_from_name(g_csharp_image, "", class_name);
+    if (!klass) { LOGE("[enum] Class %s not found", class_name); return NULL; }
+
+    LOGI("[enum] %s klass=%p, scanning heap...", class_name, klass);
+    uintptr_t instance = find_single_class_instance((uintptr_t)klass);
+    if (!instance) { LOGE("[enum] No %s instance in heap", class_name); return NULL; }
+    LOGI("[enum] Instance @ 0x%" PRIxPTR, instance);
+
+    // 读取 configs Dictionary<Int32, T>
+    install_sigsegv_handler();
+    g_in_safe_access = 1;
+    if (sigsetjmp(g_jmpbuf, 1) != 0) {
+        g_in_safe_access = 0; uninstall_sigsegv_handler();
+        LOGE("[enum] SIGSEGV reading dict header"); return NULL;
+    }
+    uintptr_t dict = *(volatile uintptr_t *)(instance + 0x10);
+    if (dict < 0x10000) { g_in_safe_access = 0; uninstall_sigsegv_handler(); return NULL; }
+    uintptr_t entries_arr = *(volatile uintptr_t *)(dict + 0x18);
+    int32_t dict_count = *(volatile int32_t *)(dict + 0x20);
+    g_in_safe_access = 0;
+    LOGI("[enum] Dict count=%d entries_arr=0x%" PRIxPTR, dict_count, entries_arr);
+
+    if (entries_arr < 0x10000 || dict_count <= 0 || dict_count > 100000) {
+        uninstall_sigsegv_handler(); return NULL;
+    }
+
+    // 读取 entries 数组容量
+    g_in_safe_access = 1;
+    if (sigsetjmp(g_jmpbuf, 1) != 0) {
+        g_in_safe_access = 0; uninstall_sigsegv_handler(); return NULL;
+    }
+    int64_t arr_max = *(volatile int64_t *)(entries_arr + 0x10);
+    g_in_safe_access = 0;
+    if (arr_max <= 0 || arr_max > 100000) { uninstall_sigsegv_handler(); return NULL; }
+
+    uintptr_t elem_base = entries_arr + 0x18;
+
+    // 自动检测 name 字段偏移 (如果未知)
+    int name_off = known_name_off;
+    if (name_off < 0) {
+        int candidates[] = {0x18, 0x28, 0x20, 0x30, -1};
+        for (int i = 0; i < (int)arr_max && name_off < 0; i++) {
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+            uintptr_t entry = elem_base + (uintptr_t)i * 24;
+            int32_t hc = *(volatile int32_t *)(entry);
+            if (hc < 0) { g_in_safe_access = 0; continue; }
+            uintptr_t val = *(volatile uintptr_t *)(entry + 16);
+            g_in_safe_access = 0;
+            if (val < 0x10000) continue;
+            for (int k = 0; candidates[k] >= 0; k++) {
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+                uintptr_t sp = *(volatile uintptr_t *)(val + candidates[k]);
+                g_in_safe_access = 0;
+                char tb[64];
+                if (safe_read_il2cpp_string(sp, tb, sizeof(tb)) > 0) {
+                    name_off = candidates[k];
+                    LOGI("[enum] Auto-detected name offset=0x%x: \"%s\"", name_off, tb);
+                    break;
+                }
+            }
+        }
+        if (name_off < 0) { name_off = 0x18; LOGW("[enum] Fallback name offset=0x18"); }
+    }
+
+    // 构建 JSON
+    int json_cap = dict_count * 100 + 32;
+    char *json = (char *)malloc(json_cap);
+    if (!json) { uninstall_sigsegv_handler(); return NULL; }
+
+    char *p = json;
+    int remaining = json_cap - 2;
+    *p++ = '['; remaining--;
+    int first = 1, added = 0;
+
+    for (int i = 0; i < (int)arr_max && remaining > 120; i++) {
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        uintptr_t entry = elem_base + (uintptr_t)i * 24;
+        int32_t hc = *(volatile int32_t *)(entry);
+        if (hc < 0) { g_in_safe_access = 0; continue; }
+        int32_t key = *(volatile int32_t *)(entry + 8);
+        uintptr_t value = *(volatile uintptr_t *)(entry + 16);
+        g_in_safe_access = 0;
+        if (value < 0x10000) continue;
+
+        // 读取 name String
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        uintptr_t name_str = *(volatile uintptr_t *)(value + name_off);
+        g_in_safe_access = 0;
+
+        char name_buf[256] = {0};
+        safe_read_il2cpp_string(name_str, name_buf, sizeof(name_buf));
+
+        if (!first) { *p++ = ','; remaining--; }
+        first = 0;
+        int n = snprintf(p, remaining, "{\"id\":%d,\"n\":\"", key);
+        p += n; remaining -= n;
+        json_escape_append(&p, &remaining, name_buf[0] ? name_buf : "???");
+        n = snprintf(p, remaining, "\"}");
+        p += n; remaining -= n;
+        added++;
+    }
+    *p++ = ']'; *p = '\0';
+
+    uninstall_sigsegv_handler();
+    LOGI("[enum] Enumerated %d items for type %d (json len=%d)", added, item_type, (int)(p - json));
+    return json;
+}
+
+// ========== 一键修改所有属性 ==========
+static int do_modify_all_stats(int gold, int max_hp, int mp, int action, int handcards) {
+    if (init_il2cpp_context() != 0) return -1;
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+    
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        
+        if (gold > 0) {
+            int32_t old = *(int32_t *)(obj_addr + OFF_CURGOLD);
+            *(int32_t *)(obj_addr + OFF_CURGOLD) = gold;
+            LOGI("  => Gold: %d -> %d", old, gold);
+        }
+        if (max_hp > 0) {
+            int32_t old_max = *(int32_t *)(obj_addr + OFF_MAXHP);
+            *(int32_t *)(obj_addr + OFF_MAXHP) = max_hp;
+            *(int32_t *)(obj_addr + OFF_CURHP) = max_hp;
+            LOGI("  => HP: %d -> %d/%d", old_max, max_hp, max_hp);
+        }
+        if (mp >= 0) {
+            int32_t old = *(int32_t *)(obj_addr + OFF_CURMP);
+            *(int32_t *)(obj_addr + OFF_CURMP) = mp;
+            LOGI("  => MP: %d -> %d", old, mp);
+        }
+        if (action > 0) {
+            int32_t old = *(int32_t *)(obj_addr + OFF_CURACTION);
+            *(int32_t *)(obj_addr + OFF_CURACTION) = action;
+            LOGI("  => Action: %d -> %d", old, action);
+        }
+        if (handcards > 0) {
+            int32_t old = *(int32_t *)(obj_addr + OFF_HANDCARDS);
+            *(int32_t *)(obj_addr + OFF_HANDCARDS) = handcards;
+            LOGI("  => Handcards: %d -> %d", old, handcards);
+        }
+        g_in_safe_access = 0;
+        count++;
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_modify_all_stats: modified %d instance(s)", count);
+    return count;
+}
+
 // ========== 同时修改金币和技能（兼容旧的一次性模式）==========
 static int modify_gold(int target_gold) {
     if (init_il2cpp_context() != 0) return -1;
@@ -1020,9 +1544,169 @@ static jstring JNICALL jni_reset_skill_cd(JNIEnv *env, jclass clazz) {
     return (*env)->NewStringUTF(env, buf);
 }
 
+// ========== JNI: 修改血量 ==========
+static jstring JNICALL jni_modify_hp(JNIEnv *env, jclass clazz, jint max_hp) {
+    LOGI("[JNI] nativeModifyHp(%d)", (int)max_hp);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    int count = do_modify_hp((int)max_hp);
+    pthread_mutex_unlock(&g_hack_mutex);
+    char buf[128];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 血量: %d/%d (%d个实例)", (int)max_hp, (int)max_hp, count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到实例");
+    else
+        snprintf(buf, sizeof(buf), "\u274C API 初始化失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
+// ========== JNI: 修改法力值 ==========
+static jstring JNICALL jni_modify_mp(JNIEnv *env, jclass clazz, jint mp) {
+    LOGI("[JNI] nativeModifyMp(%d)", (int)mp);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    int count = do_modify_mp((int)mp);
+    pthread_mutex_unlock(&g_hack_mutex);
+    char buf[128];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 法力: %d (%d个实例)", (int)mp, count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到实例");
+    else
+        snprintf(buf, sizeof(buf), "\u274C API 初始化失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
+// ========== JNI: 修改行动值 ==========
+static jstring JNICALL jni_modify_action(JNIEnv *env, jclass clazz, jint action) {
+    LOGI("[JNI] nativeModifyAction(%d)", (int)action);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    int count = do_modify_action((int)action);
+    pthread_mutex_unlock(&g_hack_mutex);
+    char buf[128];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 行动值: %d (%d个实例)", (int)action, count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到实例");
+    else
+        snprintf(buf, sizeof(buf), "\u274C API 初始化失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
+// ========== JNI: 修改手牌上限 ==========
+static jstring JNICALL jni_modify_handcards(JNIEnv *env, jclass clazz, jint handcards) {
+    LOGI("[JNI] nativeModifyHandcards(%d)", (int)handcards);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    int count = do_modify_handcards((int)handcards);
+    pthread_mutex_unlock(&g_hack_mutex);
+    char buf[128];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 手牌上限: %d (%d个实例)", (int)handcards, count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到实例");
+    else
+        snprintf(buf, sizeof(buf), "\u274C API 初始化失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
+// ========== JNI: 添加装备 ==========
+static jstring JNICALL jni_add_equipment(JNIEnv *env, jclass clazz, jint equip_id) {
+    LOGI("[JNI] nativeAddEquipment(%d)", (int)equip_id);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    int count = do_add_equipment((int)equip_id);
+    pthread_mutex_unlock(&g_hack_mutex);
+    char buf[128];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 装备 %d 已添加 (%d个实例)", (int)equip_id, count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到实例");
+    else
+        snprintf(buf, sizeof(buf), "\u274C 添加失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
+// ========== JNI: 添加祝福/遗物 ==========
+static jstring JNICALL jni_add_lostthing(JNIEnv *env, jclass clazz, jint lt_id) {
+    LOGI("[JNI] nativeAddLostThing(%d)", (int)lt_id);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    int count = do_add_lostthing((int)lt_id);
+    pthread_mutex_unlock(&g_hack_mutex);
+    char buf[128];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 祝福 %d 已添加 (%d个实例)", (int)lt_id, count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到实例");
+    else
+        snprintf(buf, sizeof(buf), "\u274C 添加失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
+// ========== JNI: 添加卡牌 ==========
+static jstring JNICALL jni_add_card(JNIEnv *env, jclass clazz, jint card_id) {
+    LOGI("[JNI] nativeAddCard(%d)", (int)card_id);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    int count = do_add_card((int)card_id);
+    pthread_mutex_unlock(&g_hack_mutex);
+    char buf[128];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 卡牌 %d 已添加 (%d个实例)", (int)card_id, count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到实例");
+    else
+        snprintf(buf, sizeof(buf), "\u274C 添加失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
+// ========== JNI: 一键修改所有属性 ==========
+static jstring JNICALL jni_modify_all(JNIEnv *env, jclass clazz, jint gold, jint max_hp, jint mp, jint action, jint handcards) {
+    LOGI("[JNI] nativeModifyAll(gold=%d, hp=%d, mp=%d, action=%d, hand=%d)",
+         (int)gold, (int)max_hp, (int)mp, (int)action, (int)handcards);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    int count = do_modify_all_stats((int)gold, (int)max_hp, (int)mp, (int)action, (int)handcards);
+    do_reset_skill_cd();
+    pthread_mutex_unlock(&g_hack_mutex);
+    char buf[256];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 全部修改完成 (%d个实例)", count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到实例");
+    else
+        snprintf(buf, sizeof(buf), "\u274C API 初始化失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
+// ========== JNI: 枚举配置项 (返回 JSON) ==========
+static jstring JNICALL jni_enum_items(JNIEnv *env, jclass clazz, jint type) {
+    LOGI("[JNI] nativeEnumItems(%d)", (int)type);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "[]");
+    char *json = do_enum_items((int)type);
+    pthread_mutex_unlock(&g_hack_mutex);
+    if (!json) return (*env)->NewStringUTF(env, "[]");
+    jstring result = (*env)->NewStringUTF(env, json);
+    free(json);
+    return result;
+}
+
 static JNINativeMethod g_jni_methods[] = {
-    { "nativeModifyGold",  "(I)Ljava/lang/String;", (void *)jni_modify_gold },
-    { "nativeResetSkillCD", "()Ljava/lang/String;",  (void *)jni_reset_skill_cd },
+    { "nativeModifyGold",      "(I)Ljava/lang/String;",     (void *)jni_modify_gold },
+    { "nativeResetSkillCD",    "()Ljava/lang/String;",      (void *)jni_reset_skill_cd },
+    { "nativeModifyHp",        "(I)Ljava/lang/String;",     (void *)jni_modify_hp },
+    { "nativeModifyMp",        "(I)Ljava/lang/String;",     (void *)jni_modify_mp },
+    { "nativeModifyAction",    "(I)Ljava/lang/String;",     (void *)jni_modify_action },
+    { "nativeModifyHandcards", "(I)Ljava/lang/String;",     (void *)jni_modify_handcards },
+    { "nativeAddEquipment",    "(I)Ljava/lang/String;",     (void *)jni_add_equipment },
+    { "nativeAddLostThing",    "(I)Ljava/lang/String;",     (void *)jni_add_lostthing },
+    { "nativeAddCard",         "(I)Ljava/lang/String;",     (void *)jni_add_card },
+    { "nativeModifyAll",       "(IIIII)Ljava/lang/String;", (void *)jni_modify_all },
+    { "nativeEnumItems",      "(I)Ljava/lang/String;",     (void *)jni_enum_items },
 };
 
 // ========== 通过 JNI 加载嵌入的 DEX 并创建悬浮菜单 ==========
@@ -1132,7 +1816,7 @@ static void create_overlay_menu(void) {
     LOGI("[overlay] OverlayMenu class loaded");
 
     // 5. 注册 native 方法
-    if ((*env)->RegisterNatives(env, menuClass, g_jni_methods, 2) != JNI_OK) {
+    if ((*env)->RegisterNatives(env, menuClass, g_jni_methods, 11) != JNI_OK) {
         LOGE("[overlay] RegisterNatives failed");
         if ((*env)->ExceptionCheck(env)) {
             (*env)->ExceptionDescribe(env);

@@ -1065,17 +1065,33 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     }
 
     // ===== 管理当前物品 (查看 + 删除) =====
-    // 通用管理对话框 - 深色主题 + 全选功能
-    //
-    // 使用方法:
-    //   buildManageDialog(currentJson, enumJson, "祝福", "nativeRemoveBlessing", ITEM_TYPE_BLESSING);
-    //
-    // currentJson: "[1,2,3,...]" 当前拥有的物品ID列表
-    // enumJson: "[{id:1,n:"名称"},...]" 所有可选物品的枚举
-    // title: 物品类型名称 (如 "祝福", "遗物")
-    // nativeRemoveMethod: 原生删除方法名
-    // itemType: 物品类型常量
 
+    private void showManageDialog(final int itemType, final String title, final String nativeRemoveMethod) {
+        if (busy) return;
+        setBusy(true);
+        statusText.setText("\u23F3 读取当前" + title + "...");
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final String currentJson = nativeGetCurrentItems(itemType);
+                final String enumJson = nativeEnumItems(itemType);
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        try {
+                            buildManageDialog(currentJson, enumJson, title, nativeRemoveMethod, itemType);
+                        } catch (Exception e) {
+                            statusText.setText("\u274C 解析失败: " + e.getMessage());
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    // 通用管理对话框 - 深色主题 + 全选功能
     private void buildManageDialog(String currentJson, String enumJson, final String title,
                                     final String nativeRemoveMethod, final int itemType) {
         final List<Integer> currentIds = parseIdList(currentJson);
@@ -1316,10 +1332,31 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     }
 
     // ===== 可视化物品选择器 =====
-    // 通用物品浏览/添加对话框 - 深色主题
-    //
-    // 使用方法:
-    //   showPickerDialog(json, "卡牌", "nativeAddCard", cardIdInput, ITEM_TYPE_CARD);
+
+    private void showItemPicker(final int itemType, final EditText targetInput,
+                                 final String nativeAddMethod, final String title) {
+        if (busy) return;
+        setBusy(true);
+        statusText.setText("\u23F3 加载" + title + "列表...");
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final String json = nativeEnumItems(itemType);
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        try {
+                            showPickerDialog(json, title, nativeAddMethod, targetInput, itemType);
+                        } catch (Exception e) {
+                            statusText.setText("\u274C 解析失败: " + e.getMessage());
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
 
     // 解析 JSON 并显示选择对话框
     private void showPickerDialog(String json, final String title,

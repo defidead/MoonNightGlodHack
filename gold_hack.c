@@ -1257,13 +1257,15 @@ static int safe_read_il2cpp_string(uintptr_t str_ptr, char *buf, int buf_size) {
 
 // ========== 扫描堆查找某个类的单一实例 ==========
 // 用于找到 CardsConfig / LostThingConfig 等单例配置类
+// 改进: 找到所有候选实例, 选择 dict count 最大的那个 (避免假阳性)
 static uintptr_t find_single_class_instance(uintptr_t klass_val) {
     if (klass_val == 0) return 0;
     parse_maps();
     install_sigsegv_handler();
-    uintptr_t result = 0;
+    uintptr_t best_addr = 0;
+    int32_t best_count = 0;
 
-    for (int r = 0; r < g_region_count && result == 0; r++) {
+    for (int r = 0; r < g_region_count; r++) {
         MemRegion *region = &g_regions[r];
         if (!region->readable || !region->writable) continue;
         if (region->executable) continue;
@@ -1272,7 +1274,7 @@ static uintptr_t find_single_class_instance(uintptr_t klass_val) {
         if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue;
 
         uint8_t *base = (uint8_t *)region->start;
-        for (size_t off = 0; off <= size - 0x40 && result == 0; off += 8) {
+        for (size_t off = 0; off <= size - 0x40; off += 8) {
             g_in_safe_access = 1;
             if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; break; }
             uintptr_t val = *(volatile uintptr_t *)(base + off);
@@ -1282,14 +1284,19 @@ static uintptr_t find_single_class_instance(uintptr_t klass_val) {
             if (dict_ptr < 0x10000) { g_in_safe_access = 0; continue; }
             // 进一步验证: dict 的 count 字段应合理
             int32_t count = *(volatile int32_t *)(dict_ptr + 0x20);
-            if (count > 0 && count < 100000) {
-                result = (uintptr_t)(base + off);
+            if (count > 0 && count < 100000 && count > best_count) {
+                best_count = count;
+                best_addr = (uintptr_t)(base + off);
+                LOGI("[scan] Candidate @ %p, dict count=%d", (void*)best_addr, count);
             }
             g_in_safe_access = 0;
         }
     }
     uninstall_sigsegv_handler();
-    return result;
+    if (best_addr) {
+        LOGI("[scan] Selected best instance @ %p (count=%d)", (void*)best_addr, best_count);
+    }
+    return best_addr;
 }
 
 // JSON 转义辅助
@@ -1306,16 +1313,26 @@ static void json_escape_append(char **dst, int *remaining, const char *src) {
 }
 
 // ========== 枚举配置项 (运行时从内存读取) ==========
-// item_type: 1=卡牌(CardsConfig), 2=祝福/遗物(LostThingConfig)
+// item_type: 1=卡牌(CardsConfig), 2=祝福/遗物(LostThingConfig), 3=装备(MinionEquipConfig)
 // 返回 JSON 数组: [{"id":1001,"n":"金剑"},...]
 // 调用者负责 free 返回的字符串
 //
-// Dictionary<Int32, T> 内存布局 (ARM64):
+// Dictionary<Int32, T> 内存布局 (ARM64, Il2CppObject header):
+//   +0x00 klass pointer
+//   +0x08 monitor
 //   +0x10 int[]   _buckets
 //   +0x18 Entry[] _entries
 //   +0x20 int     _count
 //   +0x24 int     _version
-// Entry<Int32, T> 布局 (24 bytes):
+//
+// Il2CppArray (SZArray) 头部布局:
+//   +0x00 klass (8)
+//   +0x08 monitor (8)
+//   +0x10 bounds (8, SZArray = NULL)
+//   +0x18 max_length (4/8)
+//   元素从 +0x20 开始 (含 bounds 时) 或 +0x18 (无 bounds)
+//
+// Entry<Int32, T> 布局 (24 bytes, T=reference type):
 //   +0  int hashCode (-1 = empty)
 //   +4  int next
 //   +8  int key (= item id)
@@ -1323,6 +1340,7 @@ static void json_escape_append(char **dst, int *remaining, const char *src) {
 //   +16 T value (pointer, 8)
 //
 // CardInfo fields: [0x10] id, [0x28] String name
+// MinionEquipCfgData fields: [0x14] id, [0x18] String name (parent: TierBase)
 // LostThing: 自动检测 name 字段偏移
 static char* do_enum_items(int item_type) {
     if (init_il2cpp_context() != 0) return NULL;
@@ -1332,7 +1350,8 @@ static char* do_enum_items(int item_type) {
     switch (item_type) {
         case 1: class_name = "CardsConfig"; known_name_off = 0x28; break;
         case 2: class_name = "LostThingConfig"; known_name_off = -1; break;
-        default: return NULL;
+        case 3: class_name = "MinionEquipConfig"; known_name_off = 0x18; break;
+        default: LOGE("[enum] Unknown item_type %d", item_type); return NULL;
     }
 
     LOGI("[enum] Looking for %s...", class_name);
@@ -1359,25 +1378,52 @@ static char* do_enum_items(int item_type) {
     LOGI("[enum] Dict count=%d entries_arr=0x%" PRIxPTR, dict_count, entries_arr);
 
     if (entries_arr < 0x10000 || dict_count <= 0 || dict_count > 100000) {
+        LOGE("[enum] Invalid dict: entries_arr=%p count=%d", (void*)entries_arr, dict_count);
         uninstall_sigsegv_handler(); return NULL;
     }
 
-    // 读取 entries 数组容量
+    // 探测 IL2CppArray 头部布局, 确定元素起始位置
+    // SZArray 可能有 bounds 字段(=NULL) 也可能没有
     g_in_safe_access = 1;
     if (sigsetjmp(g_jmpbuf, 1) != 0) {
-        g_in_safe_access = 0; uninstall_sigsegv_handler(); return NULL;
+        g_in_safe_access = 0; uninstall_sigsegv_handler();
+        LOGE("[enum] SIGSEGV probing array header"); return NULL;
     }
-    int64_t arr_max = *(volatile int64_t *)(entries_arr + 0x10);
+    uintptr_t probe_10 = *(volatile uintptr_t *)(entries_arr + 0x10);
     g_in_safe_access = 0;
-    if (arr_max <= 0 || arr_max > 100000) { uninstall_sigsegv_handler(); return NULL; }
 
-    uintptr_t elem_base = entries_arr + 0x18;
+    uintptr_t elem_base;
+    if (probe_10 == 0) {
+        // bounds = NULL (标准 SZArray), max_length at +0x18, 元素从 +0x20
+        elem_base = entries_arr + 0x20;
+        LOGI("[enum] Array: bounds=NULL, elem_base=+0x20");
+    } else if (probe_10 > 0 && probe_10 <= 200000) {
+        // 无 bounds 字段, +0x10 直接是 max_length (8字节), 元素从 +0x18
+        elem_base = entries_arr + 0x18;
+        LOGI("[enum] Array: no bounds, maxlen=%d, elem_base=+0x18", (int)probe_10);
+    } else {
+        // probe_10 很大: 可能是 int32 max_length + 首条目数据合并读取
+        // 检查低 32 位是否是合理的 max_length
+        uint32_t lo32 = (uint32_t)(probe_10 & 0xFFFFFFFF);
+        if (lo32 > 0 && lo32 <= 200000) {
+            // int32 max_length + 4字节 padding/data, Entry[] 需要 8 字节对齐
+            elem_base = entries_arr + 0x18;
+            LOGI("[enum] Array: int32 maxlen=%u (+entry data), elem_base=+0x18", lo32);
+        } else {
+            // 真正的 bounds 指针, max_length at +0x18, 元素从 +0x20
+            elem_base = entries_arr + 0x20;
+            LOGI("[enum] Array: bounds=%p, elem_base=+0x20", (void*)probe_10);
+        }
+    }
+
+    // 使用 dict_count 作为迭代上限 (Dictionary._count = 已用 entry 的高水位线)
+    int iter_limit = dict_count;
 
     // 自动检测 name 字段偏移 (如果未知)
     int name_off = known_name_off;
     if (name_off < 0) {
         int candidates[] = {0x18, 0x28, 0x20, 0x30, -1};
-        for (int i = 0; i < (int)arr_max && name_off < 0; i++) {
+        for (int i = 0; i < iter_limit && name_off < 0; i++) {
             g_in_safe_access = 1;
             if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
             uintptr_t entry = elem_base + (uintptr_t)i * 24;
@@ -1412,7 +1458,7 @@ static char* do_enum_items(int item_type) {
     *p++ = '['; remaining--;
     int first = 1, added = 0;
 
-    for (int i = 0; i < (int)arr_max && remaining > 120; i++) {
+    for (int i = 0; i < iter_limit && remaining > 120; i++) {
         g_in_safe_access = 1;
         if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
         uintptr_t entry = elem_base + (uintptr_t)i * 24;
@@ -1441,6 +1487,49 @@ static char* do_enum_items(int item_type) {
         p += n; remaining -= n;
         added++;
     }
+
+    // 如果首次未找到任何条目, 尝试另一个 elem_base 偏移
+    if (added == 0 && dict_count > 5) {
+        uintptr_t alt_base = (elem_base == entries_arr + 0x20)
+                              ? entries_arr + 0x18
+                              : entries_arr + 0x20;
+        LOGW("[enum] 0 items with elem_base=%p, retrying with alt=%p",
+             (void*)elem_base, (void*)alt_base);
+
+        p = json; remaining = json_cap - 2;
+        *p++ = '['; remaining--;
+        first = 1;
+
+        for (int i = 0; i < iter_limit && remaining > 120; i++) {
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+            uintptr_t entry = alt_base + (uintptr_t)i * 24;
+            int32_t hc = *(volatile int32_t *)(entry);
+            if (hc < 0) { g_in_safe_access = 0; continue; }
+            int32_t key = *(volatile int32_t *)(entry + 8);
+            uintptr_t value = *(volatile uintptr_t *)(entry + 16);
+            g_in_safe_access = 0;
+            if (value < 0x10000) continue;
+
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+            uintptr_t name_str = *(volatile uintptr_t *)(value + name_off);
+            g_in_safe_access = 0;
+
+            char name_buf[256] = {0};
+            safe_read_il2cpp_string(name_str, name_buf, sizeof(name_buf));
+
+            if (!first) { *p++ = ','; remaining--; }
+            first = 0;
+            int n = snprintf(p, remaining, "{\"id\":%d,\"n\":\"", key);
+            p += n; remaining -= n;
+            json_escape_append(&p, &remaining, name_buf[0] ? name_buf : "???");
+            n = snprintf(p, remaining, "\"}");
+            p += n; remaining -= n;
+            added++;
+        }
+    }
+
     *p++ = ']'; *p = '\0';
 
     uninstall_sigsegv_handler();

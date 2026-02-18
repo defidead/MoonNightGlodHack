@@ -72,6 +72,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     // 物品类型常量 (与 C 层 do_enum_items 对应)
     private static final int ITEM_TYPE_CARD      = 1;
     private static final int ITEM_TYPE_LOSTTHING = 2;
+    private static final int ITEM_TYPE_EQUIP     = 3;
 
     // JNI 回调（C 代码注册实现）
     public static native String nativeModifyGold(int amount);
@@ -420,7 +421,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         } else if (id == BTN_MODIFY_ALL) {
             doModifyAll();
         } else if (id == BTN_BROWSE_EQUIP) {
-            showItemPicker(ITEM_TYPE_CARD, equipInput, "nativeAddEquipment", "装备");
+            showItemPicker(ITEM_TYPE_EQUIP, equipInput, "nativeAddEquipment", "装备");
         } else if (id == BTN_BROWSE_CARD) {
             showItemPicker(ITEM_TYPE_CARD, cardInput, "nativeAddCard", "卡牌");
         } else if (id == BTN_BROWSE_BLESS) {

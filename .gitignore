@@ -1,0 +1,7 @@
+# 只跟踪 gold_hack.c 和 OverlayMenu.java，其余全部忽略
+*
+!.gitignore
+!gold_hack.c
+!OverlayMenu.java
+!README.md
+!build.sh

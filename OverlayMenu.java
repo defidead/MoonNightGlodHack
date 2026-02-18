@@ -35,7 +35,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     private LinearLayout contentArea;
     private TextView statusText;
     private EditText goldInput, hpInput, mpInput, actionInput, handcardsInput;
-    private EditText equipInput, lostthingInput, cardInput;
+    private EditText equipInput, lostthingInput, cardInput, equipSlotsInput;
     private Button toggleBtn;
     private Button autoSkillBtn;
     private boolean collapsed = false;
@@ -68,6 +68,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     private static final int BTN_BROWSE_EQUIP = 0x7f000020;
     private static final int BTN_BROWSE_CARD  = 0x7f000021;
     private static final int BTN_BROWSE_BLESS = 0x7f000022;
+    private static final int BTN_EQUIP_SLOTS  = 0x7f000023;
 
     // 物品类型常量 (与 C 层 do_enum_items 对应)
     private static final int ITEM_TYPE_CARD      = 1;
@@ -86,6 +87,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     public static native String nativeAddCard(int cardId);
     public static native String nativeModifyAll(int gold, int maxHp, int mp, int action, int handcards);
     public static native String nativeEnumItems(int type);
+    public static native String nativeModifyEquipSlots(int slots);
 
     /**
      * 从 C 代码调用的入口，在 UI 线程创建悬浮窗
@@ -206,6 +208,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         addSectionLabel(contentArea, "\u2694\uFE0F 添加装备 (装备ID)", 0xFFFB923C);
         equipInput = addInputRow(contentArea, "装备ID", "", BTN_EQUIP, "添加");
         addBrowseRow(contentArea, BTN_BROWSE_EQUIP, "📂 浏览装备列表");
+        equipSlotsInput = addInputRow(contentArea, "装备槽数", "6", BTN_EQUIP_SLOTS, "设置");
         addDivider(contentArea);
 
         // ==================== 🃏 添加卡牌 ====================
@@ -410,6 +413,8 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             doIntModify(handcardsInput, "nativeModifyHandcards");
         } else if (id == BTN_EQUIP) {
             doIntModify(equipInput, "nativeAddEquipment");
+        } else if (id == BTN_EQUIP_SLOTS) {
+            doIntModify(equipSlotsInput, "nativeModifyEquipSlots");
         } else if (id == BTN_LOSTTHING) {
             doIntModify(lostthingInput, "nativeAddLostThing");
         } else if (id == BTN_CARD) {

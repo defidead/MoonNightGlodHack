@@ -1098,28 +1098,60 @@ static int do_modify_handcards(int handcards) {
 //   +0x08 monitor
 //   +0x10 _items (System.Int32[] 数组指针)
 //   +0x18 _size (int32)
-// System.Int32[] 数组布局:
+// System.Int32[] (SZArray) 数组布局:
 //   +0x00 klass ptr
 //   +0x08 monitor
-//   +0x10 max_length (uint64 / nint)
-//   +0x18 elements[] (int32)
+//   +0x10 bounds (= NULL for SZArray)
+//   +0x18 max_length (nint, 8 bytes on ARM64)
+//   +0x20 elements[] (int32)
 static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
-    if (list_ptr < 0x10000) return -1;
+    if (list_ptr < 0x10000) { LOGW("  add_item: list_ptr invalid (%p)", (void*)list_ptr); return -1; }
     
     uintptr_t items = *(volatile uintptr_t *)(list_ptr + 0x10);
     int32_t size = *(volatile int32_t *)(list_ptr + 0x18);
     
-    if (items < 0x10000 || size < 0 || size > 1000) return -1;
+    if (items < 0x10000 || size < 0 || size > 1000) {
+        LOGW("  add_item: invalid list (items=%p, size=%d)", (void*)items, size);
+        return -1;
+    }
     
-    // 读取数组容量
-    uintptr_t max_length = *(volatile uintptr_t *)(items + 0x10);
-    if ((int64_t)max_length < size || max_length > 10000) return -1;
+    // 探测 SZArray 布局: bounds at +0x10, max_length at +0x18, elements at +0x20
+    uintptr_t probe = *(volatile uintptr_t *)(items + 0x10);
+    uintptr_t max_length;
+    int32_t *elem_base;
+    
+    if (probe == 0) {
+        // 标准 SZArray: bounds=NULL, max_length at +0x18, elements at +0x20
+        max_length = *(volatile uintptr_t *)(items + 0x18);
+        elem_base = (int32_t *)(items + 0x20);
+    } else if (probe > 0 && probe <= 200000) {
+        // 无 bounds 字段, +0x10 直接是 max_length, elements at +0x18
+        max_length = probe;
+        elem_base = (int32_t *)(items + 0x18);
+    } else {
+        // 检查低32位是否为合理的 max_length
+        uint32_t lo32 = (uint32_t)(probe & 0xFFFFFFFF);
+        if (lo32 > 0 && lo32 <= 200000) {
+            max_length = lo32;
+            elem_base = (int32_t *)(items + 0x18);
+        } else {
+            max_length = *(volatile uintptr_t *)(items + 0x18);
+            elem_base = (int32_t *)(items + 0x20);
+        }
+    }
+    
+    LOGI("  add_item: id=%d, list size=%d, arr cap=%d, elem_base=%p",
+         item_id, size, (int)max_length, (void*)elem_base);
+    
+    if ((int64_t)max_length <= 0 || max_length > 10000 || (int64_t)max_length < size) {
+        LOGW("  add_item: bad capacity (%d), size=%d", (int)max_length, size);
+        return -1;
+    }
     
     // 检查是否已存在
-    int32_t *elem_base = (int32_t *)(items + 0x18);
     for (int i = 0; i < size; i++) {
         if (elem_base[i] == item_id) {
-            LOGI("  Item %d already in list", item_id);
+            LOGI("  Item %d already in list at [%d]", item_id, i);
             return 0;
         }
     }
@@ -1209,6 +1241,86 @@ static int do_add_card(int card_id) {
     return count;
 }
 
+// ========== 修改装备槽数量 ==========
+// equipmentSlot 是 List<Int32>, size = 装备槽数量
+// 空槽 value=0, 有装备 value=itemID
+// 扩容: 在数组容量允许的范围内增加 size, 新槽填 0
+// 缩容: 减少 size (不释放数组空间)
+static int do_modify_equip_slots(int slot_count) {
+    if (init_il2cpp_context() != 0) return -1;
+    if (slot_count < 0 || slot_count > 50) {
+        LOGW("do_modify_equip_slots: invalid slot_count %d", slot_count);
+        return -1;
+    }
+    int n = ensure_roleinfo_cached();
+    if (n == 0) return 0;
+
+    int count = 0;
+    install_sigsegv_handler();
+    for (int i = 0; i < g_cached_count; i++) {
+        uintptr_t obj_addr = g_cached_roleinfo[i];
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        uintptr_t equip_list = *(volatile uintptr_t *)(obj_addr + OFF_EQUIPSLOT);
+        if (equip_list < 0x10000) { g_in_safe_access = 0; continue; }
+
+        uintptr_t items = *(volatile uintptr_t *)(equip_list + 0x10);
+        int32_t cur_size = *(volatile int32_t *)(equip_list + 0x18);
+        g_in_safe_access = 0;
+
+        if (items < 0x10000 || cur_size < 0) continue;
+
+        // 探测 SZArray 布局获取 max_length 和 elem_base
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        uintptr_t probe = *(volatile uintptr_t *)(items + 0x10);
+        uintptr_t max_length;
+        int32_t *elem_base;
+        if (probe == 0) {
+            max_length = *(volatile uintptr_t *)(items + 0x18);
+            elem_base = (int32_t *)(items + 0x20);
+        } else if (probe > 0 && probe <= 200000) {
+            max_length = probe;
+            elem_base = (int32_t *)(items + 0x18);
+        } else {
+            uint32_t lo32 = (uint32_t)(probe & 0xFFFFFFFF);
+            if (lo32 > 0 && lo32 <= 200000) {
+                max_length = lo32;
+                elem_base = (int32_t *)(items + 0x18);
+            } else {
+                max_length = *(volatile uintptr_t *)(items + 0x18);
+                elem_base = (int32_t *)(items + 0x20);
+            }
+        }
+        g_in_safe_access = 0;
+
+        LOGI("  equip_slots: cur_size=%d, cap=%d, target=%d", cur_size, (int)max_length, slot_count);
+
+        if ((int64_t)max_length <= 0 || max_length > 10000) continue;
+
+        int new_size = slot_count;
+        if ((uintptr_t)new_size > max_length) {
+            new_size = (int)max_length;
+            LOGW("  Capped to array capacity: %d", new_size);
+        }
+
+        // 新增的槽位填 0 (空槽)
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
+        for (int s = cur_size; s < new_size; s++) {
+            elem_base[s] = 0;
+        }
+        *(int32_t *)(equip_list + 0x18) = new_size;
+        g_in_safe_access = 0;
+
+        LOGI("  equip_slots: changed %d -> %d", cur_size, new_size);
+        count++;
+    }
+    uninstall_sigsegv_handler();
+    LOGI("do_modify_equip_slots: set to %d on %d instance(s)", slot_count, count);
+    return count;
+}
+
 // ========== IL2CPP 字符串读取 (UTF-16LE → UTF-8) ==========
 // Il2CppString: klass(8) + monitor(8) + length(4) + chars[](UTF-16LE)
 static int utf16_to_utf8(const uint16_t *src, int src_len, char *dst, int dst_max) {
@@ -1253,6 +1365,47 @@ static int safe_read_il2cpp_string(uintptr_t str_ptr, char *buf, int buf_size) {
     int result = utf16_to_utf8(chars, len, buf, buf_size);
     g_in_safe_access = 0;
     return result;
+}
+
+// ========== 配置类实例缓存 ==========
+// 避免每次浏览都做全堆扫描 (数秒)
+typedef struct {
+    uintptr_t klass;
+    uintptr_t addr;
+} ConfigCache;
+static ConfigCache g_config_cache[4] = {0}; // index by item_type: 1=card, 2=lostthing, 3=equip
+
+static uintptr_t get_cached_config(int item_type, uintptr_t klass_val) {
+    if (item_type < 1 || item_type > 3 || klass_val == 0) return 0;
+    ConfigCache *cc = &g_config_cache[item_type];
+    if (cc->klass != klass_val || cc->addr == 0) return 0;
+    // 验证缓存地址仍然有效
+    install_sigsegv_handler();
+    g_in_safe_access = 1;
+    if (sigsetjmp(g_jmpbuf, 1) != 0) {
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        cc->addr = 0;
+        LOGW("[cache] item_type=%d cached addr invalid, cleared", item_type);
+        return 0;
+    }
+    uintptr_t k = *(volatile uintptr_t *)cc->addr;
+    g_in_safe_access = 0;
+    uninstall_sigsegv_handler();
+    if (k != klass_val) {
+        LOGW("[cache] item_type=%d klass mismatch, cleared", item_type);
+        cc->addr = 0;
+        return 0;
+    }
+    LOGI("[cache] Hit! item_type=%d @ %p", item_type, (void*)cc->addr);
+    return cc->addr;
+}
+
+static void set_config_cache(int item_type, uintptr_t klass_val, uintptr_t addr) {
+    if (item_type < 1 || item_type > 3) return;
+    g_config_cache[item_type].klass = klass_val;
+    g_config_cache[item_type].addr = addr;
+    LOGI("[cache] Stored item_type=%d @ %p", item_type, (void*)addr);
 }
 
 // ========== 扫描堆查找某个类的单一实例 ==========
@@ -1358,8 +1511,13 @@ static char* do_enum_items(int item_type) {
     Il2CppClass klass = fn_class_from_name(g_csharp_image, "", class_name);
     if (!klass) { LOGE("[enum] Class %s not found", class_name); return NULL; }
 
-    LOGI("[enum] %s klass=%p, scanning heap...", class_name, klass);
-    uintptr_t instance = find_single_class_instance((uintptr_t)klass);
+    // 先查缓存, 缓存未命中再全堆扫描
+    uintptr_t instance = get_cached_config(item_type, (uintptr_t)klass);
+    if (!instance) {
+        LOGI("[enum] %s klass=%p, scanning heap...", class_name, klass);
+        instance = find_single_class_instance((uintptr_t)klass);
+        if (instance) set_config_cache(item_type, (uintptr_t)klass, instance);
+    }
     if (!instance) { LOGE("[enum] No %s instance in heap", class_name); return NULL; }
     LOGI("[enum] Instance @ 0x%" PRIxPTR, instance);
 
@@ -1784,6 +1942,23 @@ static jstring JNICALL jni_enum_items(JNIEnv *env, jclass clazz, jint type) {
     return result;
 }
 
+// ========== JNI: 修改装备槽数量 ==========
+static jstring JNICALL jni_modify_equip_slots(JNIEnv *env, jclass clazz, jint slots) {
+    LOGI("[JNI] nativeModifyEquipSlots(%d)", (int)slots);
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0)
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中...");
+    int count = do_modify_equip_slots((int)slots);
+    pthread_mutex_unlock(&g_hack_mutex);
+    char buf[128];
+    if (count > 0)
+        snprintf(buf, sizeof(buf), "\u2705 装备槽: %d (%d个实例)", (int)slots, count);
+    else if (count == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到实例");
+    else
+        snprintf(buf, sizeof(buf), "\u274C 修改失败");
+    return (*env)->NewStringUTF(env, buf);
+}
+
 static JNINativeMethod g_jni_methods[] = {
     { "nativeModifyGold",      "(I)Ljava/lang/String;",     (void *)jni_modify_gold },
     { "nativeResetSkillCD",    "()Ljava/lang/String;",      (void *)jni_reset_skill_cd },
@@ -1795,7 +1970,8 @@ static JNINativeMethod g_jni_methods[] = {
     { "nativeAddLostThing",    "(I)Ljava/lang/String;",     (void *)jni_add_lostthing },
     { "nativeAddCard",         "(I)Ljava/lang/String;",     (void *)jni_add_card },
     { "nativeModifyAll",       "(IIIII)Ljava/lang/String;", (void *)jni_modify_all },
-    { "nativeEnumItems",      "(I)Ljava/lang/String;",     (void *)jni_enum_items },
+    { "nativeEnumItems",       "(I)Ljava/lang/String;",     (void *)jni_enum_items },
+    { "nativeModifyEquipSlots","(I)Ljava/lang/String;",     (void *)jni_modify_equip_slots },
 };
 
 // ========== 通过 JNI 加载嵌入的 DEX 并创建悬浮菜单 ==========
@@ -1905,7 +2081,7 @@ static void create_overlay_menu(void) {
     LOGI("[overlay] OverlayMenu class loaded");
 
     // 5. 注册 native 方法
-    if ((*env)->RegisterNatives(env, menuClass, g_jni_methods, 11) != JNI_OK) {
+    if ((*env)->RegisterNatives(env, menuClass, g_jni_methods, 12) != JNI_OK) {
         LOGE("[overlay] RegisterNatives failed");
         if ((*env)->ExceptionCheck(env)) {
             (*env)->ExceptionDescribe(env);

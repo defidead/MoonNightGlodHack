@@ -133,7 +133,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         titleBar.setOnTouchListener(this);
 
         TextView title = new TextView(activity);
-        title.setText("\uD83C\uDF15 月圆之夜 修改器");
+        title.setText("\uD83C\uDF15 月圆之夜");
         title.setTextColor(0xFFE0E7FF);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         title.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
@@ -615,7 +615,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                     public void run() {
                         setBusy(false);
                         try {
-                            showPickerDialog(json, title, nativeAddMethod, targetInput);
+                            showPickerDialog(json, title, nativeAddMethod, targetInput, itemType);
                         } catch (Exception e) {
                             statusText.setText("\u274C 解析失败: " + e.getMessage());
                         }
@@ -627,7 +627,8 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
 
     // 解析 JSON 并显示选择对话框
     private void showPickerDialog(String json, final String title,
-                                   final String nativeAddMethod, final EditText targetInput) {
+                                   final String nativeAddMethod, final EditText targetInput,
+                                   final int itemType) {
         // 手动解析简单 JSON 数组 [{"id":1,"n":"名字"},...]
         final List<int[]> ids = new ArrayList<int[]>();
         final List<String> names = new ArrayList<String>();
@@ -657,8 +658,22 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                     }
                 }
                 if (id > 0) {
-                    ids.add(new int[]{id});
-                    names.add("[" + id + "] " + name);
+                    // 对祝福/遗物列表进行分类标注
+                    if (itemType == ITEM_TYPE_LOSTTHING) {
+                        String tag;
+                        if (id >= 8000 && id < 9000) {
+                            tag = "\uD83C\uDFAD 事件";
+                        } else if (id >= 10000) {
+                            tag = "\uD83C\uDFC6 成就";
+                        } else {
+                            tag = "\u2728 祝福";
+                        }
+                        ids.add(new int[]{id});
+                        names.add(tag + " [" + id + "] " + name);
+                    } else {
+                        ids.add(new int[]{id});
+                        names.add("[" + id + "] " + name);
+                    }
                 }
             }
         } catch (Exception e) {

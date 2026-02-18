@@ -1194,7 +1194,7 @@ static int add_item_to_int_list(uintptr_t list_ptr, int item_id) {
     if (max_length == 0 || (uintptr_t)size >= max_length) {
         int new_cap = (int)(max_length == 0 ? 16 : max_length * 2);
         if (new_cap < size + 4) new_cap = size + 4;
-        if (new_cap > 200) new_cap = 200;
+        if (new_cap > 2000) new_cap = 2000;
         
         LOGI("  Expanding: old cap=%d, new cap=%d, copying %d elements",
              (int)max_length, new_cap, size);
@@ -1276,7 +1276,126 @@ static int do_add_lostthing(int lostthing_id) {
 }
 
 // ========== 添加卡牌到卡组 ==========
-// cardsLibraryAll 是 List<CardInfoInDeck>，每个元素有 id(+0x10) 和 idx(+0x14)
+// cardsLibraryAll(0x90): List<CardInfoInDeck> — 卡牌库全列表（非战斗显示）
+//   CardInfoInDeck: Il2CppObject header(16) + id(+0x10,int) + idx(+0x14,int)
+// cardsBattle(0x100): List<Int32> — 战斗用卡组
+//
+// 策略: 同时向两个列表添加卡牌
+//   cardsBattle: 直接 add_item_to_int_list (int list)
+//   cardsLibraryAll: 构造 CardInfoInDeck 对象, 插入 List<ref> 的 backing array
+
+// 向 List<Ref> (List<CardInfoInDeck>) 添加一个引用类型元素
+// List<T> where T=class: _items 是 Il2CppArray of pointers
+// SZArray<ref>: klass(8)+monitor(8)+bounds(8,=0)+max_length(8)+elements[](ptr,8 each)
+static int add_card_to_ref_list(uintptr_t list_ptr, int card_id) {
+    if (list_ptr < 0x10000) return -1;
+    
+    uintptr_t items = *(volatile uintptr_t *)(list_ptr + 0x10);
+    int32_t size = *(volatile int32_t *)(list_ptr + 0x18);
+    
+    if (items < 0x10000 || size < 0 || size > 5000) {
+        LOGW("  add_card_ref: invalid list (items=%p, size=%d)", (void*)items, size);
+        return -1;
+    }
+    
+    // 探测 SZArray 布局
+    uintptr_t probe = *(volatile uintptr_t *)(items + 0x10);
+    uintptr_t max_length;
+    uintptr_t *elem_base;
+    
+    if (probe == 0) {
+        max_length = *(volatile uintptr_t *)(items + 0x18);
+        elem_base = (uintptr_t *)(items + 0x20);
+    } else if (probe > 0 && probe <= 200000) {
+        max_length = probe;
+        elem_base = (uintptr_t *)(items + 0x18);
+    } else {
+        max_length = *(volatile uintptr_t *)(items + 0x18);
+        elem_base = (uintptr_t *)(items + 0x20);
+    }
+    
+    LOGI("  add_card_ref: card=%d, size=%d, cap=%d", card_id, size, (int)max_length);
+    
+    // 检查是否已存在 (CardInfoInDeck.id at +0x10)
+    for (int i = 0; i < size; i++) {
+        uintptr_t obj = elem_base[i];
+        if (obj > 0x10000) {
+            int32_t eid = *(volatile int32_t *)(obj + 0x10);
+            if (eid == card_id) {
+                LOGI("  Card %d already in library at [%d]", card_id, i);
+                return 0;
+            }
+        }
+    }
+    
+    // 扩容 (分配新 pointer array)
+    if (max_length == 0 || (uintptr_t)size >= max_length) {
+        int new_cap = (int)(max_length == 0 ? 32 : max_length * 2);
+        if (new_cap < size + 4) new_cap = size + 4;
+        if (new_cap > 5000) new_cap = 5000;
+        
+        // 分配新 SZArray<ref>: header(0x20) + new_cap * 8(ptr)
+        size_t total = 0x20 + (size_t)new_cap * 8;
+        size_t page_sz = 4096;
+        size_t alloc_sz = (total + page_sz - 1) & ~(page_sz - 1);
+        void *mem = mmap(NULL, alloc_sz, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mem == MAP_FAILED) return -1;
+        memset(mem, 0, alloc_sz);
+        uintptr_t new_arr = (uintptr_t)mem;
+        
+        // 复制头部
+        *(volatile uintptr_t *)(new_arr + 0x00) = *(volatile uintptr_t *)(items + 0x00);
+        *(volatile uintptr_t *)(new_arr + 0x08) = *(volatile uintptr_t *)(items + 0x08);
+        *(volatile uintptr_t *)(new_arr + 0x10) = 0; // bounds=NULL
+        *(volatile uintptr_t *)(new_arr + 0x18) = (uintptr_t)new_cap;
+        
+        uintptr_t *new_elem = (uintptr_t *)(new_arr + 0x20);
+        for (int i = 0; i < size; i++) {
+            new_elem[i] = elem_base[i];
+        }
+        
+        *(volatile uintptr_t *)(list_ptr + 0x10) = new_arr;
+        elem_base = new_elem;
+        max_length = (uintptr_t)new_cap;
+        LOGI("  Expanded ref array: new cap=%d", new_cap);
+    }
+    
+    // 分配 CardInfoInDeck 对象
+    // Il2CppObject: klass(8) + monitor(8) + id(4) + idx(4) = 24 bytes
+    // 从第一个元素借 klass 指针
+    uintptr_t card_klass = 0;
+    for (int i = 0; i < size; i++) {
+        if (elem_base[i] > 0x10000) {
+            card_klass = *(volatile uintptr_t *)(elem_base[i]);
+            break;
+        }
+    }
+    if (card_klass == 0) {
+        // 没有现有元素可以借 klass, 尝试用 il2cpp_class_from_name
+        card_klass = (uintptr_t)fn_class_from_name(g_csharp_image, "", "CardInfoInDeck");
+        LOGI("  CardInfoInDeck klass from API: %p", (void*)card_klass);
+    }
+    
+    // mmap 分配一个 CardInfoInDeck 对象 (24 bytes, 页对齐)
+    void *obj_mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (obj_mem == MAP_FAILED) return -1;
+    memset(obj_mem, 0, 4096);
+    uintptr_t card_obj = (uintptr_t)obj_mem;
+    *(volatile uintptr_t *)(card_obj + 0x00) = card_klass; // klass
+    *(volatile uintptr_t *)(card_obj + 0x08) = 0;          // monitor
+    *(volatile int32_t *)(card_obj + 0x10) = card_id;      // id
+    *(volatile int32_t *)(card_obj + 0x14) = size;         // idx (= 在列表中的索引)
+    
+    // 插入到 List
+    elem_base[size] = card_obj;
+    *(int32_t *)(list_ptr + 0x18) = size + 1;
+    LOGI("  Added CardInfoInDeck(id=%d, idx=%d) @ %p to library (size: %d -> %d)",
+         card_id, size, obj_mem, size, size + 1);
+    return 1;
+}
+
 static int do_add_card(int card_id) {
     if (init_il2cpp_context() != 0) return -1;
     int n = ensure_roleinfo_cached();
@@ -1289,14 +1408,23 @@ static int do_add_card(int card_id) {
         g_in_safe_access = 1;
         if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; continue; }
         
-        // 向 cardsBattle (List<Int32>) 添加卡牌（战斗用卡组）
-        uintptr_t battle_cards = *(volatile uintptr_t *)(obj_addr + 0x100); // cardsBattle
+        int ok = 0;
+        
+        // 1. 向 cardsLibraryAll (List<CardInfoInDeck>) 添加（卡牌库，非战斗显示）
+        uintptr_t lib_cards = *(volatile uintptr_t *)(obj_addr + 0x90);
+        if (lib_cards > 0x10000) {
+            int ret = add_card_to_ref_list(lib_cards, card_id);
+            if (ret >= 0) ok = 1;
+        }
+        
+        // 2. 向 cardsBattle (List<Int32>) 添加（战斗用卡组）
+        uintptr_t battle_cards = *(volatile uintptr_t *)(obj_addr + 0x100);
         if (battle_cards > 0x10000) {
             add_item_to_int_list(battle_cards, card_id);
         }
         
         g_in_safe_access = 0;
-        count++;
+        if (ok) count++;
     }
     uninstall_sigsegv_handler();
     LOGI("do_add_card: added card %d to %d instance(s)", card_id, count);

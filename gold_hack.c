@@ -2182,6 +2182,7 @@ static void json_escape_append(char **dst, int *remaining, const char *src) {
 // CardInfo fields: [0x10] id, [0x28] String name
 // MinionEquipCfgData fields: [0x14] id, [0x18] String name (parent: TierBase)
 // LostThing: 自动检测 name 字段偏移
+static char* do_prescan(void); // 前向声明
 static char* do_enum_items(int item_type) {
     if (init_il2cpp_context() != 0) return NULL;
 
@@ -2656,8 +2657,6 @@ static jstring JNICALL jni_modify_equip_slots(JNIEnv *env, jclass clazz, jint sl
 // ========== 多线程预扫描 ==========
 #define NUM_SCAN_THREADS 4
 #define PRESCAN_SLOTS 5
-
-static char* do_prescan(void); // 前向声明
 
 typedef struct {
     int region_start;           // g_regions 起始索引 (含)

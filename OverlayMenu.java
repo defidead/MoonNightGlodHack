@@ -912,6 +912,9 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             LinearLayout.LayoutParams celp = new LinearLayout.LayoutParams(dp(40), dp(26));
             celp.setMargins(dp(4), 0, 0, 0);
             countEdit.setLayoutParams(celp);
+            countEdit.setFocusable(true);
+            countEdit.setFocusableInTouchMode(true);
+            countEdit.setClickable(true);
             countEdit.addTextChangedListener(new android.text.TextWatcher() {
                 @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
                 @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
@@ -1008,7 +1011,13 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
 
         try {
             AlertDialog dlg = builder.create();
-            if (dlg.getWindow() != null) dlg.getWindow().setType(2);
+            if (dlg.getWindow() != null) {
+                dlg.getWindow().setType(2038); // TYPE_APPLICATION_OVERLAY
+                dlg.getWindow().setSoftInputMode(
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+                dlg.getWindow().clearFlags(
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
+            }
             dlg.show();
         } catch (Exception e) {
             statusText.setText("\u274C 无法显示对话框: " + e.getMessage());

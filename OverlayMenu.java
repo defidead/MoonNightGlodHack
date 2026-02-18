@@ -35,7 +35,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     private LinearLayout contentArea;
     private TextView statusText;
     private EditText goldInput, hpInput, mpInput, actionInput, handcardsInput;
-    private EditText lostthingInput, cardInput, equipSlotsInput;
+    private EditText lostthingInput, cardInput, cardCountInput, equipSlotsInput;
     private Button toggleBtn;
     private Button autoSkillBtn;
     private boolean collapsed = false;
@@ -96,6 +96,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     public static native String nativeGetCurrentItems(int type);
     public static native String nativeRemoveCard(int cardId);
     public static native String nativeRemoveLostThing(int lostThingId);
+    public static native String nativeSetCardCount(int cardId, int count);
 
     /**
      * 从 C 代码调用的入口，在 UI 线程创建悬浮窗
@@ -230,7 +231,73 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
 
         // ==================== 🃏 卡牌管理 ====================
         addSectionLabel(contentArea, "\uD83C\uDCCF 卡牌管理", 0xFF60A5FA);
-        cardInput = addInputRow(contentArea, "卡牌ID", "", BTN_CARD, "添加");
+        // 卡牌ID + 数量 + 添加 (自定义行)
+        {
+            LinearLayout cardRow = new LinearLayout(activity);
+            cardRow.setOrientation(LinearLayout.HORIZONTAL);
+            cardRow.setGravity(Gravity.CENTER_VERTICAL);
+            LinearLayout.LayoutParams crlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            crlp.setMargins(0, dp(3), 0, 0);
+            cardRow.setLayoutParams(crlp);
+
+            cardInput = new EditText(activity);
+            cardInput.setHint("卡牌ID");
+            cardInput.setTextColor(Color.WHITE);
+            cardInput.setHintTextColor(0xFF666688);
+            cardInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            cardInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+            cardInput.setSingleLine(true);
+            cardInput.setPadding(dp(6), dp(3), dp(6), dp(3));
+            GradientDrawable cibg = new GradientDrawable();
+            cibg.setColor(0xFF1E1E3F); cibg.setCornerRadius(dp(6)); cibg.setStroke(dp(1), 0xFF4338CA);
+            cardInput.setBackground(cibg);
+            cardInput.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            final EditText ciRef = cardInput;
+            cardInput.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    wmParams.flags = 0; try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+                    ciRef.requestFocus();
+                }
+            });
+            cardRow.addView(cardInput);
+
+            TextView xLabel = new TextView(activity);
+            xLabel.setText(" x");
+            xLabel.setTextColor(0xFFCCCCCC);
+            xLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            cardRow.addView(xLabel);
+
+            cardCountInput = new EditText(activity);
+            cardCountInput.setHint("1");
+            cardCountInput.setText("1");
+            cardCountInput.setTextColor(Color.WHITE);
+            cardCountInput.setHintTextColor(0xFF666688);
+            cardCountInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            cardCountInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+            cardCountInput.setSingleLine(true);
+            cardCountInput.setPadding(dp(4), dp(3), dp(4), dp(3));
+            GradientDrawable ccbg = new GradientDrawable();
+            ccbg.setColor(0xFF1E1E3F); ccbg.setCornerRadius(dp(6)); ccbg.setStroke(dp(1), 0xFF4338CA);
+            cardCountInput.setBackground(ccbg);
+            cardCountInput.setLayoutParams(new LinearLayout.LayoutParams(dp(36), ViewGroup.LayoutParams.WRAP_CONTENT));
+            final EditText ccRef = cardCountInput;
+            cardCountInput.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    wmParams.flags = 0; try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+                    ccRef.requestFocus();
+                }
+            });
+            cardRow.addView(cardCountInput);
+
+            Button cardAddBtn = makeBtn("添加", 0xFF7C3AED, BTN_CARD);
+            LinearLayout.LayoutParams cablp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30));
+            cablp.setMargins(dp(4), 0, 0, 0);
+            cardAddBtn.setLayoutParams(cablp);
+            cardRow.addView(cardAddBtn);
+
+            contentArea.addView(cardRow);
+        }
         addBrowseRow(contentArea, BTN_BROWSE_CARD, "📂 浏览全部卡牌");
         addBrowseRow(contentArea, BTN_MANAGE_CARD, "📋 管理当前卡牌 (查看/删除)");
         addDivider(contentArea);
@@ -435,7 +502,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         } else if (id == BTN_LOSTTHING) {
             doIntModify(lostthingInput, "nativeAddLostThing");
         } else if (id == BTN_CARD) {
-            doIntModify(cardInput, "nativeAddCard");
+            doAddCardWithCount();
         } else if (id == BTN_SKILL) {
             doSkillReset();
         } else if (id == BTN_SKILL_AUTO) {
@@ -447,7 +514,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         } else if (id == BTN_BROWSE_BLESS) {
             showItemPicker(ITEM_TYPE_LOSTTHING, lostthingInput, "nativeAddLostThing", "祝福/遗物");
         } else if (id == BTN_MANAGE_CARD) {
-            showManageDialog(ITEM_TYPE_CARD, "卡牌", "nativeRemoveCard");
+            showCardManageDialog();
         } else if (id == BTN_MANAGE_BLESS) {
             showManageDialog(ITEM_TYPE_LOSTTHING, "祝福/遗物", "nativeRemoveLostThing");
         } else if (id == BTN_MANAGE_EQUIP) {
@@ -464,6 +531,43 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
 
     private void setBusy(boolean b) {
         busy = b;
+    }
+
+    // 添加卡牌(支持数量)
+    private void doAddCardWithCount() {
+        if (busy) return;
+        String idText = cardInput.getText().toString().trim();
+        String countText = cardCountInput.getText().toString().trim();
+        final int cardId, count;
+        try {
+            cardId = Integer.parseInt(idText);
+        } catch (NumberFormatException e) { statusText.setText("\u274C 请输入卡牌ID"); return; }
+        try {
+            count = countText.isEmpty() ? 1 : Integer.parseInt(countText);
+        } catch (NumberFormatException e) { statusText.setText("\u274C 数量无效"); return; }
+        if (count <= 0 || count > 99) { statusText.setText("\u274C 数量范围 1-99"); return; }
+        setBusy(true);
+        statusText.setText("\u23F3 添加 " + count + " 张卡牌 " + cardId + "...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                int ok = 0;
+                for (int i = 0; i < count; i++) {
+                    try {
+                        String r = nativeAddCard(cardId);
+                        if (r != null && r.contains("\u2705")) ok++;
+                    } catch (Exception e) { break; }
+                }
+                final int fOk = ok;
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        statusText.setText("\u2705 已添加 " + fOk + " 张卡牌 " + cardId);
+                        setBusy(false);
+                    }
+                });
+            }
+        }).start();
     }
 
     // 通用的单参数修改
@@ -639,6 +743,333 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                 });
             }
         }).start();
+    }
+
+    // ===== 卡牌管理 (查看数量 + 修改数量) =====
+    private void showCardManageDialog() {
+        if (busy) return;
+        setBusy(true);
+        statusText.setText("\u23F3 读取当前卡牌...");
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final String currentJson = nativeGetCurrentItems(ITEM_TYPE_CARD);
+                final String enumJson = nativeEnumItems(ITEM_TYPE_CARD);
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        setBusy(false);
+                        try {
+                            buildCardManageDialog(currentJson, enumJson);
+                        } catch (Exception e) {
+                            statusText.setText("\u274C 解析失败: " + e.getMessage());
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void buildCardManageDialog(String currentJson, String enumJson) {
+        // 解析当前 ID 列表 (含重复)
+        final List<Integer> currentIds = new ArrayList<Integer>();
+        try {
+            String s = currentJson.trim();
+            if (s.startsWith("[")) s = s.substring(1);
+            if (s.endsWith("]")) s = s.substring(0, s.length() - 1);
+            if (!s.isEmpty()) {
+                for (String part : s.split(",")) {
+                    part = part.trim();
+                    if (!part.isEmpty()) {
+                        int id = Integer.parseInt(part);
+                        if (id > 0) currentIds.add(id);
+                    }
+                }
+            }
+        } catch (Exception e) { /* ignore */ }
+
+        if (currentIds.isEmpty()) {
+            statusText.setText("\u26A0\uFE0F 当前没有卡牌");
+            return;
+        }
+
+        // 解析枚举名称映射
+        final java.util.Map<Integer, String> nameMap = new java.util.HashMap<Integer, String>();
+        try {
+            String ej = enumJson.trim();
+            if (ej.startsWith("[")) ej = ej.substring(1);
+            if (ej.endsWith("]")) ej = ej.substring(0, ej.length() - 1);
+            String[] parts = ej.split("\\},\\s*\\{");
+            for (String part : parts) {
+                part = part.replace("{", "").replace("}", "").trim();
+                if (part.isEmpty()) continue;
+                int id = 0; String name = "";
+                String[] fields = part.split(",");
+                for (String f : fields) {
+                    f = f.trim();
+                    if (f.startsWith("\"id\":")) {
+                        try { id = Integer.parseInt(f.substring(5).trim()); } catch (Exception e) {}
+                    } else if (f.startsWith("\"n\":")) {
+                        name = f.substring(4).trim();
+                        if (name.startsWith("\"")) name = name.substring(1);
+                        if (name.endsWith("\"")) name = name.substring(0, name.length() - 1);
+                        name = name.replace("\\\"", "\"").replace("\\\\", "\\");
+                    }
+                }
+                if (id > 0 && !name.isEmpty()) nameMap.put(id, name);
+            }
+        } catch (Exception e) { /* ignore */ }
+
+        // 统计每种卡牌数量 (保持插入顺序)
+        final java.util.Map<Integer, Integer> countMap = new java.util.LinkedHashMap<Integer, Integer>();
+        for (int id : currentIds) {
+            Integer c = countMap.get(id);
+            countMap.put(id, c == null ? 1 : c + 1);
+        }
+
+        final List<Integer> uniqueIds = new ArrayList<Integer>(countMap.keySet());
+        final int[] originalCounts = new int[uniqueIds.size()];
+        final int[] newCounts = new int[uniqueIds.size()];
+        for (int i = 0; i < uniqueIds.size(); i++) {
+            originalCounts[i] = countMap.get(uniqueIds.get(i));
+            newCounts[i] = originalCounts[i];
+        }
+
+        statusText.setText("\u2705 当前 " + currentIds.size() + " 张卡牌 (" + uniqueIds.size() + " 种)");
+
+        // 构建对话框
+        wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                       | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL;
+        try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+
+        LinearLayout dialogRoot = new LinearLayout(activity);
+        dialogRoot.setOrientation(LinearLayout.VERTICAL);
+        dialogRoot.setPadding(dp(8), dp(4), dp(8), dp(4));
+
+        // 标题信息
+        final TextView infoLabel = new TextView(activity);
+        infoLabel.setText("当前共 " + currentIds.size() + " 张卡牌 (" + uniqueIds.size() + " 种)");
+        infoLabel.setTextColor(0xFF333333);
+        infoLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        infoLabel.setPadding(dp(4), dp(2), 0, dp(4));
+        dialogRoot.addView(infoLabel);
+
+        // 搜索框
+        final EditText searchBox = new EditText(activity);
+        searchBox.setHint("\uD83D\uDD0D 搜索...");
+        searchBox.setTextColor(0xFF000000);
+        searchBox.setHintTextColor(0xFF999999);
+        searchBox.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        searchBox.setSingleLine(true);
+        searchBox.setPadding(dp(8), dp(4), dp(8), dp(4));
+        dialogRoot.addView(searchBox);
+
+        // 滚动列表
+        ScrollView sv = new ScrollView(activity);
+        sv.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(320)));
+
+        final LinearLayout listLayout = new LinearLayout(activity);
+        listLayout.setOrientation(LinearLayout.VERTICAL);
+        listLayout.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        final LinearLayout[] cardRows = new LinearLayout[uniqueIds.size()];
+        final List<String> displayNames = new ArrayList<String>();
+
+        for (int i = 0; i < uniqueIds.size(); i++) {
+            final int idx = i;
+            int cardId = uniqueIds.get(i);
+            String name = nameMap.containsKey(cardId) ? nameMap.get(cardId) : "???";
+            String label = "[" + cardId + "] " + name;
+            displayNames.add(label);
+
+            // 每行: 名称 | [-] 数量 [+] | [删]
+            LinearLayout row = new LinearLayout(activity);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rowLp.setMargins(0, dp(2), 0, dp(2));
+            row.setLayoutParams(rowLp);
+
+            // 卡牌名
+            TextView nameLabel = new TextView(activity);
+            nameLabel.setText(label);
+            nameLabel.setTextColor(0xFF222222);
+            nameLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            nameLabel.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            nameLabel.setSingleLine(true);
+            row.addView(nameLabel);
+
+            // [-] 按钮
+            Button minusBtn = new Button(activity);
+            minusBtn.setText("-");
+            minusBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            minusBtn.setTextColor(Color.WHITE);
+            minusBtn.setMinHeight(0); minusBtn.setMinimumHeight(0);
+            minusBtn.setPadding(dp(4), 0, dp(4), 0);
+            GradientDrawable mbg = new GradientDrawable();
+            mbg.setColor(0xFFDC2626); mbg.setCornerRadius(dp(4));
+            minusBtn.setBackground(mbg);
+            LinearLayout.LayoutParams mblp = new LinearLayout.LayoutParams(dp(28), dp(24));
+            mblp.setMargins(dp(2), 0, 0, 0);
+            minusBtn.setLayoutParams(mblp);
+            row.addView(minusBtn);
+
+            // 数量文本
+            final TextView countText = new TextView(activity);
+            countText.setText(String.valueOf(originalCounts[i]));
+            countText.setTextColor(0xFF000000);
+            countText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            countText.setGravity(Gravity.CENTER);
+            countText.setLayoutParams(new LinearLayout.LayoutParams(dp(28), ViewGroup.LayoutParams.WRAP_CONTENT));
+            row.addView(countText);
+
+            // [+] 按钮
+            Button plusBtn = new Button(activity);
+            plusBtn.setText("+");
+            plusBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            plusBtn.setTextColor(Color.WHITE);
+            plusBtn.setMinHeight(0); plusBtn.setMinimumHeight(0);
+            plusBtn.setPadding(dp(4), 0, dp(4), 0);
+            GradientDrawable pbg = new GradientDrawable();
+            pbg.setColor(0xFF16A34A); pbg.setCornerRadius(dp(4));
+            plusBtn.setBackground(pbg);
+            LinearLayout.LayoutParams pblp = new LinearLayout.LayoutParams(dp(28), dp(24));
+            pblp.setMargins(0, 0, dp(2), 0);
+            plusBtn.setLayoutParams(pblp);
+            row.addView(plusBtn);
+
+            minusBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    if (newCounts[idx] > 0) {
+                        newCounts[idx]--;
+                        countText.setText(String.valueOf(newCounts[idx]));
+                        if (newCounts[idx] != originalCounts[idx]) {
+                            countText.setTextColor(0xFFFF4444);
+                        } else {
+                            countText.setTextColor(0xFF000000);
+                        }
+                        updateCardInfoLabel(infoLabel, uniqueIds, newCounts);
+                    }
+                }
+            });
+            plusBtn.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    if (newCounts[idx] < 99) {
+                        newCounts[idx]++;
+                        countText.setText(String.valueOf(newCounts[idx]));
+                        if (newCounts[idx] != originalCounts[idx]) {
+                            countText.setTextColor(0xFFFF4444);
+                        } else {
+                            countText.setTextColor(0xFF000000);
+                        }
+                        updateCardInfoLabel(infoLabel, uniqueIds, newCounts);
+                    }
+                }
+            });
+
+            cardRows[i] = row;
+            listLayout.addView(row);
+        }
+
+        sv.addView(listLayout);
+        dialogRoot.addView(sv);
+
+        // 搜索过滤
+        searchBox.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {}
+            @Override
+            public void afterTextChanged(android.text.Editable s) {
+                String q = s.toString().toLowerCase().trim();
+                for (int i = 0; i < cardRows.length; i++) {
+                    boolean visible = q.isEmpty() || displayNames.get(i).toLowerCase().contains(q);
+                    cardRows[i].setVisibility(visible ? View.VISIBLE : View.GONE);
+                }
+            }
+        });
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(activity);
+        builder.setTitle("\uD83C\uDCCF 管理当前卡牌");
+        builder.setView(dialogRoot);
+        builder.setPositiveButton("\u2705 应用修改", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+
+                // 收集有变化的卡牌
+                final List<int[]> changes = new ArrayList<int[]>();
+                for (int i = 0; i < uniqueIds.size(); i++) {
+                    if (newCounts[i] != originalCounts[i]) {
+                        changes.add(new int[]{uniqueIds.get(i), newCounts[i]});
+                    }
+                }
+                if (changes.isEmpty()) {
+                    statusText.setText("未修改任何卡牌");
+                    return;
+                }
+
+                setBusy(true);
+                statusText.setText("\u23F3 应用 " + changes.size() + " 项修改...");
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        int ok = 0;
+                        for (int[] ch : changes) {
+                            String r = nativeSetCardCount(ch[0], ch[1]);
+                            if (r != null && r.contains("\u2705")) ok++;
+                        }
+                        final int fOk = ok;
+                        new Handler(Looper.getMainLooper()).post(new Runnable() {
+                            @Override
+                            public void run() {
+                                statusText.setText("\u2705 已修改 " + fOk + "/" + changes.size() + " 种卡牌");
+                                setBusy(false);
+                            }
+                        });
+                    }
+                }).start();
+            }
+        });
+        builder.setNegativeButton("关闭", new DialogInterface.OnClickListener() {
+            @Override
+            public void onClick(DialogInterface dialog, int which) {
+                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+            }
+        });
+        builder.setCancelable(true);
+        builder.setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override
+            public void onCancel(DialogInterface dialog) {
+                wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                try { wm.updateViewLayout(container, wmParams); } catch (Exception e) {}
+            }
+        });
+
+        try {
+            AlertDialog dlg = builder.create();
+            if (dlg.getWindow() != null) dlg.getWindow().setType(2);
+            dlg.show();
+        } catch (Exception e) {
+            statusText.setText("\u274C 无法显示对话框: " + e.getMessage());
+            wmParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+            try { wm.updateViewLayout(container, wmParams); } catch (Exception e2) {}
+        }
+    }
+
+    private void updateCardInfoLabel(TextView label, List<Integer> uniqueIds, int[] newCounts) {
+        int total = 0;
+        for (int c : newCounts) total += c;
+        int kinds = 0;
+        for (int c : newCounts) if (c > 0) kinds++;
+        label.setText("当前共 " + total + " 张卡牌 (" + kinds + " 种)");
     }
 
     // ===== 管理当前物品 (查看 + 删除) =====
@@ -1068,6 +1499,40 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         });
         dialogRoot.addView(selectAllBox);
 
+        // 卡牌类型: 添加数量输入
+        final EditText pickerCountInput;
+        if (itemType == ITEM_TYPE_CARD) {
+            LinearLayout cntRow = new LinearLayout(activity);
+            cntRow.setOrientation(LinearLayout.HORIZONTAL);
+            cntRow.setGravity(Gravity.CENTER_VERTICAL);
+            LinearLayout.LayoutParams cntlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            cntlp.setMargins(0, dp(2), 0, dp(2));
+            cntRow.setLayoutParams(cntlp);
+
+            TextView cntLabel = new TextView(activity);
+            cntLabel.setText("每种添加数量:");
+            cntLabel.setTextColor(0xFF555555);
+            cntLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            cntRow.addView(cntLabel);
+
+            pickerCountInput = new EditText(activity);
+            pickerCountInput.setText("1");
+            pickerCountInput.setTextColor(0xFF000000);
+            pickerCountInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            pickerCountInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+            pickerCountInput.setSingleLine(true);
+            pickerCountInput.setPadding(dp(6), dp(2), dp(6), dp(2));
+            LinearLayout.LayoutParams cilp = new LinearLayout.LayoutParams(dp(40), ViewGroup.LayoutParams.WRAP_CONTENT);
+            cilp.setMargins(dp(4), 0, 0, 0);
+            pickerCountInput.setLayoutParams(cilp);
+            cntRow.addView(pickerCountInput);
+
+            dialogRoot.addView(cntRow);
+        } else {
+            pickerCountInput = null;
+        }
+
         sv.addView(listLayout);
         dialogRoot.addView(sv);
 
@@ -1112,19 +1577,34 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
                     if (selected[i]) toAdd.add(ids.get(i)[0]);
                 }
 
+                // 卡牌: 支持每种添加多张
+                final int perCount;
+                if (pickerCountInput != null) {
+                    int pc = 1;
+                    try { pc = Integer.parseInt(pickerCountInput.getText().toString().trim()); }
+                    catch (Exception e) { pc = 1; }
+                    if (pc < 1) pc = 1; if (pc > 99) pc = 99;
+                    perCount = pc;
+                } else {
+                    perCount = 1;
+                }
+
                 setBusy(true);
-                statusText.setText("\u23F3 添加 " + toAdd.size() + " 个" + title + "...");
+                final int totalItems = toAdd.size() * perCount;
+                statusText.setText("\u23F3 添加 " + totalItems + " 个" + title + "...");
                 new Thread(new Runnable() {
                     @Override
                     public void run() {
                         int ok = 0;
                         for (int itemId : toAdd) {
-                            try {
-                                java.lang.reflect.Method m = OverlayMenu.class.getDeclaredMethod(
-                                        nativeAddMethod, int.class);
-                                m.invoke(null, itemId);
-                                ok++;
-                            } catch (Exception e) { /* skip */ }
+                            for (int n = 0; n < perCount; n++) {
+                                try {
+                                    java.lang.reflect.Method m = OverlayMenu.class.getDeclaredMethod(
+                                            nativeAddMethod, int.class);
+                                    m.invoke(null, itemId);
+                                    ok++;
+                                } catch (Exception e) { /* skip */ }
+                            }
                         }
                         final int fOk = ok;
                         new Handler(Looper.getMainLooper()).post(new Runnable() {

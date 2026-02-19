@@ -1309,6 +1309,12 @@ static int find_proto_login_instance(void) {
     parse_maps();
     install_sigsegv_handler();
 
+    // 辅助宏：指针有效性检查
+    // BAD_PTR: 非NULL且太小（不可能是堆地址）
+    // UNALIGNED_PTR: 非NULL且未8字节对齐（C#对象指针必须对齐）
+    #define BAD_PTR(v) ((v) != 0 && (v) < 0x10000)
+    #define UNALIGNED_PTR(v) ((v) != 0 && ((v) & 0x7) != 0)
+
     for (int r = 0; r < g_region_count && !g_proto_login_inst; r++) {
         MemRegion *region = &g_regions[r];
         if (!region->readable || !region->writable) continue;
@@ -1325,29 +1331,68 @@ static int find_proto_login_instance(void) {
             if (*p != klass_val) { g_in_safe_access = 0; continue; }
 
             uintptr_t obj = (uintptr_t)(base + off);
-            // 验证 monitor (+8)
+
+            // 验证 monitor (+8): 真实 ProtoLogin 的 monitor 通常为 0
             uintptr_t monitor = *(volatile uintptr_t *)(obj + 8);
             if (monitor != 0 && monitor < 0x10000) { g_in_safe_access = 0; continue; }
 
-            // 严格验证：ProtoLogin 实例字段都是指针/bool
-            // 偏移 48,56,64,72,80,88,96,104,112,120,128 应为 NULL 或有效指针
-            uintptr_t mLoginData  = *(volatile uintptr_t *)(obj + 48);
-            uintptr_t mRestore    = *(volatile uintptr_t *)(obj + 56);
-            uintptr_t mDLCSet     = *(volatile uintptr_t *)(obj + 64);
-            uintptr_t mDLCSetInfo = *(volatile uintptr_t *)(obj + 72);
-            uintptr_t mProd2DLC   = *(volatile uintptr_t *)(obj + 80);
-            uintptr_t baseRoles   = *(volatile uintptr_t *)(obj + 88);
+            // 验证 0x10-0x28 区域: ProtoLogin 的实例字段从 0x30 开始
+            // 0x10-0x28 应该全为 0 或只有很小的值（如 hash code）
+            // 真实实例: [+0x10]=0, [+0x20]=0, [+0x28]=0
+            // 假阳性: [+0x10]=0x722bf0b988 (非零堆指针 → 明显是假的)
+            uintptr_t v10 = *(volatile uintptr_t *)(obj + 0x10);
+            uintptr_t v20 = *(volatile uintptr_t *)(obj + 0x20);
+            uintptr_t v28 = *(volatile uintptr_t *)(obj + 0x28);
+            if (v10 > 0x100000 || v20 > 0x100000 || v28 > 0x100000) {
+                g_in_safe_access = 0;
+                continue; // 字段0x10-0x28有大值 → 不是ProtoLogin
+            }
+
+            // 读取关键字段
+            uintptr_t mLoginData  = *(volatile uintptr_t *)(obj + 0x30);
+            uintptr_t mRestore    = *(volatile uintptr_t *)(obj + 0x38);
+            uintptr_t mDLCSet     = *(volatile uintptr_t *)(obj + 0x40);
+            uintptr_t mDLCSetInfo = *(volatile uintptr_t *)(obj + 0x48);
+            uintptr_t mProd2DLC   = *(volatile uintptr_t *)(obj + 0x50);
+            uintptr_t baseRoles   = *(volatile uintptr_t *)(obj + 0x58);
+            uintptr_t packAll     = *(volatile uintptr_t *)(obj + 0x60);
             g_in_safe_access = 0;
 
-            // 每个指针字段必须是 NULL 或有效堆地址 (>= 0x10000)
-            #define BAD_PTR(v) ((v) != 0 && (v) < 0x10000)
+            // 检查1: 指针值合法性（非NULL时必须是有效堆地址）
             if (BAD_PTR(mLoginData) || BAD_PTR(mRestore) || BAD_PTR(mDLCSet) ||
                 BAD_PTR(mDLCSetInfo) || BAD_PTR(mProd2DLC) || BAD_PTR(baseRoles)) {
-                continue; // 有非法指针值，false positive
+                continue;
             }
-            #undef BAD_PTR
 
-            // 至少 2 个指针字段非空（已初始化的 ProtoLogin 应有数据）
+            // 检查2: 指针对齐性（C#对象引用必须8字节对齐）
+            // 假阳性特征: mRestore=0x...26b, mDLCSetInfo=0x...11e 等非对齐地址
+            if (UNALIGNED_PTR(mRestore) || UNALIGNED_PTR(mDLCSetInfo) || 
+                UNALIGNED_PTR(mProd2DLC)) {
+                continue; // 有未对齐指针 → 假阳性
+            }
+
+            // 检查3: mDLCSet != BaseRoles（假阳性中常出现两者相同）
+            if (mDLCSet != 0 && baseRoles != 0 && mDLCSet == baseRoles) {
+                candidates++;
+                LOGW("[dlc] Candidate #%d @ 0x%" PRIxPTR
+                     " rejected: mDLCSet==BaseRoles==%p (false positive)",
+                     candidates, obj, (void*)mDLCSet);
+                continue;
+            }
+
+            // 检查4: mLoginData 不应指向对象自身附近（假阳性特征）
+            if (mLoginData != 0) {
+                int64_t delta = (int64_t)mLoginData - (int64_t)obj;
+                if (delta >= 0 && delta < 0x200) {
+                    candidates++;
+                    LOGW("[dlc] Candidate #%d @ 0x%" PRIxPTR
+                         " rejected: mLoginData self-referencing (delta=0x%" PRIx64 ")",
+                         candidates, obj, (uint64_t)delta);
+                    continue;
+                }
+            }
+
+            // 至少需要 mLoginData 或 baseRoles 非空（ProtoLogin 初始化标志）
             int non_null = 0;
             if (mLoginData)  non_null++;
             if (mRestore)    non_null++;
@@ -1358,19 +1403,22 @@ static int find_proto_login_instance(void) {
 
             candidates++;
             LOGI("[dlc] ProtoLogin candidate #%d @ 0x%" PRIxPTR
-                 ": mDLCSet=%p, BaseRoles=%p, mLoginData=%p, non_null=%d",
+                 ": mDLCSet=%p, BaseRoles=%p, mLoginData=%p, packAll=%p, non_null=%d",
                  candidates, obj, (void*)mDLCSet, (void*)baseRoles,
-                 (void*)mLoginData, non_null);
+                 (void*)mLoginData, (void*)packAll, non_null);
 
-            if (non_null < 2) {
-                LOGW("[dlc]   Rejected: too few non-null fields (%d)", non_null);
-                continue; // ProtoLogin 未初始化或 false positive
+            // 需要至少 mLoginData 或 (baseRoles+packAll) 有值
+            if (non_null < 1 || (!mLoginData && !baseRoles)) {
+                LOGW("[dlc]   Rejected: insufficient initialization (non_null=%d)", non_null);
+                continue;
             }
 
             g_proto_login_inst = obj;
             break;
         }
     }
+    #undef BAD_PTR
+    #undef UNALIGNED_PTR
     uninstall_sigsegv_handler();
 
     if (g_proto_login_inst) {
@@ -1381,28 +1429,12 @@ static int find_proto_login_instance(void) {
     return g_proto_login_inst != 0;
 }
 
-// 诊断：dump MethodInfo 结构（用于分析 HybridCLR 内部布局）
-static void dump_method_info(const char *label, Il2CppMethodInfo m) {
-    if (!m) return;
-    uint64_t *p = (uint64_t *)m;
-    LOGI("[dlc-diag] MethodInfo '%s' @ %p:", label, m);
-    for (int i = 0; i < 12; i++) {
-        install_sigsegv_handler();
-        g_in_safe_access = 1;
-        if (sigsetjmp(g_jmpbuf, 1) != 0) {
-            g_in_safe_access = 0;
-            uninstall_sigsegv_handler();
-            LOGI("[dlc-diag]   [+%02x] <unreadable>", i * 8);
-            continue;
-        }
-        uint64_t val = p[i];
-        g_in_safe_access = 0;
-        uninstall_sigsegv_handler();
-        LOGI("[dlc-diag]   [+%02x] 0x%016" PRIx64, i * 8, val);
-    }
-}
+// DLC 解锁: 是否已输出过详细日志（避免每次调用都输出几百行）
+static volatile int g_dlc_verbose_logged = 0;
+// DLC 后台持续解锁标记
+static volatile int g_dlc_unlocked = 0;
 
-// 主 DLC 解锁函数
+// 主 DLC 解锁函数 (v2: 修复 SIGSEGV 误报, 增强实例验证)
 static int do_unlock_all_dlc(void) {
     if (init_il2cpp_context() != 0) return -1;
 
@@ -1413,12 +1445,11 @@ static int do_unlock_all_dlc(void) {
 
     // 关键：当前线程可能不是 il2cpp 主线程，必须先 attach
     if (fn_thread_attach && g_domain) {
-        LOGI("[dlc] Attaching current thread to il2cpp runtime...");
         fn_thread_attach(g_domain);
         LOGI("[dlc] Thread attached OK");
     }
 
-    // ===== 0) 枚举 ProtoLogin 和 UserInfo 的所有方法/字段（诊断）=====
+    // ===== 0) 枚举方法/字段（仅首次）=====
     if (!g_proto_login_cls) {
         g_proto_login_cls = fn_class_from_name(g_csharp_image, "", "ProtoLogin");
     }
@@ -1427,51 +1458,46 @@ static int do_unlock_all_dlc(void) {
         return -1;
     }
 
-    LOGI("[dlc] ===== ProtoLogin class diagnostics =====");
-
-    // 枚举所有方法
-    if (fn_class_get_methods && fn_method_get_name && fn_method_get_param_count) {
-        void *iter = NULL;
-        Il2CppMethodInfo m;
-        int method_count = 0;
-        while ((m = fn_class_get_methods(g_proto_login_cls, &iter)) != NULL) {
-            const char *name = fn_method_get_name(m);
-            int params = fn_method_get_param_count(m);
-            uintptr_t methodPtr = *(uintptr_t *)m;
-            LOGI("[dlc-enum] Method: %s(%d params) ptr=%p MethodInfo=%p", 
-                 name ? name : "?", params, (void*)methodPtr, m);
-            method_count++;
-        }
-        LOGI("[dlc-enum] Total methods: %d", method_count);
-    }
-
-    // 枚举所有字段
-    if (fn_class_get_fields && fn_field_get_name && fn_field_get_offset) {
-        void *iter = NULL;
-        Il2CppFieldInfo f;
-        int field_count = 0;
-        while ((f = fn_class_get_fields(g_proto_login_cls, &iter)) != NULL) {
-            const char *name = fn_field_get_name(f);
-            int offset = fn_field_get_offset(f);
-            LOGI("[dlc-enum] Field: %s @ offset 0x%x", name ? name : "?", offset);
-            field_count++;
-        }
-        LOGI("[dlc-enum] Total fields: %d", field_count);
-    }
-
-    // 也枚举 UserInfo 的方法（了解 IsDLCRole/IsBaseRole 逻辑）
-    Il2CppClass ui_class = fn_class_from_name(g_csharp_image, "", "UserInfo");
-    if (ui_class && fn_class_get_methods && fn_method_get_name) {
-        LOGI("[dlc-enum] ===== UserInfo methods =====");
-        void *iter = NULL;
-        Il2CppMethodInfo m;
-        while ((m = fn_class_get_methods(ui_class, &iter)) != NULL) {
-            const char *name = fn_method_get_name(m);
-            int params = fn_method_get_param_count(m);
-            // 只记录 DLC/Role 相关方法
-            if (name && (strstr(name, "DLC") || strstr(name, "Role") || strstr(name, "Lock") || strstr(name, "lock") || strstr(name, "Base"))) {
+    // 仅首次输出详细枚举信息
+    int verbose = !g_dlc_verbose_logged;
+    if (verbose) {
+        g_dlc_verbose_logged = 1;
+        LOGI("[dlc] ===== ProtoLogin class diagnostics =====");
+        if (fn_class_get_methods && fn_method_get_name && fn_method_get_param_count) {
+            void *iter = NULL;
+            Il2CppMethodInfo m;
+            int method_count = 0;
+            while ((m = fn_class_get_methods(g_proto_login_cls, &iter)) != NULL) {
+                const char *name = fn_method_get_name(m);
+                int params = fn_method_get_param_count(m);
                 uintptr_t methodPtr = *(uintptr_t *)m;
-                LOGI("[dlc-enum] UserInfo.%s(%d) ptr=%p MI=%p", name, params, (void*)methodPtr, m);
+                LOGI("[dlc-enum] Method: %s(%d params) ptr=%p MI=%p", 
+                     name ? name : "?", params, (void*)methodPtr, m);
+                method_count++;
+            }
+            LOGI("[dlc-enum] Total methods: %d", method_count);
+        }
+        if (fn_class_get_fields && fn_field_get_name && fn_field_get_offset) {
+            void *iter = NULL;
+            Il2CppFieldInfo f;
+            while ((f = fn_class_get_fields(g_proto_login_cls, &iter)) != NULL) {
+                const char *name = fn_field_get_name(f);
+                int offset = fn_field_get_offset(f);
+                LOGI("[dlc-enum] Field: %s @ offset 0x%x", name ? name : "?", offset);
+            }
+        }
+        // UserInfo DLC 相关方法
+        Il2CppClass ui_class = fn_class_from_name(g_csharp_image, "", "UserInfo");
+        if (ui_class && fn_class_get_methods && fn_method_get_name) {
+            void *iter = NULL;
+            Il2CppMethodInfo m;
+            while ((m = fn_class_get_methods(ui_class, &iter)) != NULL) {
+                const char *name = fn_method_get_name(m);
+                if (name && (strstr(name, "DLC") || strstr(name, "Role") || strstr(name, "Lock") || strstr(name, "lock") || strstr(name, "Base"))) {
+                    int params = fn_method_get_param_count(m);
+                    uintptr_t methodPtr = *(uintptr_t *)m;
+                    LOGI("[dlc-enum] UserInfo.%s(%d) ptr=%p MI=%p", name, params, (void*)methodPtr, m);
+                }
             }
         }
     }
@@ -1482,54 +1508,29 @@ static int do_unlock_all_dlc(void) {
         return -2;
     }
 
-    // ===== 2) Dump 实例的前 20 个 qword =====
-    LOGI("[dlc] === ProtoLogin instance dump (@ 0x%" PRIxPTR ") ===", g_proto_login_inst);
-    install_sigsegv_handler();
-    g_in_safe_access = 1;
-    if (sigsetjmp(g_jmpbuf, 1) == 0) {
-        for (int i = 0; i < 20; i++) {
-            uintptr_t val = *(volatile uintptr_t *)(g_proto_login_inst + i * 8);
-            LOGI("[dlc]   [+0x%02x] = 0x%" PRIxPTR, i * 8, val);
-        }
-    }
-    g_in_safe_access = 0;
-    uninstall_sigsegv_handler();
-
-    // ===== 3) 获取所有需要的方法 =====
+    // ===== 2) 获取方法 =====
     Il2CppMethodInfo m_addDLC     = fn_class_get_method_from_name(g_proto_login_cls, "AddDLC", 1);
-    Il2CppMethodInfo m_getDLCId   = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCId", 1);
-    Il2CppMethodInfo m_getDLCs    = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCs", 0);
     Il2CppMethodInfo m_isUnlock   = fn_class_get_method_from_name(g_proto_login_cls, "isUnlockRole", 1);
     Il2CppMethodInfo m_isDLCRole  = fn_class_get_method_from_name(g_proto_login_cls, "IsDLCRole", 1);
-    Il2CppMethodInfo m_isBaseRole = fn_class_get_method_from_name(g_proto_login_cls, "IsBaseRole", 1);
-    Il2CppMethodInfo m_initDLC    = fn_class_get_method_from_name(g_proto_login_cls, "InitDLC", 0);
-    // 尝试找 set_mDLCSet 或 InitLogin 等初始化方法
-    Il2CppMethodInfo m_init0      = fn_class_get_method_from_name(g_proto_login_cls, "Init", 0);
-    Il2CppMethodInfo m_init1      = fn_class_get_method_from_name(g_proto_login_cls, "Init", 1);
-    Il2CppMethodInfo m_setDLC     = fn_class_get_method_from_name(g_proto_login_cls, "set_mDLCSet", 1);
-    Il2CppMethodInfo m_clearDLC   = fn_class_get_method_from_name(g_proto_login_cls, "ClearDLC", 0);
-
-    LOGI("[dlc] Methods found: AddDLC=%p GetDLCId=%p getDLCs=%p isUnlock=%p isDLCRole=%p isBaseRole=%p",
-         m_addDLC, m_getDLCId, m_getDLCs, m_isUnlock, m_isDLCRole, m_isBaseRole);
-    LOGI("[dlc] Init methods: InitDLC=%p Init0=%p Init1=%p setDLC=%p clearDLC=%p",
-         m_initDLC, m_init0, m_init1, m_setDLC, m_clearDLC);
-
-    // Dump 关键 MethodInfo 结构
-    if (m_isUnlock)  dump_method_info("isUnlockRole", m_isUnlock);
-    if (m_isDLCRole) dump_method_info("IsDLCRole", m_isDLCRole);
-    if (m_isBaseRole) dump_method_info("IsBaseRole", m_isBaseRole);
-    if (m_addDLC)    dump_method_info("AddDLC", m_addDLC);
+    
+    if (!m_addDLC || !m_isUnlock) {
+        LOGE("[dlc] Essential methods not found: AddDLC=%p isUnlock=%p", m_addDLC, m_isUnlock);
+        return -1;
+    }
+    LOGI("[dlc] Methods: AddDLC=%p isUnlock=%p isDLCRole=%p", m_addDLC, m_isUnlock, m_isDLCRole);
 
     void *exc = NULL;
+    volatile int sigsegv_hit = 0; // 追踪 SIGSEGV 是否发生
 
-    // 安全调用宏
+    // 安全调用宏 - 修复版: 正确追踪 SIGSEGV
     #define SAFE_INVOKE(result_var, method, obj, params, exc_ptr) do { \
+        sigsegv_hit = 0; \
         install_sigsegv_handler(); \
         g_in_safe_access = 1; \
         if (sigsetjmp(g_jmpbuf, 1) != 0) { \
             g_in_safe_access = 0; \
             uninstall_sigsegv_handler(); \
-            LOGW("[dlc] SIGSEGV in runtime_invoke, skipping"); \
+            sigsegv_hit = 1; \
             result_var = NULL; \
         } else { \
             result_var = fn_runtime_invoke(method, obj, params, (void **)exc_ptr); \
@@ -1540,7 +1541,7 @@ static int do_unlock_all_dlc(void) {
 
     #define SAFE_UNBOX_INT(result, boxed, default_val) do { \
         result = default_val; \
-        if (boxed) { \
+        if (boxed && !sigsegv_hit) { \
             install_sigsegv_handler(); \
             g_in_safe_access = 1; \
             if (sigsetjmp(g_jmpbuf, 1) == 0) { \
@@ -1551,37 +1552,40 @@ static int do_unlock_all_dlc(void) {
         } \
     } while(0)
 
-    // ===== 4) 测试 runtime_invoke 是否触发 hook =====
-    // 调用已 hook 的 ProtoLogin.IsDLCRole(0)，看 hook 是否触发（日志会显示 "[bypass]"）
-    if (m_isDLCRole) {
-        LOGI("[dlc] Testing runtime_invoke on hooked IsDLCRole(0)...");
+    // ===== 3) 验证实例: 调用 isUnlockRole(0) 测试是否 SIGSEGV =====
+    {
         int32_t test_rid = 0;
         void *params[1] = { &test_rid };
         exc = NULL;
         void *result = NULL;
-        SAFE_INVOKE(result, m_isDLCRole, (void *)g_proto_login_inst, params, &exc);
+        SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
+        if (sigsegv_hit) {
+            LOGW("[dlc] SIGSEGV calling isUnlockRole(0) - instance @ 0x%" PRIxPTR " is INVALID, discarding",
+                 g_proto_login_inst);
+            g_proto_login_inst = 0; // 丢弃此实例，下次重新扫描
+            #undef SAFE_INVOKE
+            #undef SAFE_UNBOX_INT
+            return -3; // 特殊返回值: 实例无效
+        }
         int val = -1;
         SAFE_UNBOX_INT(val, result, -1);
-        LOGI("[dlc] IsDLCRole(0) via runtime_invoke = %d (if hook worked, should be 0 with [bypass] log)", val);
+        LOGI("[dlc] Instance validation: isUnlockRole(0) = %d (valid!)", val);
     }
 
-    // ===== 5) 检查 mDLCSet 状态 =====
+    // ===== 4) 检查 mDLCSet 状态 =====
     uintptr_t mDLCSet = 0;
     install_sigsegv_handler();
     g_in_safe_access = 1;
     if (sigsetjmp(g_jmpbuf, 1) == 0) {
-        mDLCSet = *(volatile uintptr_t *)(g_proto_login_inst + 64);
+        mDLCSet = *(volatile uintptr_t *)(g_proto_login_inst + 0x40);
     }
     g_in_safe_access = 0;
     uninstall_sigsegv_handler();
-
     LOGI("[dlc] mDLCSet = %p", (void*)mDLCSet);
 
-    // ===== 6) 如果 mDLCSet=NULL，尝试用 packAll 的 klass 创建 HashSet<int> =====
+    // ===== 5) 如果 mDLCSet=NULL，用 packAll 的 klass 创建 HashSet<int> =====
     if (mDLCSet == 0 && fn_object_new) {
-        LOGI("[dlc] mDLCSet is NULL, attempting to create HashSet<int> from packAll klass...");
-        
-        // 读取 packAll (offset 0x60) 的 klass — packAll 应该是 HashSet<int> 类型
+        LOGI("[dlc] mDLCSet is NULL, creating HashSet<int>...");
         uintptr_t packAll = 0;
         install_sigsegv_handler();
         g_in_safe_access = 1;
@@ -1592,7 +1596,6 @@ static int do_unlock_all_dlc(void) {
         uninstall_sigsegv_handler();
         
         if (packAll) {
-            // 读取 packAll 对象的 klass
             uintptr_t hashset_klass = 0;
             install_sigsegv_handler();
             g_in_safe_access = 1;
@@ -1605,181 +1608,119 @@ static int do_unlock_all_dlc(void) {
             LOGI("[dlc] packAll=%p, klass=%p", (void*)packAll, (void*)hashset_klass);
             
             if (hashset_klass) {
-                // 用 il2cpp_object_new 创建新的 HashSet<int> 实例
                 Il2CppObject newSet = fn_object_new((Il2CppClass)hashset_klass);
-                LOGI("[dlc] Created new HashSet<int> @ %p", newSet);
-                
                 if (newSet) {
-                    // 调用 .ctor() 初始化 HashSet
                     Il2CppMethodInfo ctor = fn_class_get_method_from_name(
                         (Il2CppClass)hashset_klass, ".ctor", 0);
                     if (ctor) {
-                        LOGI("[dlc] HashSet .ctor found @ %p, calling...", ctor);
                         void *ctor_result = NULL;
                         SAFE_INVOKE(ctor_result, ctor, newSet, NULL, &exc);
-                        LOGI("[dlc] HashSet .ctor() called, exc=%p", exc);
-                    } else {
-                        LOGI("[dlc] HashSet .ctor not found, object may still be usable");
+                        if (sigsegv_hit) {
+                            LOGW("[dlc] HashSet .ctor() SIGSEGV");
+                        } else {
+                            LOGI("[dlc] HashSet .ctor() OK, new HashSet @ %p", newSet);
+                        }
                     }
                     
-                    // 将新 HashSet 写入 ProtoLogin.mDLCSet (offset 0x40)
+                    // 写入 mDLCSet
                     install_sigsegv_handler();
                     g_in_safe_access = 1;
                     if (sigsetjmp(g_jmpbuf, 1) == 0) {
                         *(volatile uintptr_t *)(g_proto_login_inst + 0x40) = (uintptr_t)newSet;
                         mDLCSet = (uintptr_t)newSet;
-                        LOGI("[dlc] Assigned new HashSet to mDLCSet @ +0x40");
+                        LOGI("[dlc] Assigned new HashSet to mDLCSet");
                     }
                     g_in_safe_access = 0;
                     uninstall_sigsegv_handler();
-                    
-                    // 验证写入
-                    uintptr_t verify = 0;
-                    install_sigsegv_handler();
-                    g_in_safe_access = 1;
-                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                        verify = *(volatile uintptr_t *)(g_proto_login_inst + 0x40);
-                    }
-                    g_in_safe_access = 0;
-                    uninstall_sigsegv_handler();
-                    LOGI("[dlc] mDLCSet verification: %p (expected %p)", 
-                         (void*)verify, newSet);
                 }
             }
         } else {
-            LOGW("[dlc] packAll is also NULL, cannot determine HashSet<int> klass");
+            LOGW("[dlc] packAll is NULL, cannot create HashSet");
         }
     }
 
-    // ===== 7) 先检查当前解锁状态 =====
-    LOGI("[dlc] === Current role unlock status ===");
+    // ===== 6) 先检查当前解锁状态 =====
+    int all_unlocked = 1;
     if (m_isUnlock) {
+        LOGI("[dlc] === Before AddDLC ===");
         for (int32_t rid = 0; rid <= 15; rid++) {
             void *params[1] = { &rid };
             exc = NULL;
             void *result = NULL;
             SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
             int unlocked = -1;
-            if (result) { SAFE_UNBOX_INT(unlocked, result, -1); }
-            LOGI("[dlc]   isUnlockRole(%d) = %d", rid, unlocked);
+            if (!sigsegv_hit && result) { SAFE_UNBOX_INT(unlocked, result, -1); }
+            if (unlocked != 1) all_unlocked = 0;
+            if (verbose || unlocked != 0) {
+                LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
+                     sigsegv_hit ? " (SIGSEGV!)" : unlocked > 0 ? " (unlocked)" : "");
+            }
+        }
+        if (!verbose && all_unlocked) {
+            LOGI("[dlc] All roles already unlocked");
         }
     }
 
-    // 也测试 IsBaseRole
-    if (m_isBaseRole) {
-        LOGI("[dlc] === IsBaseRole check ===");
-        for (int32_t rid = 0; rid <= 15; rid++) {
-            void *params[1] = { &rid };
-            exc = NULL;
-            void *result = NULL;
-            SAFE_INVOKE(result, m_isBaseRole, (void *)g_proto_login_inst, params, &exc);
-            int val = -1;
-            if (result) { SAFE_UNBOX_INT(val, result, -1); }
-            LOGI("[dlc]   IsBaseRole(%d) = %d", rid, val);
-        }
-    }
-
-    // ===== 8) 尝试 AddDLC =====
+    // ===== 7) 调用 AddDLC =====
     int added = 0;
+    int add_failed = 0;
     if (mDLCSet != 0 && m_addDLC) {
-        LOGI("[dlc] mDLCSet is initialized (%p), calling AddDLC...", (void*)mDLCSet);
-        for (int32_t dlcId = 1; dlcId <= 20; dlcId++) {
+        LOGI("[dlc] Calling AddDLC(1-50)...");
+        for (int32_t dlcId = 1; dlcId <= 50; dlcId++) {
             void *params[1] = { &dlcId };
             exc = NULL;
             void *result = NULL;
             SAFE_INVOKE(result, m_addDLC, (void *)g_proto_login_inst, params, &exc);
-            if (!exc) {
-                LOGI("[dlc] AddDLC(%d) OK", dlcId);
-                added++;
+            if (sigsegv_hit) {
+                LOGW("[dlc] AddDLC(%d) SIGSEGV! Instance may be invalid", dlcId);
+                add_failed++;
+                if (add_failed >= 3) {
+                    LOGE("[dlc] Too many SIGSEGV, aborting AddDLC. Instance invalidated.");
+                    g_proto_login_inst = 0;
+                    break;
+                }
+            } else if (exc) {
+                // exception 不一定是错 — 可能 DLC ID 超范围
+                if (verbose) LOGW("[dlc] AddDLC(%d) exception (might be out of range)", dlcId);
             } else {
-                LOGW("[dlc] AddDLC(%d) exception", dlcId);
+                added++;
             }
         }
+        LOGI("[dlc] AddDLC: %d succeeded, %d SIGSEGV", added, add_failed);
         
-        // 验证：再次检查解锁状态
-        LOGI("[dlc] === After AddDLC (added %d) ===", added);
-        if (m_isUnlock) {
+        // ===== 8) 验证解锁状态 =====
+        if (added > 0 && m_isUnlock) {
+            LOGI("[dlc] === After AddDLC ===");
+            int unlocked_count = 0;
             for (int32_t rid = 0; rid <= 15; rid++) {
                 void *params[1] = { &rid };
                 exc = NULL;
                 void *result = NULL;
                 SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
                 int unlocked = -1;
-                if (result) { SAFE_UNBOX_INT(unlocked, result, -1); }
-                LOGI("[dlc]   isUnlockRole(%d) = %d %s", rid, unlocked,
-                     unlocked > 0 ? "(UNLOCKED!)" : "(locked)");
+                if (!sigsegv_hit && result) { SAFE_UNBOX_INT(unlocked, result, -1); }
+                LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
+                     sigsegv_hit ? " (SIGSEGV!)" : unlocked > 0 ? " ✓UNLOCKED" : " ✗locked");
+                if (unlocked > 0) unlocked_count++;
+            }
+            LOGI("[dlc] Result: %d/16 roles unlocked", unlocked_count);
+            if (unlocked_count >= 15) {
+                g_dlc_unlocked = 1;
+                LOGI("[dlc] ★ DLC unlock SUCCESS! Please re-enter role selection screen.");
             }
         }
     } else if (mDLCSet == 0) {
-        LOGW("[dlc] mDLCSet is NULL - AddDLC would crash, skipping");
-        LOGI("[dlc] Will try BaseRoles manipulation instead...");
-
-        // ===== 9) 尝试读取 BaseRoles 的内容 =====
-        uintptr_t baseRoles = 0;
-        install_sigsegv_handler();
-        g_in_safe_access = 1;
-        if (sigsetjmp(g_jmpbuf, 1) == 0) {
-            baseRoles = *(volatile uintptr_t *)(g_proto_login_inst + 0x58); // BaseRoles @ offset 0x58
-        }
-        g_in_safe_access = 0;
-        uninstall_sigsegv_handler();
-
-        if (baseRoles) {
-            LOGI("[dlc] BaseRoles @ %p - dumping List<int> structure...", (void*)baseRoles);
-            // List<int> 布局:
-            //   [+00] klass
-            //   [+08] monitor
-            //   [+10] int[] _items  (System.Int32[])
-            //   [+18] int _size
-            //   [+1c] int _version
-            install_sigsegv_handler();
-            g_in_safe_access = 1;
-            if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                uintptr_t br_klass = *(volatile uintptr_t *)(baseRoles);
-                uintptr_t br_items = *(volatile uintptr_t *)(baseRoles + 0x10);
-                int32_t br_size    = *(volatile int32_t *)(baseRoles + 0x18);
-                LOGI("[dlc] BaseRoles: klass=%p items=%p size=%d", 
-                     (void*)br_klass, (void*)br_items, br_size);
-                
-                // Dump items
-                if (br_items && br_size > 0 && br_size < 100) {
-                    // int[] 布局: [+00] klass, [+08] monitor, [+10] max_length, [+14..] int data[]
-                    int32_t max_len = *(volatile int32_t *)(br_items + 0x10);
-                    // 在 il2cpp 中 Array 布局可能是: klass(8) + monitor(8) + bounds(8) + max_length(8) + data
-                    // 或者: klass(8) + monitor(8) + max_length(4, aligned to 8) + data
-                    // Unity il2cpp: Il2CppArray = { Il2CppObject obj; Il2CppArrayBounds *bounds; il2cpp_array_size_t max_length; ... }
-                    // 在 64 位上: obj=16, bounds=8, max_length=8 => data starts at +32 (0x20)
-                    LOGI("[dlc] BaseRoles items array: max_length from +0x18=%d", 
-                         *(volatile int32_t *)(br_items + 0x18));
-                    LOGI("[dlc] BaseRoles items array dump:");
-                    for (int i = 0; i < 8; i++) {
-                        uintptr_t qw = *(volatile uintptr_t *)(br_items + i * 8);
-                        LOGI("[dlc]   items[+0x%02x] = 0x%" PRIxPTR, i * 8, qw);
-                    }
-                    
-                    // 尝试读取从 offset 0x20 开始的 int32 数组数据
-                    LOGI("[dlc] BaseRoles actual values (from +0x20):");
-                    int count = br_size < 20 ? br_size : 20;
-                    for (int i = 0; i < count; i++) {
-                        int32_t val = *(volatile int32_t *)(br_items + 0x20 + i * 4);
-                        LOGI("[dlc]   BaseRoles[%d] = %d", i, val);
-                    }
-                }
-            }
-            g_in_safe_access = 0;
-            uninstall_sigsegv_handler();
-        }
+        LOGW("[dlc] mDLCSet still NULL, cannot AddDLC");
     }
 
-    // ===== 10) 最终状态 =====
-    LOGI("[dlc] === Final state ===");
+    // ===== 9) 最终状态 =====
     install_sigsegv_handler();
     g_in_safe_access = 1;
     if (sigsetjmp(g_jmpbuf, 1) == 0) {
         uintptr_t final_mDLCSet   = *(volatile uintptr_t *)(g_proto_login_inst + 0x40);
         uintptr_t final_baseRoles = *(volatile uintptr_t *)(g_proto_login_inst + 0x58);
         uintptr_t final_packAll   = *(volatile uintptr_t *)(g_proto_login_inst + 0x60);
-        LOGI("[dlc] mDLCSet=%p, BaseRoles=%p, packAll=%p", 
+        LOGI("[dlc] Final: mDLCSet=%p BaseRoles=%p packAll=%p", 
              (void*)final_mDLCSet, (void*)final_baseRoles, (void*)final_packAll);
     }
     g_in_safe_access = 0;
@@ -1788,7 +1729,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock diagnostics complete =====");
+    LOGI("[dlc] ===== DLC unlock complete (added=%d) =====", added);
     return added;
 }
 
@@ -3932,11 +3873,13 @@ static jstring JNICALL jni_unlock_dlc(JNIEnv *env, jclass clazz) {
     pthread_mutex_unlock(&g_hack_mutex);
     char buf[256];
     if (result > 0)
-        snprintf(buf, sizeof(buf), "\u2705 DLC解锁完成: 已添加 %d 个DLC，请返回角色选择界面查看", result);
+        snprintf(buf, sizeof(buf), "\u2705 DLC解锁完成: 已添加 %d 个DLC\n请【返回主菜单】重新进入角色选择界面", result);
     else if (result == -2)
         snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到 ProtoLogin 实例(请先进入主菜单)");
+    else if (result == -3)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F ProtoLogin 实例无效(SIGSEGV)，请稍后重试");
     else if (result == 0)
-        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未能添加任何 DLC (详见logcat)");
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未能添加任何 DLC (mDLCSet 可能为空)");
     else
         snprintf(buf, sizeof(buf), "\u274C DLC 解锁失败 (code=%d)", result);
     return (*env)->NewStringUTF(env, buf);
@@ -4125,6 +4068,64 @@ cleanup:
 }
 #endif /* OVERLAY_DEX */
 
+// ========== 后台 DLC 持续解锁线程 ==========
+// 目的: 尽早在游戏初始化完成后自动调用 AddDLC，
+// 确保在用户进入角色选择界面之前就完成解锁。
+// 同时持续运行以防游戏重置 DLC 数据。
+static void *dlc_monitor_thread(void *arg) {
+    (void)arg;
+    LOGI("[dlc-monitor] DLC monitor started, waiting 8s for game login...");
+    sleep(8); // 等待游戏完成登录
+    
+    int attempts = 0;
+    int max_attempts = 30; // 最多尝试 30 次（~90秒）
+    
+    while (attempts < max_attempts) {
+        attempts++;
+        
+        if (g_dlc_unlocked) {
+            LOGI("[dlc-monitor] DLC already unlocked, checking persistence (attempt %d)...", attempts);
+        } else {
+            LOGI("[dlc-monitor] Attempt %d/%d to unlock DLC...", attempts, max_attempts);
+        }
+        
+        // 互斥锁 — 防止和手动按钮冲突
+        if (pthread_mutex_trylock(&g_hack_mutex) != 0) {
+            LOGI("[dlc-monitor] Mutex busy, skipping this round");
+            sleep(3);
+            continue;
+        }
+        
+        int result = do_unlock_all_dlc();
+        pthread_mutex_unlock(&g_hack_mutex);
+        
+        if (result == -3) {
+            // 实例无效（SIGSEGV），快速重试
+            LOGW("[dlc-monitor] Invalid instance, retrying in 2s...");
+            sleep(2);
+            continue;
+        } else if (result == -2) {
+            // ProtoLogin 未找到，游戏可能还在加载
+            LOGI("[dlc-monitor] ProtoLogin not found yet, retrying in 3s...");
+            sleep(3);
+            continue;
+        } else if (result > 0) {
+            LOGI("[dlc-monitor] ★ DLC unlocked (%d added)! Will keep monitoring...", result);
+            // 成功后放慢频率，持续监控（防止游戏重置）
+            sleep(10);
+            continue;
+        } else {
+            // result == 0 或其他错误
+            LOGW("[dlc-monitor] AddDLC returned %d, retrying in 3s...", result);
+            sleep(3);
+            continue;
+        }
+    }
+    
+    LOGI("[dlc-monitor] DLC monitor finished (%d attempts)", attempts);
+    return NULL;
+}
+
 // ========== 主工作线程 ==========
 static void *hack_thread(void *arg) {
     int target_gold = (int)(intptr_t)arg;
@@ -4222,22 +4223,22 @@ static void *hack_thread(void *arg) {
     // 5.7 安装 DLC/职业解锁绕过
     bypass_dlc_lock();
 
+    // 5.8 启动后台 DLC 持续解锁线程
+    {
+        pthread_t dlc_tid;
+        if (pthread_create(&dlc_tid, NULL, dlc_monitor_thread, NULL) == 0) {
+            pthread_detach(dlc_tid);
+            LOGI("[dlc-monitor] Background DLC unlock thread started");
+        } else {
+            LOGW("[dlc-monitor] Failed to create DLC monitor thread");
+        }
+    }
+
     // 6. 启动游戏内悬浮菜单
 #ifdef OVERLAY_DEX
     LOGI("=== Creating overlay menu ===");
     create_overlay_menu();
     LOGI("=== Overlay menu launched, waiting for user interaction ===");
-    
-    // 自动 DLC 测试：等待游戏进入主菜单后自动尝试解锁
-    // 在 hack 线程上执行（已 thread_attach），避免 Java 线程的问题
-    {
-        LOGI("[dlc-auto] Waiting 5s for game to reach main menu...");
-        sleep(5);
-        LOGI("[dlc-auto] Starting auto DLC unlock test...");
-        int auto_result = do_unlock_all_dlc();
-        LOGI("[dlc-auto] Auto DLC result: %d", auto_result);
-    }
-    
     // 线程保持存活以处理 JNI 回调
     // 菜单按钮触发 native 方法时会在 Java 线程中调用 do_modify_gold / do_reset_skill_cd
     while (1) { sleep(3600); }

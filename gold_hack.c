@@ -785,13 +785,40 @@ static Il2CppClass   g_roleinfo_cls = NULL;
 static Il2CppClass   g_warinfo_cls  = NULL;  // RoleInfoToWar
 
 // 初始化 il2cpp 上下文（domain / image / class），只需调用一次
+// 注意：在 APK 重打包模式下，libgoldhack.so 在 attachBaseContext 中加载，
+// 此时 il2cpp 可能尚未完全初始化（GC 子系统等），需要等待并重试。
 static int init_il2cpp_context(void) {
     if (g_roleinfo_cls) return 0;  // 已初始化
 
-    LOGI("Calling il2cpp_domain_get @ %p", (void*)fn_domain_get);
-    g_domain = fn_domain_get();
-    if (!g_domain) { LOGE("il2cpp_domain_get returned NULL"); return -1; }
-    LOGI("Domain: %p, calling thread_attach...", g_domain);
+    // 等待 il2cpp 完全初始化：尝试调用 domain_get，如果返回 NULL 或
+    // thread_attach 崩溃（通过 signal handler 捕获），则等待重试
+    int max_retries = 30;  // 最多等待 30 秒
+    for (int attempt = 0; attempt < max_retries; attempt++) {
+        LOGI("Calling il2cpp_domain_get @ %p (attempt %d/%d)", 
+             (void*)fn_domain_get, attempt + 1, max_retries);
+        g_domain = fn_domain_get();
+        if (g_domain) {
+            // domain_get 成功，再尝试 thread_attach
+            // 先检查 il2cpp 内部 GC 是否就绪：domain_get_assemblies 需要 GC
+            // 如果 assemblies 返回非空且 count > 0，说明 il2cpp 已完全初始化
+            size_t test_count = 0;
+            Il2CppAssembly *test_assemblies = fn_domain_get_assemblies(g_domain, &test_count);
+            if (test_assemblies && test_count > 0) {
+                LOGI("Domain: %p, assemblies: %zu, il2cpp is fully initialized", 
+                     g_domain, test_count);
+                break;
+            }
+            LOGW("Domain: %p but assemblies not ready (count=%zu), waiting 1s...", 
+                 g_domain, test_count);
+        } else {
+            LOGW("il2cpp_domain_get returned NULL, waiting 1s...");
+        }
+        g_domain = NULL;
+        sleep(1);
+    }
+    if (!g_domain) { LOGE("il2cpp_domain_get failed after %d attempts", max_retries); return -1; }
+
+    LOGI("Calling thread_attach...");
     fn_thread_attach(g_domain);
     LOGI("Attached to il2cpp domain");
 

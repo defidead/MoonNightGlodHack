@@ -1508,16 +1508,50 @@ static int do_unlock_all_dlc(void) {
         return -2;
     }
 
-    // ===== 2) 获取方法 =====
+    // ===== 2) 获取 ProtoLogin 方法 =====
     Il2CppMethodInfo m_addDLC     = fn_class_get_method_from_name(g_proto_login_cls, "AddDLC", 1);
     Il2CppMethodInfo m_isUnlock   = fn_class_get_method_from_name(g_proto_login_cls, "isUnlockRole", 1);
     Il2CppMethodInfo m_isDLCRole  = fn_class_get_method_from_name(g_proto_login_cls, "IsDLCRole", 1);
+    Il2CppMethodInfo m_getDLCId   = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCId", 1);
+    Il2CppMethodInfo m_getDLCs    = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCs", 0);
+    Il2CppMethodInfo m_updateDLC  = fn_class_get_method_from_name(g_proto_login_cls, "UpdateDLC", 0);
+    Il2CppMethodInfo m_addDlcs    = fn_class_get_method_from_name(g_proto_login_cls, "AddDlcs", 1);
+    Il2CppMethodInfo m_isBoughtAll = fn_class_get_method_from_name(g_proto_login_cls, "IsBoughtAllItems", 0);
+    Il2CppMethodInfo m_saveLData  = fn_class_get_method_from_name(g_proto_login_cls, "SaveLoginData", 0);
+    Il2CppMethodInfo m_isUnlockByItem = fn_class_get_method_from_name(g_proto_login_cls, "isUnlockByItem", 2);
+    Il2CppMethodInfo m_getProduct = fn_class_get_method_from_name(g_proto_login_cls, "GetProduct", 1);
+    Il2CppMethodInfo m_getProductId = fn_class_get_method_from_name(g_proto_login_cls, "GetProductId", 1);
+    Il2CppMethodInfo m_filterDlc  = fn_class_get_method_from_name(g_proto_login_cls, "filterServerdlc", 1);
+    Il2CppMethodInfo m_loginComplete = fn_class_get_method_from_name(g_proto_login_cls, "LoginComplete", 0);
     
-    if (!m_addDLC || !m_isUnlock) {
-        LOGE("[dlc] Essential methods not found: AddDLC=%p isUnlock=%p", m_addDLC, m_isUnlock);
+    // 两个版本的 IsUnlockAllDLC (可能参数类型不同)
+    Il2CppMethodInfo m_isUnlockAll_a = NULL, m_isUnlockAll_b = NULL;
+    Il2CppMethodInfo m_isUnlockByGameId = NULL;
+    {
+        void *iter = NULL;
+        Il2CppMethodInfo m;
+        while ((m = fn_class_get_methods(g_proto_login_cls, &iter)) != NULL) {
+            const char *name = fn_method_get_name(m);
+            if (!name) continue;
+            int pc = fn_method_get_param_count(m);
+            if (strcmp(name, "IsUnlockAllDLC") == 0 && pc == 1) {
+                if (!m_isUnlockAll_a) m_isUnlockAll_a = m;
+                else m_isUnlockAll_b = m;
+            }
+            if (strcmp(name, "IsUnlockByGameId") == 0 && pc == 2) m_isUnlockByGameId = m;
+        }
+    }
+    
+    if (!m_isUnlock) {
+        LOGE("[dlc] isUnlockRole not found!");
         return -1;
     }
-    LOGI("[dlc] Methods: AddDLC=%p isUnlock=%p isDLCRole=%p", m_addDLC, m_isUnlock, m_isDLCRole);
+    LOGI("[dlc] Methods: AddDLC=%p isUnlock=%p isDLCRole=%p getDLCId=%p UpdateDLC=%p",
+         m_addDLC, m_isUnlock, m_isDLCRole, m_getDLCId, m_updateDLC);
+    LOGI("[dlc] Methods: IsUnlockAllDLC_A=%p IsUnlockAllDLC_B=%p isBoughtAll=%p addDlcs=%p",
+         m_isUnlockAll_a, m_isUnlockAll_b, m_isBoughtAll, m_addDlcs);
+    LOGI("[dlc] Methods: saveLData=%p loginComplete=%p filterDlc=%p getProduct=%p",
+         m_saveLData, m_loginComplete, m_filterDlc, m_getProduct);
 
     void *exc = NULL;
     volatile int sigsegv_hit = 0; // 追踪 SIGSEGV 是否发生
@@ -1572,19 +1606,26 @@ static int do_unlock_all_dlc(void) {
 
     // ===== 4) 读取所有 HashSet 指针 =====
     uintptr_t mDLCSet = 0, baseRoles = 0, packAll = 0;
+    uintptr_t mDLCSetInfo = 0, mProduct2DLC = 0;
+    uintptr_t packMagic = 0, packClassics = 0;
     install_sigsegv_handler();
     g_in_safe_access = 1;
     if (sigsetjmp(g_jmpbuf, 1) == 0) {
-        mDLCSet   = *(volatile uintptr_t *)(g_proto_login_inst + 0x40);
-        baseRoles = *(volatile uintptr_t *)(g_proto_login_inst + 0x58);
-        packAll   = *(volatile uintptr_t *)(g_proto_login_inst + 0x60);
+        mDLCSet      = *(volatile uintptr_t *)(g_proto_login_inst + 0x40);
+        mDLCSetInfo  = *(volatile uintptr_t *)(g_proto_login_inst + 0x48);
+        mProduct2DLC = *(volatile uintptr_t *)(g_proto_login_inst + 0x50);
+        baseRoles    = *(volatile uintptr_t *)(g_proto_login_inst + 0x58);
+        packAll      = *(volatile uintptr_t *)(g_proto_login_inst + 0x60);
+        packMagic    = *(volatile uintptr_t *)(g_proto_login_inst + 0x68);
+        packClassics = *(volatile uintptr_t *)(g_proto_login_inst + 0x70);
     }
     g_in_safe_access = 0;
     uninstall_sigsegv_handler();
-    LOGI("[dlc] mDLCSet=%p BaseRoles=%p packAll=%p", (void*)mDLCSet, (void*)baseRoles, (void*)packAll);
+    LOGI("[dlc] mDLCSet=%p mDLCSetInfo=%p mProduct2DLC=%p", (void*)mDLCSet, (void*)mDLCSetInfo, (void*)mProduct2DLC);
+    LOGI("[dlc] BaseRoles=%p packAll=%p packMagic=%p packClassics=%p",
+         (void*)baseRoles, (void*)packAll, (void*)packMagic, (void*)packClassics);
 
-    // ===== 5) 获取 HashSet<int> 的关键方法 =====
-    // 从 packAll 或 BaseRoles 的 klass 获取 HashSet<int> 类型
+    // ===== 5) 获取 HashSet<int> klass + 通过迭代查找方法 =====
     uintptr_t hashset_klass = 0;
     uintptr_t hs_source = packAll ? packAll : baseRoles;
     if (hs_source) {
@@ -1596,71 +1637,182 @@ static int do_unlock_all_dlc(void) {
         g_in_safe_access = 0;
         uninstall_sigsegv_handler();
     }
-    if (!hashset_klass) {
-        LOGE("[dlc] Cannot find HashSet<int> klass!");
-        return -1;
+    
+    Il2CppMethodInfo m_hs_add = NULL, m_hs_contains = NULL, m_hs_count = NULL, m_hs_ctor = NULL;
+    if (hashset_klass) {
+        // 先试 class_get_method_from_name
+        m_hs_add      = fn_class_get_method_from_name((Il2CppClass)hashset_klass, "Add", 1);
+        m_hs_contains = fn_class_get_method_from_name((Il2CppClass)hashset_klass, "Contains", 1);
+        m_hs_count    = fn_class_get_method_from_name((Il2CppClass)hashset_klass, "get_Count", 0);
+        m_hs_ctor     = fn_class_get_method_from_name((Il2CppClass)hashset_klass, ".ctor", 0);
+        
+        // 如果失败，通过迭代所有方法查找
+        if (!m_hs_add || !m_hs_contains || !m_hs_count) {
+            LOGI("[dlc] HashSet method_from_name partial fail, trying iteration...");
+            void *iter = NULL;
+            Il2CppMethodInfo m;
+            int total_methods = 0;
+            while ((m = fn_class_get_methods((Il2CppClass)hashset_klass, &iter)) != NULL) {
+                const char *name = fn_method_get_name(m);
+                int pc = fn_method_get_param_count(m);
+                total_methods++;
+                if (!name) continue;
+                if (strcmp(name, "Add") == 0 && pc == 1 && !m_hs_add) m_hs_add = m;
+                else if (strcmp(name, "Contains") == 0 && pc == 1 && !m_hs_contains) m_hs_contains = m;
+                else if (strcmp(name, "get_Count") == 0 && pc == 0 && !m_hs_count) m_hs_count = m;
+                else if (strcmp(name, ".ctor") == 0 && pc == 0 && !m_hs_ctor) m_hs_ctor = m;
+                // 首次时输出所有方法名
+                if (verbose) {
+                    LOGI("[dlc-hs] %s(%d) ptr=%p MI=%p", name, pc, (void*)(*(uintptr_t*)m), m);
+                }
+            }
+            LOGI("[dlc] HashSet total methods iterated: %d", total_methods);
+        }
     }
-    LOGI("[dlc] HashSet<int> klass=%p", (void*)hashset_klass);
-
-    Il2CppMethodInfo m_hs_add      = fn_class_get_method_from_name((Il2CppClass)hashset_klass, "Add", 1);
-    Il2CppMethodInfo m_hs_contains = fn_class_get_method_from_name((Il2CppClass)hashset_klass, "Contains", 1);
-    Il2CppMethodInfo m_hs_count    = fn_class_get_method_from_name((Il2CppClass)hashset_klass, "get_Count", 0);
-    Il2CppMethodInfo m_hs_ctor     = fn_class_get_method_from_name((Il2CppClass)hashset_klass, ".ctor", 0);
     LOGI("[dlc] HashSet methods: Add=%p Contains=%p Count=%p .ctor=%p",
          m_hs_add, m_hs_contains, m_hs_count, m_hs_ctor);
 
-    // ===== 6) 诊断: 检查 packAll 和 BaseRoles 的内容 =====
-    if (m_hs_count && verbose) {
-        // packAll.Count
-        if (packAll) {
-            void *r = NULL;
-            SAFE_INVOKE(r, m_hs_count, (void*)packAll, NULL, &exc);
-            int cnt = -1;
-            if (!sigsegv_hit && r) { SAFE_UNBOX_INT(cnt, r, -1); }
-            LOGI("[dlc] packAll.Count = %d", cnt);
-        }
-        // BaseRoles.Count
-        if (baseRoles) {
-            void *r = NULL;
-            SAFE_INVOKE(r, m_hs_count, (void*)baseRoles, NULL, &exc);
-            int cnt = -1;
-            if (!sigsegv_hit && r) { SAFE_UNBOX_INT(cnt, r, -1); }
-            LOGI("[dlc] BaseRoles.Count = %d", cnt);
-        }
-        // 检查 packAll 包含哪些 role ID
-        if (packAll && m_hs_contains) {
-            LOGI("[dlc] packAll.Contains test:");
+    // ===== 6) 全面诊断: 理解 DLC 数据结构 =====
+    if (verbose) {
+        // 6a) GetDLCId: 角色ID -> DLC包ID的映射
+        if (m_getDLCId) {
+            LOGI("[dlc] === GetDLCId mapping (roleId -> dlcPackId) ===");
             for (int32_t rid = 0; rid <= 20; rid++) {
                 void *params[1] = { &rid };
+                exc = NULL;
                 void *r = NULL;
-                SAFE_INVOKE(r, m_hs_contains, (void*)packAll, params, &exc);
-                int contains = -1;
-                if (!sigsegv_hit && r) { SAFE_UNBOX_INT(contains, r, -1); }
-                if (contains > 0) LOGI("[dlc]   packAll.Contains(%d) = YES", rid);
+                SAFE_INVOKE(r, m_getDLCId, (void*)g_proto_login_inst, params, &exc);
+                if (!sigsegv_hit && r && !exc) {
+                    int dlcId = -1;
+                    SAFE_UNBOX_INT(dlcId, r, -1);
+                    LOGI("[dlc]   Role %d -> DLC %d", rid, dlcId);
+                } else if (!sigsegv_hit && exc) {
+                    LOGI("[dlc]   Role %d -> exc (no mapping)", rid);
+                }
             }
         }
-        if (baseRoles && m_hs_contains) {
-            LOGI("[dlc] BaseRoles.Contains test:");
-            for (int32_t rid = 0; rid <= 20; rid++) {
+        
+        // 6b) IsDLCRole: 哪些角色是 DLC 角色
+        if (m_isDLCRole) {
+            LOGI("[dlc] === IsDLCRole check ===");
+            for (int32_t rid = 0; rid <= 15; rid++) {
                 void *params[1] = { &rid };
+                exc = NULL;
                 void *r = NULL;
-                SAFE_INVOKE(r, m_hs_contains, (void*)baseRoles, params, &exc);
-                int contains = -1;
-                if (!sigsegv_hit && r) { SAFE_UNBOX_INT(contains, r, -1); }
-                if (contains > 0) LOGI("[dlc]   BaseRoles.Contains(%d) = YES", rid);
+                SAFE_INVOKE(r, m_isDLCRole, (void*)g_proto_login_inst, params, &exc);
+                int isDLC = -1;
+                if (!sigsegv_hit && r && !exc) { SAFE_UNBOX_INT(isDLC, r, -1); }
+                LOGI("[dlc]   IsDLCRole(%d) = %d", rid, isDLC);
+            }
+        }
+        
+        // 6c) IsUnlockAllDLC: 两个版本
+        if (m_isUnlockAll_a) {
+            LOGI("[dlc] === IsUnlockAllDLC_A (MI=%p) ===", m_isUnlockAll_a);
+            for (int32_t v = 0; v <= 10; v++) {
+                void *params[1] = { &v };
+                exc = NULL;
+                void *r = NULL;
+                SAFE_INVOKE(r, m_isUnlockAll_a, (void*)g_proto_login_inst, params, &exc);
+                int result = -99;
+                if (!sigsegv_hit && r && !exc) { SAFE_UNBOX_INT(result, r, -99); }
+                LOGI("[dlc]   IsUnlockAllDLC_A(%d) = %d%s", v, result, exc ? " (exc)" : "");
+            }
+        }
+        if (m_isUnlockAll_b) {
+            LOGI("[dlc] === IsUnlockAllDLC_B (MI=%p) ===", m_isUnlockAll_b);
+            for (int32_t v = 0; v <= 10; v++) {
+                void *params[1] = { &v };
+                exc = NULL;
+                void *r = NULL;
+                SAFE_INVOKE(r, m_isUnlockAll_b, (void*)g_proto_login_inst, params, &exc);
+                int result = -99;
+                if (!sigsegv_hit && r && !exc) { SAFE_UNBOX_INT(result, r, -99); }
+                LOGI("[dlc]   IsUnlockAllDLC_B(%d) = %d%s", v, result, exc ? " (exc)" : "");
+            }
+        }
+
+        // 6d) IsBoughtAllItems
+        if (m_isBoughtAll) {
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_isBoughtAll, (void*)g_proto_login_inst, NULL, &exc);
+            int bought = -1;
+            if (!sigsegv_hit && r && !exc) { SAFE_UNBOX_INT(bought, r, -1); }
+            LOGI("[dlc] IsBoughtAllItems = %d", bought);
+        }
+
+        // 6e) GetDLCs - 获取当前 DLC 集合
+        if (m_getDLCs) {
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_getDLCs, (void*)g_proto_login_inst, NULL, &exc);
+            LOGI("[dlc] GetDLCs() = %p (exc=%p)", r, exc);
+            // 如果返回 HashSet, 读取 Count
+            if (r && !sigsegv_hit && !exc && m_hs_count) {
+                void *cnt_r = NULL;
+                SAFE_INVOKE(cnt_r, m_hs_count, r, NULL, &exc);
+                int cnt = -1;
+                if (!sigsegv_hit && cnt_r) { SAFE_UNBOX_INT(cnt, cnt_r, -1); }
+                LOGI("[dlc] GetDLCs().Count = %d", cnt);
+            }
+        }
+
+        // 6f) packAll/BaseRoles Count
+        if (m_hs_count) {
+            if (packAll) {
+                void *r = NULL;
+                SAFE_INVOKE(r, m_hs_count, (void*)packAll, NULL, &exc);
+                int cnt = -1;
+                if (!sigsegv_hit && r) { SAFE_UNBOX_INT(cnt, r, -1); }
+                LOGI("[dlc] packAll.Count = %d", cnt);
+            }
+            if (baseRoles) {
+                void *r = NULL;
+                SAFE_INVOKE(r, m_hs_count, (void*)baseRoles, NULL, &exc);
+                int cnt = -1;
+                if (!sigsegv_hit && r) { SAFE_UNBOX_INT(cnt, r, -1); }
+                LOGI("[dlc] BaseRoles.Count = %d", cnt);
+            }
+            if (packMagic) {
+                void *r = NULL;
+                SAFE_INVOKE(r, m_hs_count, (void*)packMagic, NULL, &exc);
+                int cnt = -1;
+                if (!sigsegv_hit && r) { SAFE_UNBOX_INT(cnt, r, -1); }
+                LOGI("[dlc] packMagic.Count = %d", cnt);
+            }
+            if (packClassics) {
+                void *r = NULL;
+                SAFE_INVOKE(r, m_hs_count, (void*)packClassics, NULL, &exc);
+                int cnt = -1;
+                if (!sigsegv_hit && r) { SAFE_UNBOX_INT(cnt, r, -1); }
+                LOGI("[dlc] packClassics.Count = %d", cnt);
+            }
+        }
+        
+        // 6g) packAll Contains 检查
+        if (m_hs_contains && packAll) {
+            LOGI("[dlc] === packAll.Contains test (0-20) ===");
+            for (int32_t v = 0; v <= 20; v++) {
+                void *params[1] = { &v };
+                void *r = NULL;
+                SAFE_INVOKE(r, m_hs_contains, (void*)packAll, params, &exc);
+                int c = -1;
+                if (!sigsegv_hit && r) { SAFE_UNBOX_INT(c, r, -1); }
+                if (c > 0) LOGI("[dlc]   packAll.Contains(%d) = YES", v);
             }
         }
     }
 
-    // ===== 7) 创建或获取 mDLCSet =====
-    if (mDLCSet == 0 && fn_object_new && m_hs_ctor) {
+    // ===== 7) 创建 mDLCSet (如果为 NULL) =====
+    if (mDLCSet == 0 && fn_object_new && m_hs_ctor && hashset_klass) {
         LOGI("[dlc] mDLCSet is NULL, creating HashSet<int>...");
         Il2CppObject newSet = fn_object_new((Il2CppClass)hashset_klass);
         if (newSet) {
             void *ctor_result = NULL;
             SAFE_INVOKE(ctor_result, m_hs_ctor, newSet, NULL, &exc);
             if (!sigsegv_hit) {
-                LOGI("[dlc] HashSet .ctor() OK, new HashSet @ %p", newSet);
+                LOGI("[dlc] Created new HashSet @ %p", newSet);
                 install_sigsegv_handler();
                 g_in_safe_access = 1;
                 if (sigsetjmp(g_jmpbuf, 1) == 0) {
@@ -1669,58 +1821,30 @@ static int do_unlock_all_dlc(void) {
                 }
                 g_in_safe_access = 0;
                 uninstall_sigsegv_handler();
-                LOGI("[dlc] Assigned new HashSet to mDLCSet @ %p", (void*)mDLCSet);
             }
         }
     }
 
-    // ===== 8) 策略 A: 直接用 HashSet<int>.Add 向 mDLCSet 添加 role IDs 0-50 =====
+    // ===== 8) 策略 A: 直接 HashSet.Add 填充 mDLCSet =====
     int added = 0;
     if (mDLCSet && m_hs_add) {
-        LOGI("[dlc] Strategy A: Direct HashSet.Add to mDLCSet...");
+        LOGI("[dlc] Strategy A: Direct HashSet.Add to mDLCSet (0-50)...");
         for (int32_t id = 0; id <= 50; id++) {
             void *params[1] = { &id };
             void *r = NULL;
             exc = NULL;
             SAFE_INVOKE(r, m_hs_add, (void*)mDLCSet, params, &exc);
-            if (sigsegv_hit) {
-                LOGW("[dlc] HashSet.Add(%d) SIGSEGV!", id);
-                break;
-            }
+            if (sigsegv_hit) { LOGW("[dlc] HashSet.Add(%d) SIGSEGV!", id); break; }
             if (!exc) added++;
         }
-        LOGI("[dlc] HashSet.Add: %d items added", added);
-        
-        // 验证 mDLCSet.Count
-        if (m_hs_count) {
-            void *r = NULL;
-            SAFE_INVOKE(r, m_hs_count, (void*)mDLCSet, NULL, &exc);
-            int cnt = -1;
-            if (!sigsegv_hit && r) { SAFE_UNBOX_INT(cnt, r, -1); }
-            LOGI("[dlc] mDLCSet.Count after Add = %d", cnt);
-        }
+        LOGI("[dlc] HashSet.Add: %d items added to mDLCSet", added);
+    } else if (!m_hs_add) {
+        LOGI("[dlc] HashSet.Add not found, skipping Strategy A");
     }
 
-    // ===== 9) 检查 isUnlockRole 状态 (策略 A 后) =====
-    int unlocked_count = 0;
-    if (m_isUnlock) {
-        LOGI("[dlc] === After Strategy A (direct HashSet.Add) ===");
-        for (int32_t rid = 0; rid <= 15; rid++) {
-            void *params[1] = { &rid };
-            exc = NULL;
-            void *result = NULL;
-            SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
-            int unlocked = -1;
-            if (!sigsegv_hit && result) { SAFE_UNBOX_INT(unlocked, result, -1); }
-            LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
-                 sigsegv_hit ? " SIGSEGV!" : unlocked > 0 ? " ✓UNLOCKED" : " ✗locked");
-            if (unlocked > 0) unlocked_count++;
-        }
-    }
-
-    // ===== 10) 策略 B: 如果策略 A 无效，设 mDLCSet = packAll =====
-    if (unlocked_count == 0 && packAll && packAll != mDLCSet) {
-        LOGI("[dlc] Strategy B: Setting mDLCSet = packAll (%p)...", (void*)packAll);
+    // ===== 9) 策略 B: mDLCSet = packAll =====
+    if (packAll) {
+        LOGI("[dlc] Strategy B: Setting mDLCSet = packAll (%p)", (void*)packAll);
         install_sigsegv_handler();
         g_in_safe_access = 1;
         if (sigsetjmp(g_jmpbuf, 1) == 0) {
@@ -1729,62 +1853,75 @@ static int do_unlock_all_dlc(void) {
         }
         g_in_safe_access = 0;
         uninstall_sigsegv_handler();
-        
-        // 再次验证
-        if (m_isUnlock) {
-            LOGI("[dlc] === After Strategy B (mDLCSet=packAll) ===");
-            unlocked_count = 0;
-            for (int32_t rid = 0; rid <= 15; rid++) {
-                void *params[1] = { &rid };
-                exc = NULL;
-                void *result = NULL;
-                SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
-                int unlocked = -1;
-                if (!sigsegv_hit && result) { SAFE_UNBOX_INT(unlocked, result, -1); }
-                LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
-                     sigsegv_hit ? " SIGSEGV!" : unlocked > 0 ? " ✓UNLOCKED" : " ✗locked");
-                if (unlocked > 0) unlocked_count++;
-            }
-        }
     }
 
-    // ===== 11) 策略 C: 如果仍无效，也调用 AddDLC (网络协议，可能需要游戏已登录) =====
-    if (unlocked_count == 0 && m_addDLC) {
-        LOGI("[dlc] Strategy C: Calling ProtoLogin.AddDLC(1-50)...");
+    // ===== 10) 策略 C: 调用 AddDLC(1-50) 触发内部状态更新 =====
+    if (m_addDLC) {
+        LOGI("[dlc] Strategy C: Calling AddDLC(1-50) to trigger state refresh...");
         int add_ok = 0;
         for (int32_t dlcId = 1; dlcId <= 50; dlcId++) {
             void *params[1] = { &dlcId };
             exc = NULL;
-            void *result = NULL;
-            SAFE_INVOKE(result, m_addDLC, (void *)g_proto_login_inst, params, &exc);
+            void *r = NULL;
+            SAFE_INVOKE(r, m_addDLC, (void *)g_proto_login_inst, params, &exc);
             if (sigsegv_hit) break;
             if (!exc) add_ok++;
         }
-        LOGI("[dlc] AddDLC: %d calls OK", add_ok);
-        
-        // 最后一次验证
-        if (m_isUnlock) {
-            LOGI("[dlc] === After Strategy C (AddDLC) ===");
-            unlocked_count = 0;
-            for (int32_t rid = 0; rid <= 15; rid++) {
-                void *params[1] = { &rid };
-                exc = NULL;
-                void *result = NULL;
-                SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
-                int unlocked = -1;
-                if (!sigsegv_hit && result) { SAFE_UNBOX_INT(unlocked, result, -1); }
-                LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
-                     sigsegv_hit ? " SIGSEGV!" : unlocked > 0 ? " ✓UNLOCKED" : " ✗locked");
-                if (unlocked > 0) unlocked_count++;
-            }
+        LOGI("[dlc] AddDLC: %d OK, %d total", add_ok, 50);
+    }
+
+    // ===== 11) 策略 D: 调用 UpdateDLC + SaveLoginData 刷新状态 =====
+    if (m_updateDLC) {
+        LOGI("[dlc] Strategy D: Calling UpdateDLC()...");
+        exc = NULL;
+        void *r = NULL;
+        SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
+        LOGI("[dlc] UpdateDLC() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
+    }
+    if (m_saveLData) {
+        LOGI("[dlc] Calling SaveLoginData()...");
+        exc = NULL;
+        void *r = NULL;
+        SAFE_INVOKE(r, m_saveLData, (void*)g_proto_login_inst, NULL, &exc);
+        LOGI("[dlc] SaveLoginData() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
+    }
+
+    // ===== 12) 验证最终解锁状态 =====
+    int unlocked_count = 0;
+    if (m_isUnlock) {
+        LOGI("[dlc] === Final unlock status ===");
+        for (int32_t rid = 0; rid <= 15; rid++) {
+            void *params[1] = { &rid };
+            exc = NULL;
+            void *result = NULL;
+            SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
+            int unlocked = -1;
+            if (!sigsegv_hit && result) { SAFE_UNBOX_INT(unlocked, result, -1); }
+            LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
+                 unlocked > 0 ? " ✓" : " ✗");
+            if (unlocked > 0) unlocked_count++;
+        }
+    }
+    
+    // 再验证 IsUnlockAllDLC（策略 B+C+D 后）
+    if (m_isUnlockAll_a) {
+        LOGI("[dlc] === IsUnlockAllDLC after all strategies ===");
+        for (int32_t v = 0; v <= 5; v++) {
+            void *params[1] = { &v };
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_isUnlockAll_a, (void*)g_proto_login_inst, params, &exc);
+            int result = -99;
+            if (!sigsegv_hit && r && !exc) { SAFE_UNBOX_INT(result, r, -99); }
+            LOGI("[dlc]   IsUnlockAllDLC_A(%d) = %d", v, result);
         }
     }
 
-    // ===== 12) 最终结果 =====
+    // ===== 13) 最终结果 =====
     LOGI("[dlc] Final result: %d/16 roles unlocked", unlocked_count);
     if (unlocked_count >= 10) {
         g_dlc_unlocked = 1;
-        LOGI("[dlc] ★ DLC unlock SUCCESS!");
+        LOGI("[dlc] ★ DLC unlock reported SUCCESS (but UI may need different approach)");
     }
 
     // ===== 13) 最终状态 =====

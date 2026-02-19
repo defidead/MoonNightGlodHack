@@ -977,35 +977,239 @@ static void enumerate_game_classes(void) {
     // 登录相关
     log_class_info("LoginGuanFangPanel", "");
     log_class_info("LoginPanel", "");
-    log_class_info("LoginManager", "");
-    log_class_info("AccountManager", "");
     log_class_info("SDKManager", "");
     
     // 职业/角色解锁相关
-    log_class_info("RoleManager", "");
-    log_class_info("RoleData", "");
-    log_class_info("CareerManager", "");
-    log_class_info("CareerData", "");
-    log_class_info("CareerInfo", "");
-    log_class_info("ClassInfo", "");
-    log_class_info("UserData", "");
     log_class_info("UserInfo", "");
-    log_class_info("PlayerData", "");
-    log_class_info("PlayerInfo", "");
-    log_class_info("UnlockManager", "");
-    log_class_info("LockManager", "");
-    log_class_info("ClassSelectPanel", "");
-    log_class_info("CharacterSelectPanel", "");
-    log_class_info("RoleSelectPanel", "");
     log_class_info("PurchaseManager", "");
-    log_class_info("StoreManager", "");
-    log_class_info("ShopManager", "");
-    
-    // 也搜索一些可能的命名空间
-    log_class_info("PackageVersionControl", "YooAsset");
-    log_class_info("VersionCheckResult", "YooAsset");
+    log_class_info("Achieve", "");
+    log_class_info("ProtoLogin", "");
+    log_class_info("BookShelfManager", "");
+    log_class_info("EnterLayer", "");
+    log_class_info("GameStartCheck", "");
     
     LOGI("[enum] ========== Enumeration complete ==========");
+}
+
+// ========== 通用 il2cpp inline hook 工具 ==========
+// 通过修改 MethodInfo 中的 methodPointer（offset 0）来 hook il2cpp 方法
+// 如果 methodPointer 无法修改（HybridCLR 解释器方法），则使用 inline hook
+
+// 获取 MethodInfo 中的 methodPointer（offset 0）
+static uintptr_t get_method_pointer(Il2CppMethodInfo method) {
+    if (!method) return 0;
+    // Il2CppMethodInfo 第一个字段是 methodPointer（void* 指针）
+    return *(uintptr_t *)method;
+}
+
+// 使用 inline hook 替换函数入口
+// 将 target_func 的前 16 字节替换为跳转到 hook_func 的指令
+static int inline_hook_method(uintptr_t target_func, void *hook_func, const char *name) {
+    if (!target_func || !hook_func) return -1;
+    
+    uintptr_t page = target_func & ~(uintptr_t)0xFFF;
+    if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("[hook] mprotect RWX failed for %s @ %p: %s", name, (void*)target_func, strerror(errno));
+        if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE) != 0) {
+            LOGE("[hook] mprotect RW also failed for %s", name);
+            return -1;
+        }
+    }
+    
+    // LDR X16, [PC, #8] + BR X16 + .quad addr
+    uint32_t *code = (uint32_t *)target_func;
+    code[0] = 0x58000050;  // LDR X16, [PC, #8]
+    code[1] = 0xD61F0200;  // BR X16
+    uint64_t *target = (uint64_t *)(code + 2);
+    *target = (uint64_t)hook_func;
+    
+    __builtin___clear_cache((char *)target_func, (char *)(target_func + 16));
+    mprotect((void *)page, 0x2000, PROT_READ | PROT_EXEC);
+    
+    LOGI("[hook] %s @ %p -> %p (inline hook installed)", name, (void*)target_func, hook_func);
+    return 0;
+}
+
+// ========== 版本检查绕过 ==========
+// Hook PackageVersionControl.get_IsOn() -> 返回 false（关闭版本检查）
+static int /*bool*/ hook_pvc_get_IsOn(void *thisptr) {
+    (void)thisptr;
+    return 0; // false - 关闭版本检查
+}
+
+// Hook PackageVersionControl.CheckForceUpgrade() -> 返回 false
+static int /*bool*/ hook_pvc_CheckForceUpgrade(void *thisptr) {
+    (void)thisptr;
+    LOGI("[bypass] CheckForceUpgrade blocked -> false");
+    return 0; // 不需要强制更新
+}
+
+// Hook PackageVersionControl.DealCheckResult(VersionCheckResult) -> 什么都不做
+static void hook_pvc_DealCheckResult(void *thisptr, int result) {
+    (void)thisptr; (void)result;
+    LOGI("[bypass] DealCheckResult(%d) blocked", result);
+    // 什么都不做，跳过版本检查结果处理
+}
+
+// Hook PackageVersionControl.CheckComplete(bool) -> 直接返回
+static void hook_pvc_CheckComplete(void *thisptr, int /*bool*/ result) {
+    (void)thisptr; (void)result;
+    LOGI("[bypass] CheckComplete(%d) blocked", result);
+}
+
+// Hook PackageStateInit.CheckUpdateVersion -> 跳过版本检查
+static void hook_psi_CheckUpdateVersion(void *thisptr, void *arg1, void *arg2) {
+    (void)thisptr; (void)arg1; (void)arg2;
+    LOGI("[bypass] PackageStateInit.CheckUpdateVersion blocked");
+}
+
+static int bypass_version_check(void) {
+    LOGI("[bypass] ===== Installing version check bypass =====");
+    int hooked = 0;
+    
+    Il2CppClass pvc_class = fn_class_from_name(g_csharp_image, "", "PackageVersionControl");
+    if (!pvc_class) {
+        LOGW("[bypass] PackageVersionControl class not found, skipping version bypass");
+        return 0;
+    }
+    
+    // Hook get_IsOn() - 关闭版本检查开关
+    if (fn_class_get_method_from_name) {
+        Il2CppMethodInfo m = fn_class_get_method_from_name(pvc_class, "get_IsOn", 0);
+        if (m) {
+            uintptr_t fp = get_method_pointer(m);
+            if (fp && inline_hook_method(fp, (void*)hook_pvc_get_IsOn, "PVC.get_IsOn") == 0)
+                hooked++;
+        }
+        
+        // Hook CheckForceUpgrade()
+        m = fn_class_get_method_from_name(pvc_class, "CheckForceUpgrade", 0);
+        if (m) {
+            uintptr_t fp = get_method_pointer(m);
+            if (fp && inline_hook_method(fp, (void*)hook_pvc_CheckForceUpgrade, "PVC.CheckForceUpgrade") == 0)
+                hooked++;
+        }
+        
+        // Hook DealCheckResult(1)
+        m = fn_class_get_method_from_name(pvc_class, "DealCheckResult", 1);
+        if (m) {
+            uintptr_t fp = get_method_pointer(m);
+            if (fp && inline_hook_method(fp, (void*)hook_pvc_DealCheckResult, "PVC.DealCheckResult") == 0)
+                hooked++;
+        }
+        
+        // Hook CheckComplete(1)
+        m = fn_class_get_method_from_name(pvc_class, "CheckComplete", 1);
+        if (m) {
+            uintptr_t fp = get_method_pointer(m);
+            if (fp && inline_hook_method(fp, (void*)hook_pvc_CheckComplete, "PVC.CheckComplete") == 0)
+                hooked++;
+        }
+    }
+    
+    // 也 hook PackageStateInit.CheckUpdateVersion
+    Il2CppClass psi_class = fn_class_from_name(g_csharp_image, "", "PackageStateInit");
+    if (psi_class && fn_class_get_method_from_name) {
+        Il2CppMethodInfo m = fn_class_get_method_from_name(psi_class, "CheckUpdateVersion", 2);
+        if (m) {
+            uintptr_t fp = get_method_pointer(m);
+            if (fp && inline_hook_method(fp, (void*)hook_psi_CheckUpdateVersion, "PSI.CheckUpdateVersion") == 0)
+                hooked++;
+        }
+    }
+    
+    LOGI("[bypass] Version check bypass: %d hooks installed", hooked);
+    return hooked;
+}
+
+// ========== DLC/职业解锁绕过 ==========
+// Hook UserInfo.IsDLCRole(int roleId) -> 返回 false（所有角色都不是 DLC，可免费选择）
+static int /*bool*/ hook_userinfo_IsDLCRole(void *thisptr, int roleId) {
+    (void)thisptr;
+    LOGI("[bypass] IsDLCRole(%d) -> false (unlocked)", roleId);
+    return 0; // false = 不是 DLC 角色 = 免费可用
+}
+
+// Hook UserInfo.IsBaseRole(int roleId) -> 返回 true（所有角色都是基础角色）
+static int /*bool*/ hook_userinfo_IsBaseRole(void *thisptr, int roleId) {
+    (void)thisptr;
+    return 1; // true = 基础角色 = 不需要购买
+}
+
+// Hook PurchaseManager.IsUnlockShop_PVP(int shopId) -> 返回 true
+static int /*bool*/ hook_pm_IsUnlockShop_PVP(void *thisptr, int shopId) {
+    (void)thisptr;
+    LOGI("[bypass] IsUnlockShop_PVP(%d) -> true", shopId);
+    return 1; // 已解锁
+}
+
+// Hook SDKManager.IsFroceLogin() -> 返回 false（不强制登录）
+static int /*bool*/ hook_sdk_IsForceLogin(void *thisptr) {
+    (void)thisptr;
+    return 0; // false = 不需要强制登录
+}
+
+// Hook PurchaseManager.IsNeedBind() -> 返回 false（不需要绑定）
+static int /*bool*/ hook_pm_IsNeedBind(void *thisptr) {
+    (void)thisptr;
+    return 0; // false = 不需要绑定
+}
+
+static int bypass_dlc_lock(void) {
+    LOGI("[bypass] ===== Installing DLC/career unlock bypass =====");
+    int hooked = 0;
+    
+    // Hook UserInfo.IsDLCRole -> false
+    Il2CppClass ui_class = fn_class_from_name(g_csharp_image, "", "UserInfo");
+    if (ui_class && fn_class_get_method_from_name) {
+        Il2CppMethodInfo m = fn_class_get_method_from_name(ui_class, "IsDLCRole", 1);
+        if (m) {
+            uintptr_t fp = get_method_pointer(m);
+            if (fp && inline_hook_method(fp, (void*)hook_userinfo_IsDLCRole, "UserInfo.IsDLCRole") == 0)
+                hooked++;
+        }
+        
+        // Hook UserInfo.IsBaseRole -> true
+        m = fn_class_get_method_from_name(ui_class, "IsBaseRole", 1);
+        if (m) {
+            uintptr_t fp = get_method_pointer(m);
+            if (fp && inline_hook_method(fp, (void*)hook_userinfo_IsBaseRole, "UserInfo.IsBaseRole") == 0)
+                hooked++;
+        }
+    }
+    
+    // Hook PurchaseManager.IsUnlockShop_PVP -> true
+    Il2CppClass pm_class = fn_class_from_name(g_csharp_image, "", "PurchaseManager");
+    if (pm_class && fn_class_get_method_from_name) {
+        Il2CppMethodInfo m = fn_class_get_method_from_name(pm_class, "IsUnlockShop_PVP", 1);
+        if (m) {
+            uintptr_t fp = get_method_pointer(m);
+            if (fp && inline_hook_method(fp, (void*)hook_pm_IsUnlockShop_PVP, "PM.IsUnlockShop_PVP") == 0)
+                hooked++;
+        }
+        
+        // Hook IsNeedBind -> false
+        m = fn_class_get_method_from_name(pm_class, "IsNeedBind", 0);
+        if (m) {
+            uintptr_t fp = get_method_pointer(m);
+            if (fp && inline_hook_method(fp, (void*)hook_pm_IsNeedBind, "PM.IsNeedBind") == 0)
+                hooked++;
+        }
+    }
+    
+    // Hook SDKManager.IsFroceLogin -> false
+    Il2CppClass sdk_class = fn_class_from_name(g_csharp_image, "", "SDKManager");
+    if (sdk_class && fn_class_get_method_from_name) {
+        Il2CppMethodInfo m = fn_class_get_method_from_name(sdk_class, "IsFroceLogin", 0);
+        if (m) {
+            uintptr_t fp = get_method_pointer(m);
+            if (fp && inline_hook_method(fp, (void*)hook_sdk_IsForceLogin, "SDK.IsFroceLogin") == 0)
+                hooked++;
+        }
+    }
+    
+    LOGI("[bypass] DLC/career unlock bypass: %d hooks installed", hooked);
+    return hooked;
 }
 
 // ========== RoleInfo 实例缓存（避免每次全量扫描）==========
@@ -3409,6 +3613,12 @@ static void *hack_thread(void *arg) {
 
     // 5.5 枚举游戏类（调试：分析更新检查和登录机制）
     enumerate_game_classes();
+
+    // 5.6 安装版本检查绕过
+    bypass_version_check();
+    
+    // 5.7 安装 DLC/职业解锁绕过
+    bypass_dlc_lock();
 
     // 6. 启动游戏内悬浮菜单
 #ifdef OVERLAY_DEX

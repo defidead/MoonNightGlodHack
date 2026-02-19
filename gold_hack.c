@@ -84,6 +84,7 @@ typedef void* Il2CppClass;
 typedef void* Il2CppMethodInfo;
 typedef void* Il2CppFieldInfo;
 typedef void* Il2CppObject;
+typedef void* Il2CppMethodInfo;
 
 // API 函数指针类型
 typedef Il2CppDomain   (*il2cpp_domain_get_t)(void);
@@ -96,6 +97,16 @@ typedef int            (*il2cpp_image_get_class_count_t)(Il2CppImage image);
 typedef Il2CppClass    (*il2cpp_image_get_class_t)(Il2CppImage image, int index);
 typedef const char*    (*il2cpp_class_get_name_t)(Il2CppClass klass);
 typedef const char*    (*il2cpp_class_get_namespace_t)(Il2CppClass klass);
+// 新增 API：方法/字段枚举 + method hooking
+typedef Il2CppMethodInfo (*il2cpp_class_get_methods_t)(Il2CppClass klass, void **iter);
+typedef const char*      (*il2cpp_method_get_name_t)(Il2CppMethodInfo method);
+typedef int              (*il2cpp_method_get_param_count_t)(Il2CppMethodInfo method);
+typedef Il2CppFieldInfo  (*il2cpp_class_get_fields_t)(Il2CppClass klass, void **iter);
+typedef const char*      (*il2cpp_field_get_name_t)(Il2CppFieldInfo field);
+typedef int              (*il2cpp_field_get_offset_t)(Il2CppFieldInfo field);
+typedef Il2CppMethodInfo (*il2cpp_class_get_method_from_name_t)(Il2CppClass klass, const char *name, int param_count);
+typedef Il2CppObject     (*il2cpp_runtime_invoke_t)(Il2CppMethodInfo method, void *obj, void **params, void **exc);
+typedef void*            (*il2cpp_string_new_t)(const char *str);
 
 // 需要发现的 API 列表
 typedef struct {
@@ -110,18 +121,37 @@ static il2cpp_domain_get_assemblies_t  fn_domain_get_assemblies = NULL;
 static il2cpp_assembly_get_image_t     fn_assembly_get_image = NULL;
 static il2cpp_image_get_name_t         fn_image_get_name = NULL;
 static il2cpp_class_from_name_t        fn_class_from_name = NULL;
+// 新增 API 函数指针
+static il2cpp_class_get_methods_t          fn_class_get_methods = NULL;
+static il2cpp_method_get_name_t            fn_method_get_name = NULL;
+static il2cpp_method_get_param_count_t     fn_method_get_param_count = NULL;
+static il2cpp_class_get_fields_t           fn_class_get_fields = NULL;
+static il2cpp_field_get_name_t             fn_field_get_name = NULL;
+static il2cpp_field_get_offset_t           fn_field_get_offset = NULL;
+static il2cpp_class_get_method_from_name_t fn_class_get_method_from_name = NULL;
+static il2cpp_runtime_invoke_t             fn_runtime_invoke = NULL;
+static il2cpp_string_new_t                 fn_string_new = NULL;
 
 static ApiEntry g_api_table[] = {
-    { "il2cpp_domain_get",             (void**)&fn_domain_get },
-    { "il2cpp_thread_attach",          (void**)&fn_thread_attach },
-    { "il2cpp_domain_get_assemblies",  (void**)&fn_domain_get_assemblies },
-    { "il2cpp_assembly_get_image",     (void**)&fn_assembly_get_image },
-    { "il2cpp_image_get_name",         (void**)&fn_image_get_name },
-    { "il2cpp_class_from_name",        (void**)&fn_class_from_name },
+    { "il2cpp_domain_get",                 (void**)&fn_domain_get },
+    { "il2cpp_thread_attach",              (void**)&fn_thread_attach },
+    { "il2cpp_domain_get_assemblies",      (void**)&fn_domain_get_assemblies },
+    { "il2cpp_assembly_get_image",         (void**)&fn_assembly_get_image },
+    { "il2cpp_image_get_name",             (void**)&fn_image_get_name },
+    { "il2cpp_class_from_name",            (void**)&fn_class_from_name },
+    { "il2cpp_class_get_methods",          (void**)&fn_class_get_methods },
+    { "il2cpp_method_get_name",            (void**)&fn_method_get_name },
+    { "il2cpp_method_get_param_count",     (void**)&fn_method_get_param_count },
+    { "il2cpp_class_get_fields",           (void**)&fn_class_get_fields },
+    { "il2cpp_field_get_name",             (void**)&fn_field_get_name },
+    { "il2cpp_field_get_offset",           (void**)&fn_field_get_offset },
+    { "il2cpp_class_get_method_from_name", (void**)&fn_class_get_method_from_name },
+    { "il2cpp_runtime_invoke",             (void**)&fn_runtime_invoke },
+    { "il2cpp_string_new",                 (void**)&fn_string_new },
     { NULL, NULL }
 };
 
-#define API_COUNT 6
+#define API_COUNT 15
 
 // ========== 内存区域信息 ==========
 typedef struct {
@@ -432,12 +462,12 @@ static int load_api_cache(uintptr_t il2cpp_base) {
     }
     uninstall_sigsegv_handler();
     
-    if (loaded == API_COUNT) {
-        LOGI("[cache] All %d APIs restored from cache", loaded);
+    if (loaded >= 6) {
+        LOGI("[cache] Restored %d/%d APIs from cache (6 core + %d optional)", loaded, API_COUNT, loaded - 6);
         return 0;
     }
     
-    LOGW("[cache] Only %d/%d APIs restored, falling back to scan", loaded, API_COUNT);
+    LOGW("[cache] Only %d/%d APIs restored (need >=6 core), falling back to scan", loaded, API_COUNT);
     for (int i = 0; g_api_table[i].name; i++) {
         *g_api_table[i].func_ptr = NULL;
     }
@@ -777,7 +807,15 @@ static int resolve_apis_from_pairs(void) {
 done:
     uninstall_sigsegv_handler();
     LOGI("[scan] Scanned %d rw- regions for pairs, resolved %d/%d APIs", scanned_pair_regions, resolved, API_COUNT);
-    return (resolved >= API_COUNT) ? 0 : -1;
+    // 至少需要前6个核心 API（domain_get, thread_attach, domain_get_assemblies, 
+    // assembly_get_image, image_get_name, class_from_name）
+    if (resolved >= 6) {
+        if (resolved < API_COUNT) {
+            LOGW("[scan] Only %d/%d APIs resolved, some features may be limited", resolved, API_COUNT);
+        }
+        return 0;
+    }
+    return -1;
 }
 
 // ========== il2cpp 运行时上下文（初始化后全局缓存）==========
@@ -888,6 +926,86 @@ static int init_il2cpp_context(void) {
         LOGW("RoleInfoToWar class not found (non-fatal)");
     }
     return 0;
+}
+
+// ========== 枚举游戏类方法/字段（用于分析更新和登录机制）==========
+static void log_class_info(const char *name, const char *ns) {
+    Il2CppClass klass = fn_class_from_name(g_csharp_image, ns, name);
+    if (!klass) {
+        LOGW("[enum] Class '%s%s%s' not found", ns[0] ? ns : "", ns[0] ? "." : "", name);
+        return;
+    }
+    LOGI("[enum] === %s%s%s @ %p ===", ns[0] ? ns : "", ns[0] ? "." : "", name, klass);
+    
+    // 枚举方法
+    if (fn_class_get_methods && fn_method_get_name) {
+        void *iter = NULL;
+        Il2CppMethodInfo method;
+        while ((method = fn_class_get_methods(klass, &iter)) != NULL) {
+            const char *mname = fn_method_get_name(method);
+            int pcount = fn_method_get_param_count ? fn_method_get_param_count(method) : -1;
+            LOGI("[enum]   M: %s(%d) @%p", mname ? mname : "?", pcount, method);
+        }
+    }
+    
+    // 枚举字段
+    if (fn_class_get_fields && fn_field_get_name) {
+        void *fiter = NULL;
+        Il2CppFieldInfo field;
+        while ((field = fn_class_get_fields(klass, &fiter)) != NULL) {
+            const char *fname = fn_field_get_name(field);
+            int offset = fn_field_get_offset ? fn_field_get_offset(field) : -1;
+            LOGI("[enum]   F: %s (offset=%d)", fname ? fname : "?", offset);
+        }
+    }
+}
+
+static void enumerate_game_classes(void) {
+    LOGI("[enum] ========== Enumerating game classes ==========");
+    
+    // 更新/版本检查相关
+    log_class_info("PackageVersionControl", "");
+    log_class_info("PackageStateInit", "");
+    log_class_info("PackageStateUpdateVersion", "");
+    log_class_info("PackageDownloadPanel", "");
+    log_class_info("GameStartPanel", "");
+    log_class_info("FsmInitBootPackage", "");
+    log_class_info("VersionCheckResult", "");
+    log_class_info("ConfigManager", "");
+    log_class_info("GameManager", "");
+    
+    // 登录相关
+    log_class_info("LoginGuanFangPanel", "");
+    log_class_info("LoginPanel", "");
+    log_class_info("LoginManager", "");
+    log_class_info("AccountManager", "");
+    log_class_info("SDKManager", "");
+    
+    // 职业/角色解锁相关
+    log_class_info("RoleManager", "");
+    log_class_info("RoleData", "");
+    log_class_info("CareerManager", "");
+    log_class_info("CareerData", "");
+    log_class_info("CareerInfo", "");
+    log_class_info("ClassInfo", "");
+    log_class_info("UserData", "");
+    log_class_info("UserInfo", "");
+    log_class_info("PlayerData", "");
+    log_class_info("PlayerInfo", "");
+    log_class_info("UnlockManager", "");
+    log_class_info("LockManager", "");
+    log_class_info("ClassSelectPanel", "");
+    log_class_info("CharacterSelectPanel", "");
+    log_class_info("RoleSelectPanel", "");
+    log_class_info("PurchaseManager", "");
+    log_class_info("StoreManager", "");
+    log_class_info("ShopManager", "");
+    
+    // 也搜索一些可能的命名空间
+    log_class_info("PackageVersionControl", "YooAsset");
+    log_class_info("VersionCheckResult", "YooAsset");
+    
+    LOGI("[enum] ========== Enumeration complete ==========");
 }
 
 // ========== RoleInfo 实例缓存（避免每次全量扫描）==========
@@ -3253,12 +3371,28 @@ static void *hack_thread(void *arg) {
     }
 
     // 4. 验证所有 API 已就位
+    int missing_critical = 0;
+    int missing_optional = 0;
     for (int i = 0; g_api_table[i].name; i++) {
         if (*g_api_table[i].func_ptr == NULL) {
-            LOGE("API %s is NULL, aborting", g_api_table[i].name);
-            return NULL;
+            // 前6个是核心 API，必须存在
+            if (i < 6) {
+                LOGE("CRITICAL API %s is NULL", g_api_table[i].name);
+                missing_critical++;
+            } else {
+                LOGW("Optional API %s is NULL (non-fatal)", g_api_table[i].name);
+                missing_optional++;
+            }
+        } else {
+            LOGI("API ready: %s @ %p", g_api_table[i].name, *g_api_table[i].func_ptr);
         }
-        LOGI("API ready: %s @ %p", g_api_table[i].name, *g_api_table[i].func_ptr);
+    }
+    if (missing_critical > 0) {
+        LOGE("Missing %d critical APIs, aborting", missing_critical);
+        return NULL;
+    }
+    if (missing_optional > 0) {
+        LOGW("%d optional APIs missing, some features may not work", missing_optional);
     }
 
     // 确保信号处理器已恢复为 MHP 原始状态（不用 SIG_DFL，MHP 的 trampoline 可能需要自己的处理器）
@@ -3272,6 +3406,9 @@ static void *hack_thread(void *arg) {
         return NULL;
     }
     LOGI("il2cpp context initialized");
+
+    // 5.5 枚举游戏类（调试：分析更新检查和登录机制）
+    enumerate_game_classes();
 
     // 6. 启动游戏内悬浮菜单
 #ifdef OVERLAY_DEX

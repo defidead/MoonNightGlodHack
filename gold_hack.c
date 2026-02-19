@@ -2002,29 +2002,24 @@ static int do_unlock_all_dlc(void) {
         }
     }
 
-    // 如果成功修改了 mLoginData.DLC，调用 UpdateDLC 让游戏重建 mDLCSet
+    // 如果成功修改了 mLoginData.DLC，不调用 UpdateDLC（会崩溃：触发UI更新需主线程）
+    // 改为直接保持 mDLCSet = packAll
     if (logindata_dlc_modified) {
-        if (m_updateDLC) {
-            LOGI("[dlc] Strategy D: UpdateDLC() after mLoginData modification...");
-            exc = NULL;
-            void *r = NULL;
-            SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
-            LOGI("[dlc] UpdateDLC() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
-        }
-        // UpdateDLC 之后重新设置 mDLCSet = packAll (以防 UpdateDLC 重建的 HashSet 不完整)
+        // 不调用 UpdateDLC — 它内部触发 OnPayComplete→BookControl→RenderTexture → SIGTRAP 崩溃
+        // 不调用 SaveLoginData — 它序列化时分配 0xFFFFFFFED00001D0 字节 → SIGTRAP 崩溃
+        // 直接设置 mDLCSet = packAll 即可
         install_sigsegv_handler();
         g_in_safe_access = 1;
         if (sigsetjmp(g_jmpbuf, 1) == 0) {
             uintptr_t packAll_val = *(volatile uintptr_t *)(g_proto_login_inst + 0x60);
             if (packAll_val) {
                 *(volatile uintptr_t *)(g_proto_login_inst + 0x40) = packAll_val;
-                LOGI("[dlc] Post-UpdateDLC: Re-set mDLCSet = packAll (%p)", (void*)packAll_val);
+                LOGI("[dlc] Strategy D: Set mDLCSet = packAll (%p) after DLC list mod", (void*)packAll_val);
             }
         }
         g_in_safe_access = 0;
         uninstall_sigsegv_handler();
-        // 不调用 SaveLoginData/LoginComplete — 它们会崩溃 (内存分配 0xFFFFFFFED00001D0)
-        LOGI("[dlc] Skipping SaveLoginData/LoginComplete (crash prevention)");
+        LOGI("[dlc] Skipping UpdateDLC/SaveLoginData/LoginComplete (thread safety)");
     } else {
         LOGI("[dlc] mLoginData.DLC not modified - keeping mDLCSet=packAll (no UpdateDLC)");
     }

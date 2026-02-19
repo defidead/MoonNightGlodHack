@@ -1563,8 +1563,6 @@ static int do_unlock_all_dlc(void) {
             LOGW("[dlc] SIGSEGV calling isUnlockRole(0) - instance @ 0x%" PRIxPTR " is INVALID, discarding",
                  g_proto_login_inst);
             g_proto_login_inst = 0; // 丢弃此实例，下次重新扫描
-            #undef SAFE_INVOKE
-            #undef SAFE_UNBOX_INT
             return -3; // 特殊返回值: 实例无效
         }
         int val = -1;

@@ -503,7 +503,9 @@ PATCH_ORIG = PATCH1_ORIG
 PATCH_NEW = PATCH1_NEW
 
 DECRYPTED_METADATA_PATH = os.path.join(SCRIPT_DIR, '..', 'decrypted_output', 'global-metadata.dat')
+MHP_HEADER_PATH = os.path.join(SCRIPT_DIR, '..', 'decrypted_output', 'mhp_header.bin')
 METADATA_MAGIC = 0xFAB11BAF
+MHP_HEADER_SIZE = 256  # MHP 创建的自定义头部大小（字段偏移重排）
 
 
 def _apply_patch(so_bytes, offset, orig, new, desc):
@@ -554,14 +556,22 @@ def patch_libil2cpp(so_data):
 
 
 def load_decrypted_metadata():
-    """加载预解密的 global-metadata.dat"""
+    """加载预解密的 global-metadata.dat，并用 MHP 头部替换前 256 字节。
+    
+    MHP 保护不仅解密 metadata 数据体，还会创建一个自定义的头部结构，
+    将各字段偏移量重新排列。il2cpp 代码读取 header+48 等特定偏移处的值，
+    如果使用原始（加密的）头部，偏移量会指向错误位置导致 SIGSEGV。
+    
+    解决方案：用 Frida 从原始游戏捕获 MHP 解密后的头部（256字节），
+    替换到我们的预解密 metadata 文件中。
+    """
     path = DECRYPTED_METADATA_PATH
     if not os.path.isfile(path):
         print(f"  ❌ 找不到解密的 metadata: {path}")
         return None
 
     with open(path, 'rb') as f:
-        data = f.read()
+        data = bytearray(f.read())
 
     # 验证 magic
     import struct
@@ -570,8 +580,25 @@ def load_decrypted_metadata():
         print(f"  ❌ metadata magic 不匹配: {hex(magic)} (期望 {hex(METADATA_MAGIC)})")
         return None
 
+    # 替换头部为 MHP 解密后的头部
+    if os.path.isfile(MHP_HEADER_PATH):
+        with open(MHP_HEADER_PATH, 'rb') as f:
+            mhp_header = f.read()
+        if len(mhp_header) == MHP_HEADER_SIZE:
+            mhp_magic = struct.unpack('<I', mhp_header[:4])[0]
+            if mhp_magic == METADATA_MAGIC:
+                data[:MHP_HEADER_SIZE] = mhp_header
+                print(f"  ✅ 已用 MHP 头部替换前 {MHP_HEADER_SIZE} 字节（字段偏移重排）")
+            else:
+                print(f"  ⚠️  MHP 头部 magic 不匹配: {hex(mhp_magic)}")
+        else:
+            print(f"  ⚠️  MHP 头部大小异常: {len(mhp_header)} (期望 {MHP_HEADER_SIZE})")
+    else:
+        print(f"  ⚠️  找不到 MHP 头部: {MHP_HEADER_PATH}")
+        print(f"      metadata 将使用原始头部，可能导致崩溃！")
+
     print(f"  ✅ 加载解密 metadata: {len(data):,} bytes (magic OK)")
-    return data
+    return bytes(data)
 
 
 # ==================== APK 重建 ====================

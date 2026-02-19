@@ -995,11 +995,31 @@ static void enumerate_game_classes(void) {
 // 通过修改 MethodInfo 中的 methodPointer（offset 0）来 hook il2cpp 方法
 // 如果 methodPointer 无法修改（HybridCLR 解释器方法），则使用 inline hook
 
-// 获取 MethodInfo 中的 methodPointer（offset 0）
+// 获取 MethodInfo 中的 methodPointer
+// 标准 il2cpp MethodInfo 布局:
+//   offset 0:  methodPointer (void*)
+//   offset 8:  invoker_method (void*)
+//   offset 16: name (const char*)
+// 但 HybridCLR/MHP 可能修改了布局，需要通过检查 name 字段来验证
 static uintptr_t get_method_pointer(Il2CppMethodInfo method) {
     if (!method) return 0;
+    uintptr_t *fields = (uintptr_t *)method;
+    
+    // 尝试验证 MethodInfo 布局：检查不同 offset 下 name 字段是否匹配
+    const char *known_name = fn_method_get_name ? fn_method_get_name(method) : NULL;
+    
+    // 检查标准布局: offset 16 应该是 name
+    if (known_name) {
+        // Dump 前 8 个字段用于调试
+        LOGI("[mi] MethodInfo %p fields: [0]=%p [1]=%p [2]=%p [3]=%p [4]=%p [5]=%p [6]=%p [7]=%p (name=%s)",
+             method,
+             (void*)fields[0], (void*)fields[1], (void*)fields[2], (void*)fields[3],
+             (void*)fields[4], (void*)fields[5], (void*)fields[6], (void*)fields[7],
+             known_name);
+    }
+    
     // Il2CppMethodInfo 第一个字段是 methodPointer（void* 指针）
-    return *(uintptr_t *)method;
+    return fields[0];
 }
 
 // 使用 inline hook 替换函数入口

@@ -1411,6 +1411,13 @@ static int do_unlock_all_dlc(void) {
         return -1;
     }
 
+    // 关键：当前线程可能不是 il2cpp 主线程，必须先 attach
+    if (fn_thread_attach && g_domain) {
+        LOGI("[dlc] Attaching current thread to il2cpp runtime...");
+        fn_thread_attach(g_domain);
+        LOGI("[dlc] Thread attached OK");
+    }
+
     // ===== 0) 枚举 ProtoLogin 和 UserInfo 的所有方法/字段（诊断）=====
     if (!g_proto_login_cls) {
         g_proto_login_cls = fn_class_from_name(g_csharp_image, "", "ProtoLogin");

@@ -4227,6 +4227,17 @@ static void *hack_thread(void *arg) {
     LOGI("=== Creating overlay menu ===");
     create_overlay_menu();
     LOGI("=== Overlay menu launched, waiting for user interaction ===");
+    
+    // 自动 DLC 测试：等待游戏进入主菜单后自动尝试解锁
+    // 在 hack 线程上执行（已 thread_attach），避免 Java 线程的问题
+    {
+        LOGI("[dlc-auto] Waiting 5s for game to reach main menu...");
+        sleep(5);
+        LOGI("[dlc-auto] Starting auto DLC unlock test...");
+        int auto_result = do_unlock_all_dlc();
+        LOGI("[dlc-auto] Auto DLC result: %d", auto_result);
+    }
+    
     // 线程保持存活以处理 JNI 回调
     // 菜单按钮触发 native 方法时会在 Java 线程中调用 do_modify_gold / do_reset_skill_cd
     while (1) { sleep(3600); }

@@ -991,38 +991,30 @@ static void enumerate_game_classes(void) {
     LOGI("[enum] ========== Enumeration complete ==========");
 }
 
-// ========== 通用 il2cpp inline hook 工具 ==========
-// 通过修改 MethodInfo 中的 methodPointer（offset 0）来 hook il2cpp 方法
-// 如果 methodPointer 无法修改（HybridCLR 解释器方法），则使用 inline hook
+// ========== il2cpp MethodInfo hook 工具 ==========
+// HybridCLR 方法的 methodPointer (field[0]) 是共享的解释器蹦床，
+// 不能直接 inline hook。正确做法：直接替换 MethodInfo->methodPointer 为我们的函数。
+// 这样 il2cpp 调用该方法时会执行我们的替代函数。
 
-// 获取 MethodInfo 中的 methodPointer
-// 标准 il2cpp MethodInfo 布局:
-//   offset 0:  methodPointer (void*)
-//   offset 8:  invoker_method (void*)
-//   offset 16: name (const char*)
-// 但 HybridCLR/MHP 可能修改了布局，需要通过检查 name 字段来验证
-static uintptr_t get_method_pointer(Il2CppMethodInfo method) {
-    if (!method) return 0;
+// 替换 MethodInfo 中的 methodPointer (offset 0) 为自定义函数
+// 返回旧的 methodPointer（可用于后续调用原始方法）
+static uintptr_t replace_method_pointer(Il2CppMethodInfo method, void *new_func, const char *name) {
+    if (!method || !new_func) return 0;
     uintptr_t *fields = (uintptr_t *)method;
+    uintptr_t old_ptr = fields[0];
     
-    // 尝试验证 MethodInfo 布局：检查不同 offset 下 name 字段是否匹配
-    const char *known_name = fn_method_get_name ? fn_method_get_name(method) : NULL;
+    // MethodInfo 在堆中，通常已有写权限，但为保险起见 mprotect
+    uintptr_t page = (uintptr_t)method & ~(uintptr_t)0xFFF;
+    mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
     
-    // 检查标准布局: offset 16 应该是 name
-    if (known_name) {
-        // Dump 前 8 个字段用于调试
-        LOGI("[mi] MethodInfo %p fields: [0]=%p [1]=%p [2]=%p [3]=%p [4]=%p [5]=%p [6]=%p [7]=%p (name=%s)",
-             method,
-             (void*)fields[0], (void*)fields[1], (void*)fields[2], (void*)fields[3],
-             (void*)fields[4], (void*)fields[5], (void*)fields[6], (void*)fields[7],
-             known_name);
-    }
+    fields[0] = (uintptr_t)new_func;
     
-    // Il2CppMethodInfo 第一个字段是 methodPointer（void* 指针）
-    return fields[0];
+    LOGI("[hook] %s: MethodInfo %p, old methodPtr=%p -> new=%p",
+         name, method, (void*)old_ptr, new_func);
+    return old_ptr;
 }
 
-// 使用 inline hook 替换函数入口
+// 使用 inline hook 替换函数入口（仅用于 AOT 方法或 libc 函数）
 // 将 target_func 的前 16 字节替换为跳转到 hook_func 的指令
 static int inline_hook_method(uintptr_t target_func, void *hook_func, const char *name) {
     if (!target_func || !hook_func) return -1;
@@ -1051,36 +1043,42 @@ static int inline_hook_method(uintptr_t target_func, void *hook_func, const char
 }
 
 // ========== 版本检查绕过 ==========
+// HybridCLR 方法: 通过替换 MethodInfo.methodPointer 来拦截
+// il2cpp 调用约定: (void* thisptr, Il2CppMethodInfo method, ...)
+
 // Hook PackageVersionControl.get_IsOn() -> 返回 false（关闭版本检查）
-static int /*bool*/ hook_pvc_get_IsOn(void *thisptr) {
-    (void)thisptr;
-    return 0; // false - 关闭版本检查
+static void* hook_pvc_get_IsOn(void *thisptr, Il2CppMethodInfo method) {
+    (void)thisptr; (void)method;
+    LOGI("[bypass] PVC.get_IsOn -> false");
+    return (void*)0; // false - 关闭版本检查
 }
 
 // Hook PackageVersionControl.CheckForceUpgrade() -> 返回 false
-static int /*bool*/ hook_pvc_CheckForceUpgrade(void *thisptr) {
-    (void)thisptr;
-    LOGI("[bypass] CheckForceUpgrade blocked -> false");
-    return 0; // 不需要强制更新
+static void* hook_pvc_CheckForceUpgrade(void *thisptr, Il2CppMethodInfo method) {
+    (void)thisptr; (void)method;
+    LOGI("[bypass] CheckForceUpgrade -> false");
+    return (void*)0; // 不需要强制更新
 }
 
 // Hook PackageVersionControl.DealCheckResult(VersionCheckResult) -> 什么都不做
-static void hook_pvc_DealCheckResult(void *thisptr, int result) {
-    (void)thisptr; (void)result;
-    LOGI("[bypass] DealCheckResult(%d) blocked", result);
-    // 什么都不做，跳过版本检查结果处理
+static void* hook_pvc_DealCheckResult(void *thisptr, Il2CppMethodInfo method, void *result) {
+    (void)thisptr; (void)method; (void)result;
+    LOGI("[bypass] DealCheckResult blocked");
+    return (void*)0;
 }
 
 // Hook PackageVersionControl.CheckComplete(bool) -> 直接返回
-static void hook_pvc_CheckComplete(void *thisptr, int /*bool*/ result) {
-    (void)thisptr; (void)result;
-    LOGI("[bypass] CheckComplete(%d) blocked", result);
+static void* hook_pvc_CheckComplete(void *thisptr, Il2CppMethodInfo method, int result) {
+    (void)thisptr; (void)method; (void)result;
+    LOGI("[bypass] CheckComplete blocked");
+    return (void*)0;
 }
 
 // Hook PackageStateInit.CheckUpdateVersion -> 跳过版本检查
-static void hook_psi_CheckUpdateVersion(void *thisptr, void *arg1, void *arg2) {
-    (void)thisptr; (void)arg1; (void)arg2;
+static void* hook_psi_CheckUpdateVersion(void *thisptr, Il2CppMethodInfo method, void *arg1, void *arg2) {
+    (void)thisptr; (void)method; (void)arg1; (void)arg2;
     LOGI("[bypass] PackageStateInit.CheckUpdateVersion blocked");
+    return (void*)0;
 }
 
 static int bypass_version_check(void) {
@@ -1093,49 +1091,31 @@ static int bypass_version_check(void) {
         return 0;
     }
     
-    // Hook get_IsOn() - 关闭版本检查开关
     if (fn_class_get_method_from_name) {
-        Il2CppMethodInfo m = fn_class_get_method_from_name(pvc_class, "get_IsOn", 0);
-        if (m) {
-            uintptr_t fp = get_method_pointer(m);
-            if (fp && inline_hook_method(fp, (void*)hook_pvc_get_IsOn, "PVC.get_IsOn") == 0)
-                hooked++;
-        }
+        Il2CppMethodInfo m;
+        
+        // Hook get_IsOn() - 关闭版本检查开关
+        m = fn_class_get_method_from_name(pvc_class, "get_IsOn", 0);
+        if (m) { replace_method_pointer(m, (void*)hook_pvc_get_IsOn, "PVC.get_IsOn"); hooked++; }
         
         // Hook CheckForceUpgrade()
         m = fn_class_get_method_from_name(pvc_class, "CheckForceUpgrade", 0);
-        if (m) {
-            uintptr_t fp = get_method_pointer(m);
-            if (fp && inline_hook_method(fp, (void*)hook_pvc_CheckForceUpgrade, "PVC.CheckForceUpgrade") == 0)
-                hooked++;
-        }
+        if (m) { replace_method_pointer(m, (void*)hook_pvc_CheckForceUpgrade, "PVC.CheckForceUpgrade"); hooked++; }
         
         // Hook DealCheckResult(1)
         m = fn_class_get_method_from_name(pvc_class, "DealCheckResult", 1);
-        if (m) {
-            uintptr_t fp = get_method_pointer(m);
-            if (fp && inline_hook_method(fp, (void*)hook_pvc_DealCheckResult, "PVC.DealCheckResult") == 0)
-                hooked++;
-        }
+        if (m) { replace_method_pointer(m, (void*)hook_pvc_DealCheckResult, "PVC.DealCheckResult"); hooked++; }
         
         // Hook CheckComplete(1)
         m = fn_class_get_method_from_name(pvc_class, "CheckComplete", 1);
-        if (m) {
-            uintptr_t fp = get_method_pointer(m);
-            if (fp && inline_hook_method(fp, (void*)hook_pvc_CheckComplete, "PVC.CheckComplete") == 0)
-                hooked++;
-        }
+        if (m) { replace_method_pointer(m, (void*)hook_pvc_CheckComplete, "PVC.CheckComplete"); hooked++; }
     }
     
     // 也 hook PackageStateInit.CheckUpdateVersion
     Il2CppClass psi_class = fn_class_from_name(g_csharp_image, "", "PackageStateInit");
     if (psi_class && fn_class_get_method_from_name) {
         Il2CppMethodInfo m = fn_class_get_method_from_name(psi_class, "CheckUpdateVersion", 2);
-        if (m) {
-            uintptr_t fp = get_method_pointer(m);
-            if (fp && inline_hook_method(fp, (void*)hook_psi_CheckUpdateVersion, "PSI.CheckUpdateVersion") == 0)
-                hooked++;
-        }
+        if (m) { replace_method_pointer(m, (void*)hook_psi_CheckUpdateVersion, "PSI.CheckUpdateVersion"); hooked++; }
     }
     
     LOGI("[bypass] Version check bypass: %d hooks installed", hooked);
@@ -1143,89 +1123,141 @@ static int bypass_version_check(void) {
 }
 
 // ========== DLC/职业解锁绕过 ==========
+// HybridCLR il2cpp 调用约定: (void* thisptr, Il2CppMethodInfo method, ...)
+
 // Hook UserInfo.IsDLCRole(int roleId) -> 返回 false（所有角色都不是 DLC，可免费选择）
-static int /*bool*/ hook_userinfo_IsDLCRole(void *thisptr, int roleId) {
-    (void)thisptr;
+static void* hook_userinfo_IsDLCRole(void *thisptr, Il2CppMethodInfo method, int roleId) {
+    (void)thisptr; (void)method;
     LOGI("[bypass] IsDLCRole(%d) -> false (unlocked)", roleId);
-    return 0; // false = 不是 DLC 角色 = 免费可用
+    return (void*)0; // false = 不是 DLC 角色 = 免费可用
 }
 
 // Hook UserInfo.IsBaseRole(int roleId) -> 返回 true（所有角色都是基础角色）
-static int /*bool*/ hook_userinfo_IsBaseRole(void *thisptr, int roleId) {
-    (void)thisptr;
-    return 1; // true = 基础角色 = 不需要购买
+static void* hook_userinfo_IsBaseRole(void *thisptr, Il2CppMethodInfo method, int roleId) {
+    (void)thisptr; (void)method;
+    LOGI("[bypass] IsBaseRole(%d) -> true", roleId);
+    return (void*)1; // true = 基础角色 = 不需要购买
 }
 
 // Hook PurchaseManager.IsUnlockShop_PVP(int shopId) -> 返回 true
-static int /*bool*/ hook_pm_IsUnlockShop_PVP(void *thisptr, int shopId) {
-    (void)thisptr;
+static void* hook_pm_IsUnlockShop_PVP(void *thisptr, Il2CppMethodInfo method, int shopId) {
+    (void)thisptr; (void)method;
     LOGI("[bypass] IsUnlockShop_PVP(%d) -> true", shopId);
-    return 1; // 已解锁
+    return (void*)1; // 已解锁
 }
 
 // Hook SDKManager.IsFroceLogin() -> 返回 false（不强制登录）
-static int /*bool*/ hook_sdk_IsForceLogin(void *thisptr) {
-    (void)thisptr;
-    return 0; // false = 不需要强制登录
+static void* hook_sdk_IsForceLogin(void *thisptr, Il2CppMethodInfo method) {
+    (void)thisptr; (void)method;
+    LOGI("[bypass] IsFroceLogin -> false");
+    return (void*)0; // false = 不需要强制登录
 }
 
 // Hook PurchaseManager.IsNeedBind() -> 返回 false（不需要绑定）
-static int /*bool*/ hook_pm_IsNeedBind(void *thisptr) {
-    (void)thisptr;
-    return 0; // false = 不需要绑定
+static void* hook_pm_IsNeedBind(void *thisptr, Il2CppMethodInfo method) {
+    (void)thisptr; (void)method;
+    LOGI("[bypass] IsNeedBind -> false");
+    return (void*)0; // false = 不需要绑定
+}
+
+// Hook ProtoLogin.IsDLCRole(int) -> 返回 false
+static void* hook_proto_IsDLCRole(void *thisptr, Il2CppMethodInfo method, int roleId) {
+    (void)thisptr; (void)method;
+    LOGI("[bypass] ProtoLogin.IsDLCRole(%d) -> false", roleId);
+    return (void*)0;
+}
+
+// Hook ProtoLogin.IsUnlockAllDLC(int) -> 返回 true
+static void* hook_proto_IsUnlockAllDLC(void *thisptr, Il2CppMethodInfo method, int arg) {
+    (void)thisptr; (void)method; (void)arg;
+    LOGI("[bypass] ProtoLogin.IsUnlockAllDLC -> true");
+    return (void*)1;
+}
+
+// Hook Achieve.checkDLCUnlock(GameItemID, AchievementType) -> 返回 true
+static void* hook_achieve_checkDLCUnlock(void *thisptr, Il2CppMethodInfo method, int gameItemId, int achieveType) {
+    (void)thisptr; (void)method;
+    LOGI("[bypass] Achieve.checkDLCUnlock(%d, %d) -> true", gameItemId, achieveType);
+    return (void*)1; // 已解锁
+}
+
+// Hook EnterLayer.CheckLogin() -> 跳过登录检查
+static void* hook_enterlayer_CheckLogin(void *thisptr, Il2CppMethodInfo method) {
+    (void)thisptr; (void)method;
+    LOGI("[bypass] EnterLayer.CheckLogin -> skip");
+    return (void*)0;
+}
+
+// Hook GameStartCheck.CheckForceUpgrade(int) -> 返回 false
+static void* hook_gsc_CheckForceUpgrade(void *thisptr, Il2CppMethodInfo method, int arg) {
+    (void)thisptr; (void)method; (void)arg;
+    LOGI("[bypass] GameStartCheck.CheckForceUpgrade -> false");
+    return (void*)0;
 }
 
 static int bypass_dlc_lock(void) {
     LOGI("[bypass] ===== Installing DLC/career unlock bypass =====");
     int hooked = 0;
     
-    // Hook UserInfo.IsDLCRole -> false
+    // Hook UserInfo.IsDLCRole -> false, IsBaseRole -> true
     Il2CppClass ui_class = fn_class_from_name(g_csharp_image, "", "UserInfo");
     if (ui_class && fn_class_get_method_from_name) {
-        Il2CppMethodInfo m = fn_class_get_method_from_name(ui_class, "IsDLCRole", 1);
-        if (m) {
-            uintptr_t fp = get_method_pointer(m);
-            if (fp && inline_hook_method(fp, (void*)hook_userinfo_IsDLCRole, "UserInfo.IsDLCRole") == 0)
-                hooked++;
-        }
+        Il2CppMethodInfo m;
+        m = fn_class_get_method_from_name(ui_class, "IsDLCRole", 1);
+        if (m) { replace_method_pointer(m, (void*)hook_userinfo_IsDLCRole, "UserInfo.IsDLCRole"); hooked++; }
         
-        // Hook UserInfo.IsBaseRole -> true
         m = fn_class_get_method_from_name(ui_class, "IsBaseRole", 1);
-        if (m) {
-            uintptr_t fp = get_method_pointer(m);
-            if (fp && inline_hook_method(fp, (void*)hook_userinfo_IsBaseRole, "UserInfo.IsBaseRole") == 0)
-                hooked++;
-        }
+        if (m) { replace_method_pointer(m, (void*)hook_userinfo_IsBaseRole, "UserInfo.IsBaseRole"); hooked++; }
     }
     
-    // Hook PurchaseManager.IsUnlockShop_PVP -> true
+    // Hook PurchaseManager
     Il2CppClass pm_class = fn_class_from_name(g_csharp_image, "", "PurchaseManager");
     if (pm_class && fn_class_get_method_from_name) {
-        Il2CppMethodInfo m = fn_class_get_method_from_name(pm_class, "IsUnlockShop_PVP", 1);
-        if (m) {
-            uintptr_t fp = get_method_pointer(m);
-            if (fp && inline_hook_method(fp, (void*)hook_pm_IsUnlockShop_PVP, "PM.IsUnlockShop_PVP") == 0)
-                hooked++;
-        }
+        Il2CppMethodInfo m;
+        m = fn_class_get_method_from_name(pm_class, "IsUnlockShop_PVP", 1);
+        if (m) { replace_method_pointer(m, (void*)hook_pm_IsUnlockShop_PVP, "PM.IsUnlockShop_PVP"); hooked++; }
         
-        // Hook IsNeedBind -> false
         m = fn_class_get_method_from_name(pm_class, "IsNeedBind", 0);
-        if (m) {
-            uintptr_t fp = get_method_pointer(m);
-            if (fp && inline_hook_method(fp, (void*)hook_pm_IsNeedBind, "PM.IsNeedBind") == 0)
-                hooked++;
-        }
+        if (m) { replace_method_pointer(m, (void*)hook_pm_IsNeedBind, "PM.IsNeedBind"); hooked++; }
     }
     
     // Hook SDKManager.IsFroceLogin -> false
     Il2CppClass sdk_class = fn_class_from_name(g_csharp_image, "", "SDKManager");
     if (sdk_class && fn_class_get_method_from_name) {
         Il2CppMethodInfo m = fn_class_get_method_from_name(sdk_class, "IsFroceLogin", 0);
-        if (m) {
-            uintptr_t fp = get_method_pointer(m);
-            if (fp && inline_hook_method(fp, (void*)hook_sdk_IsForceLogin, "SDK.IsFroceLogin") == 0)
-                hooked++;
-        }
+        if (m) { replace_method_pointer(m, (void*)hook_sdk_IsForceLogin, "SDK.IsFroceLogin"); hooked++; }
+    }
+    
+    // Hook ProtoLogin.IsDLCRole, IsUnlockAllDLC
+    Il2CppClass proto_class = fn_class_from_name(g_csharp_image, "", "ProtoLogin");
+    if (proto_class && fn_class_get_method_from_name) {
+        Il2CppMethodInfo m;
+        m = fn_class_get_method_from_name(proto_class, "IsDLCRole", 1);
+        if (m) { replace_method_pointer(m, (void*)hook_proto_IsDLCRole, "ProtoLogin.IsDLCRole"); hooked++; }
+        
+        m = fn_class_get_method_from_name(proto_class, "IsUnlockAllDLC", 1);
+        if (m) { replace_method_pointer(m, (void*)hook_proto_IsUnlockAllDLC, "ProtoLogin.IsUnlockAllDLC"); hooked++; }
+    }
+    
+    // Hook Achieve.checkDLCUnlock
+    Il2CppClass achieve_class = fn_class_from_name(g_csharp_image, "", "Achieve");
+    if (achieve_class && fn_class_get_method_from_name) {
+        Il2CppMethodInfo m = fn_class_get_method_from_name(achieve_class, "checkDLCUnlock", 2);
+        if (m) { replace_method_pointer(m, (void*)hook_achieve_checkDLCUnlock, "Achieve.checkDLCUnlock"); hooked++; }
+    }
+    
+    // Hook EnterLayer.CheckLogin
+    Il2CppClass enter_class = fn_class_from_name(g_csharp_image, "", "EnterLayer");
+    if (enter_class && fn_class_get_method_from_name) {
+        Il2CppMethodInfo m = fn_class_get_method_from_name(enter_class, "CheckLogin", 0);
+        if (m) { replace_method_pointer(m, (void*)hook_enterlayer_CheckLogin, "EnterLayer.CheckLogin"); hooked++; }
+    }
+    
+    // Hook GameStartCheck.CheckForceUpgrade
+    Il2CppClass gsc_class = fn_class_from_name(g_csharp_image, "", "GameStartCheck");
+    if (gsc_class && fn_class_get_method_from_name) {
+        Il2CppMethodInfo m = fn_class_get_method_from_name(gsc_class, "CheckForceUpgrade", 1);
+        if (m) { replace_method_pointer(m, (void*)hook_gsc_CheckForceUpgrade, "GSC.CheckForceUpgrade"); hooked++; }
     }
     
     LOGI("[bypass] DLC/career unlock bypass: %d hooks installed", hooked);

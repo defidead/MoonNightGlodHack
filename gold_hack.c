@@ -21,6 +21,8 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <errno.h>
 #include <jni.h>
 #include <android/log.h>
 
@@ -3306,10 +3308,65 @@ static void *hack_thread(void *arg) {
     return NULL;
 }
 
+// ========== Anti-kill: 拦截 MHP/SecSDK 反篡改自杀 ==========
+// MHP/SecSDK 检测到 APK 被修改后，通过 Process.killProcess() -> kill(getpid(), SIGKILL)
+// 杀死进程。我们通过 inline hook libc 的 kill() 函数来拦截自杀。
+
+static int hook_kill_func(pid_t pid, int sig) {
+    if (sig == SIGKILL && pid == getpid()) {
+        LOGW("[anti-kill] Blocked self-kill (SIGKILL) from anti-tamper check");
+        return 0;  // 假装成功但不执行
+    }
+    // 其他 kill 调用使用原始 syscall
+    return (int)syscall(__NR_kill, pid, sig);
+}
+
+static void install_kill_hook(void) {
+    // 查找 libc 的 kill() 函数
+    void *kill_addr = dlsym(RTLD_DEFAULT, "kill");
+    if (!kill_addr) {
+        LOGE("[anti-kill] dlsym(kill) failed");
+        return;
+    }
+    LOGI("[anti-kill] libc kill() @ %p, hook @ %p", kill_addr, (void*)hook_kill_func);
+
+    // 使 kill() 代码页可写
+    uintptr_t page = (uintptr_t)kill_addr & ~(uintptr_t)0xFFF;
+    if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("[anti-kill] mprotect RWX failed: %s", strerror(errno));
+        // 尝试不带 EXEC 的 mprotect
+        if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE) != 0) {
+            LOGE("[anti-kill] mprotect RW failed: %s", strerror(errno));
+            return;
+        }
+    }
+
+    // 在 kill() 入口写入跳转到 hook 的指令:
+    // LDR X16, [PC, #8]   (0x58000050)
+    // BR  X16              (0xD61F0200)
+    // .quad hook_addr      (8 bytes)
+    uint32_t *code = (uint32_t *)kill_addr;
+    code[0] = 0x58000050;  // LDR X16, [PC, #8]
+    code[1] = 0xD61F0200;  // BR X16
+    uint64_t *target = (uint64_t *)(code + 2);
+    *target = (uint64_t)(void*)hook_kill_func;
+
+    // 刷新指令缓存
+    __builtin___clear_cache((char *)kill_addr, (char *)((uint8_t*)kill_addr + 16));
+
+    // 恢复页保护
+    mprotect((void *)page, 0x2000, PROT_READ | PROT_EXEC);
+
+    LOGI("[anti-kill] kill() hooked successfully");
+}
+
 // ========== .so 入口（constructor）==========
 __attribute__((constructor))
 void gold_hack_init(void) {
     LOGI("=== libgoldhack.so loaded ===");
+
+    // 第一时间安装 kill() hook，防止反篡改保护杀进程
+    install_kill_hook();
     
     pthread_t tid;
     int ret = pthread_create(&tid, NULL, hack_thread, (void*)(intptr_t)TARGET_GOLD);

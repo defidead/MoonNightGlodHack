@@ -1905,17 +1905,13 @@ static int do_unlock_all_dlc(void) {
                     if (fname && strcmp(fname, "Gold") == 0) gold_offset = foffset;
                 }
 
-                // 修改 Gold 字段
+                // Gold 字段：仅记录，不修改（直接写内存会破坏 LoginData 序列化）
                 if (gold_offset >= 0) {
                     install_sigsegv_handler();
                     g_in_safe_access = 1;
                     if (sigsetjmp(g_jmpbuf, 1) == 0) {
                         int32_t cur_gold = *(volatile int32_t *)(loginData + gold_offset);
-                        LOGI("[dlc] mLoginData.Gold = %d (offset 0x%x)", cur_gold, gold_offset);
-                        if (cur_gold < 99999) {
-                            *(volatile int32_t *)(loginData + gold_offset) = 99999;
-                            LOGI("[dlc] Set mLoginData.Gold = 99999");
-                        }
+                        LOGI("[dlc] mLoginData.Gold = %d (offset 0x%x, read-only)", cur_gold, gold_offset);
                     }
                     g_in_safe_access = 0;
                     uninstall_sigsegv_handler();
@@ -2015,20 +2011,20 @@ static int do_unlock_all_dlc(void) {
             SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
             LOGI("[dlc] UpdateDLC() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
         }
-        if (m_saveLData) {
-            LOGI("[dlc] SaveLoginData() to persist...");
-            exc = NULL;
-            void *r = NULL;
-            SAFE_INVOKE(r, m_saveLData, (void*)g_proto_login_inst, NULL, &exc);
-            LOGI("[dlc] SaveLoginData() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
+        // UpdateDLC 之后重新设置 mDLCSet = packAll (以防 UpdateDLC 重建的 HashSet 不完整)
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+            uintptr_t packAll_val = *(volatile uintptr_t *)(g_proto_login_inst + 0x60);
+            if (packAll_val) {
+                *(volatile uintptr_t *)(g_proto_login_inst + 0x40) = packAll_val;
+                LOGI("[dlc] Post-UpdateDLC: Re-set mDLCSet = packAll (%p)", (void*)packAll_val);
+            }
         }
-        if (m_loginComplete) {
-            LOGI("[dlc] LoginComplete() to refresh UI...");
-            exc = NULL;
-            void *r = NULL;
-            SAFE_INVOKE(r, m_loginComplete, (void*)g_proto_login_inst, NULL, &exc);
-            LOGI("[dlc] LoginComplete() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
-        }
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        // 不调用 SaveLoginData/LoginComplete — 它们会崩溃 (内存分配 0xFFFFFFFED00001D0)
+        LOGI("[dlc] Skipping SaveLoginData/LoginComplete (crash prevention)");
     } else {
         LOGI("[dlc] mLoginData.DLC not modified - keeping mDLCSet=packAll (no UpdateDLC)");
     }

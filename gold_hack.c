@@ -1264,6 +1264,259 @@ static int bypass_dlc_lock(void) {
     return hooked;
 }
 
+// ========== DLC 解锁 - 数据修改方式（绕过 HybridCLR 方法拦截限制）==========
+// HybridCLR 解释器内部调用绕过 methodPointer，所以 replace_method_pointer 无效。
+// 新方案：找到 ProtoLogin 单例，直接通过 il2cpp_runtime_invoke 调用 AddDLC() 向数据集添加 DLC。
+static Il2CppClass   g_proto_login_cls  = NULL;
+static uintptr_t     g_proto_login_inst = 0;
+
+// 扫描内存查找 ProtoLogin 实例（与 RoleInfo 扫描相同原理）
+static int find_proto_login_instance(void) {
+    if (!g_proto_login_cls) {
+        g_proto_login_cls = fn_class_from_name(g_csharp_image, "", "ProtoLogin");
+        if (!g_proto_login_cls) {
+            LOGE("[dlc] ProtoLogin class not found!");
+            return 0;
+        }
+        LOGI("[dlc] ProtoLogin klass: %p", g_proto_login_cls);
+    }
+
+    uintptr_t klass_val = (uintptr_t)g_proto_login_cls;
+    g_proto_login_inst = 0;
+    int candidates = 0;
+
+    parse_maps();
+    install_sigsegv_handler();
+
+    for (int r = 0; r < g_region_count && !g_proto_login_inst; r++) {
+        MemRegion *region = &g_regions[r];
+        if (!region->readable || !region->writable) continue;
+        size_t size = region->end - region->start;
+        if (size < 0x90 || size > MAX_SCAN_SIZE) continue;
+        if (strstr(region->path, ".so") || strstr(region->path, "/dev/")) continue;
+
+        uint8_t *base = (uint8_t *)region->start;
+        for (size_t off = 0; off <= size - 0x90; off += 8) {
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) != 0) { g_in_safe_access = 0; break; }
+
+            uintptr_t *p = (uintptr_t *)(base + off);
+            if (*p != klass_val) { g_in_safe_access = 0; continue; }
+
+            uintptr_t obj = (uintptr_t)(base + off);
+            // 验证 monitor (+8)
+            uintptr_t monitor = *(volatile uintptr_t *)(obj + 8);
+            if (monitor != 0 && monitor < 0x10000) { g_in_safe_access = 0; continue; }
+            // 读取关键字段做诊断
+            uintptr_t mDLCSet   = *(volatile uintptr_t *)(obj + 64);
+            uintptr_t baseRoles = *(volatile uintptr_t *)(obj + 88);
+            g_in_safe_access = 0;
+
+            candidates++;
+            LOGI("[dlc] ProtoLogin candidate #%d @ 0x%" PRIxPTR
+                 ": mDLCSet=%p, BaseRoles=%p",
+                 candidates, obj, (void*)mDLCSet, (void*)baseRoles);
+            g_proto_login_inst = obj;
+            break;
+        }
+    }
+    uninstall_sigsegv_handler();
+
+    if (g_proto_login_inst) {
+        LOGI("[dlc] Found ProtoLogin @ 0x%" PRIxPTR, g_proto_login_inst);
+    } else {
+        LOGW("[dlc] No ProtoLogin instance found (%d candidates)", candidates);
+    }
+    return g_proto_login_inst != 0;
+}
+
+// 诊断：dump MethodInfo 结构（用于分析 HybridCLR 内部布局）
+static void dump_method_info(const char *label, Il2CppMethodInfo m) {
+    if (!m) return;
+    uint64_t *p = (uint64_t *)m;
+    LOGI("[dlc-diag] MethodInfo '%s' @ %p:", label, m);
+    for (int i = 0; i < 12; i++) {
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) != 0) {
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+            LOGI("[dlc-diag]   [+%02x] <unreadable>", i * 8);
+            continue;
+        }
+        uint64_t val = p[i];
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        LOGI("[dlc-diag]   [+%02x] 0x%016" PRIx64, i * 8, val);
+    }
+}
+
+// 主 DLC 解锁函数
+static int do_unlock_all_dlc(void) {
+    if (init_il2cpp_context() != 0) return -1;
+
+    if (!fn_runtime_invoke) {
+        LOGE("[dlc] il2cpp_runtime_invoke not resolved!");
+        return -1;
+    }
+
+    // 1) 找 ProtoLogin 实例
+    if (!find_proto_login_instance()) {
+        LOGW("[dlc] ProtoLogin not found - game may not be initialized");
+        return -2;
+    }
+
+    // 2) 获取需要的方法
+    Il2CppMethodInfo m_addDLC   = fn_class_get_method_from_name(g_proto_login_cls, "AddDLC", 1);
+    Il2CppMethodInfo m_getDLCId = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCId", 1);
+    Il2CppMethodInfo m_getDLCs  = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCs", 0);
+    Il2CppMethodInfo m_isUnlock = fn_class_get_method_from_name(g_proto_login_cls, "isUnlockRole", 1);
+    Il2CppMethodInfo m_isDLCRole= fn_class_get_method_from_name(g_proto_login_cls, "IsDLCRole", 1);
+
+    if (!m_addDLC) {
+        LOGE("[dlc] AddDLC(1) method not found!");
+        return -3;
+    }
+    LOGI("[dlc] Methods: AddDLC=%p GetDLCId=%p getDLCs=%p isUnlock=%p isDLCRole=%p",
+         m_addDLC, m_getDLCId, m_getDLCs, m_isUnlock, m_isDLCRole);
+
+    // 诊断：dump AddDLC MethodInfo（了解 HybridCLR 结构）
+    dump_method_info("AddDLC", m_addDLC);
+
+    void *exc = NULL;
+
+    // 3) 先检查当前解锁状态
+    LOGI("[dlc] === Before unlock ===");
+    if (m_isDLCRole) {
+        for (int32_t rid = 0; rid <= 15; rid++) {
+            void *params[1] = { &rid };
+            exc = NULL;
+            // 注意: 我们已替换了 ProtoLogin.IsDLCRole 的 methodPointer
+            //       但 il2cpp_runtime_invoke 会走 invoker_method -> 我们的 hook
+            //       所以这里调用原始未 hook 的 UserInfo.IsDLCRole 更准确
+        }
+    }
+    if (m_isUnlock) {
+        for (int32_t rid = 0; rid <= 15; rid++) {
+            void *params[1] = { &rid };
+            exc = NULL;
+            void *result = fn_runtime_invoke(m_isUnlock, (void *)g_proto_login_inst, params, (void **)&exc);
+            if (exc) {
+                LOGW("[dlc] isUnlockRole(%d) exception", rid);
+                continue;
+            }
+            // il2cpp_runtime_invoke 返回 boxed value，bool 在 offset 0x10
+            int unlocked = 0;
+            if (result) {
+                install_sigsegv_handler();
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                    unlocked = *(int32_t *)((uint8_t *)result + 0x10);
+                }
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
+            }
+            LOGI("[dlc]   isUnlockRole(%d) = %d", rid, unlocked);
+        }
+    }
+
+    // 4) 发现 DLC IDs: 调用 GetDLCId(roleId) 对每个角色
+    int32_t dlc_ids[64];
+    int     dlc_count = 0;
+
+    if (m_getDLCId) {
+        LOGI("[dlc] Discovering DLC IDs via GetDLCId...");
+        for (int32_t roleId = 0; roleId <= 30; roleId++) {
+            void *params[1] = { &roleId };
+            exc = NULL;
+            void *result = fn_runtime_invoke(m_getDLCId, (void *)g_proto_login_inst, params, (void **)&exc);
+            if (exc) continue;
+            if (!result) continue;
+            // Unbox int
+            int32_t dlcId = 0;
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                dlcId = *(int32_t *)((uint8_t *)result + 0x10);
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+
+            if (dlcId > 0) {
+                LOGI("[dlc]   Role %d -> DLC ID %d", roleId, dlcId);
+                int dup = 0;
+                for (int i = 0; i < dlc_count; i++) {
+                    if (dlc_ids[i] == dlcId) { dup = 1; break; }
+                }
+                if (!dup && dlc_count < 64) {
+                    dlc_ids[dlc_count++] = dlcId;
+                }
+            }
+        }
+        LOGI("[dlc] Discovered %d unique DLC IDs", dlc_count);
+    }
+
+    // 若未发现任何 DLC ID，尝试暴力范围 1-50
+    if (dlc_count == 0) {
+        LOGI("[dlc] No DLC IDs discovered via GetDLCId, trying range 1-50...");
+        for (int32_t i = 1; i <= 50; i++) {
+            dlc_ids[dlc_count++] = i;
+        }
+    }
+
+    // 5) 调用 AddDLC 添加每个 DLC
+    int added = 0;
+    for (int i = 0; i < dlc_count; i++) {
+        int32_t dlcId = dlc_ids[i];
+        void *params[1] = { &dlcId };
+        exc = NULL;
+        fn_runtime_invoke(m_addDLC, (void *)g_proto_login_inst, params, (void **)&exc);
+        if (exc) {
+            LOGW("[dlc] AddDLC(%d) threw exception", dlcId);
+        } else {
+            LOGI("[dlc] AddDLC(%d) OK", dlcId);
+            added++;
+        }
+    }
+
+    // 6) 验证：再次检查解锁状态
+    LOGI("[dlc] === After unlock (added %d) ===", added);
+    if (m_isUnlock) {
+        for (int32_t rid = 0; rid <= 15; rid++) {
+            void *params[1] = { &rid };
+            exc = NULL;
+            void *result = fn_runtime_invoke(m_isUnlock, (void *)g_proto_login_inst, params, (void **)&exc);
+            if (exc) continue;
+            int unlocked = 0;
+            if (result) {
+                install_sigsegv_handler();
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                    unlocked = *(int32_t *)((uint8_t *)result + 0x10);
+                }
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
+            }
+            LOGI("[dlc]   isUnlockRole(%d) = %d %s", rid, unlocked,
+                 unlocked ? "(UNLOCKED)" : "(locked)");
+        }
+    }
+
+    // 7) 也修改 mDLCSet 字段，确认写入
+    install_sigsegv_handler();
+    g_in_safe_access = 1;
+    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+        uintptr_t mDLCSet   = *(volatile uintptr_t *)(g_proto_login_inst + 64);
+        uintptr_t baseRoles = *(volatile uintptr_t *)(g_proto_login_inst + 88);
+        LOGI("[dlc] Final state: mDLCSet=%p, BaseRoles=%p", (void*)mDLCSet, (void*)baseRoles);
+    }
+    g_in_safe_access = 0;
+    uninstall_sigsegv_handler();
+
+    LOGI("[dlc] ===== DLC unlock complete: %d DLCs added =====", added);
+    return added;
+}
+
 // ========== RoleInfo 实例缓存（避免每次全量扫描）==========
 #define MAX_CACHED_ROLEINFO 8
 static uintptr_t g_cached_roleinfo[MAX_CACHED_ROLEINFO];
@@ -3393,6 +3646,27 @@ static jstring JNICALL jni_set_card_count(JNIEnv *env, jclass clazz, jint card_i
     return js;
 }
 
+// ========== DLC 解锁 JNI 方法 ==========
+static jstring JNICALL jni_unlock_dlc(JNIEnv *env, jclass clazz) {
+    LOGI("[JNI] nativeUnlockDLC");
+    if (pthread_mutex_trylock(&g_hack_mutex) != 0) {
+        LOGW("[JNI] nativeUnlockDLC busy");
+        return (*env)->NewStringUTF(env, "\u23F3 操作进行中，请稍候...");
+    }
+    int result = do_unlock_all_dlc();
+    pthread_mutex_unlock(&g_hack_mutex);
+    char buf[256];
+    if (result > 0)
+        snprintf(buf, sizeof(buf), "\u2705 DLC解锁完成: 已添加 %d 个DLC，请返回角色选择界面查看", result);
+    else if (result == -2)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未找到 ProtoLogin 实例(请先进入主菜单)");
+    else if (result == 0)
+        snprintf(buf, sizeof(buf), "\u26A0\uFE0F 未能添加任何 DLC (详见logcat)");
+    else
+        snprintf(buf, sizeof(buf), "\u274C DLC 解锁失败 (code=%d)", result);
+    return (*env)->NewStringUTF(env, buf);
+}
+
 static JNINativeMethod g_jni_methods[] = {
     { "nativeModifyGold",      "(I)Ljava/lang/String;",     (void *)jni_modify_gold },
     { "nativeResetSkillCD",    "()Ljava/lang/String;",      (void *)jni_reset_skill_cd },
@@ -3411,6 +3685,7 @@ static JNINativeMethod g_jni_methods[] = {
     { "nativeRemoveCard",      "(I)Ljava/lang/String;",     (void *)jni_remove_card },
     { "nativeRemoveLostThing", "(I)Ljava/lang/String;",     (void *)jni_remove_lostthing },
     { "nativeSetCardCount",    "(II)Ljava/lang/String;",    (void *)jni_set_card_count },
+    { "nativeUnlockDLC",       "()Ljava/lang/String;",      (void *)jni_unlock_dlc },
 };
 
 // ========== 通过 JNI 加载嵌入的 DEX 并创建悬浮菜单 ==========

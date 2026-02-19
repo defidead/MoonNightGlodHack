@@ -73,6 +73,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     private static final int BTN_MANAGE_CARD  = 0x7f000025;
     private static final int BTN_MANAGE_BLESS = 0x7f000026;
     private static final int BTN_MANAGE_EQUIP = 0x7f000027;
+    private static final int BTN_UNLOCK_DLC  = 0x7f000028;
 
     // 物品类型常量 (与 C 层 do_enum_items 对应)
     private static final int ITEM_TYPE_CARD      = 1;
@@ -97,6 +98,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     public static native String nativeRemoveCard(int cardId);
     public static native String nativeRemoveLostThing(int lostThingId);
     public static native String nativeSetCardCount(int cardId, int count);
+    public static native String nativeUnlockDLC();
 
     /**
      * 从 C 代码调用的入口，在 UI 线程创建悬浮窗
@@ -330,6 +332,16 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         modAllBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
         modAllBtn.setTypeface(null, android.graphics.Typeface.BOLD);
         contentArea.addView(modAllBtn);
+
+        // ==================== 🔓 DLC解锁 ====================
+        Button dlcBtn = makeGradientBtn("\uD83D\uDD13 解锁全部DLC/职业", 0xFFE65100, 0xFFFF6D00, BTN_UNLOCK_DLC);
+        LinearLayout.LayoutParams dlclp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(36));
+        dlclp.setMargins(0, dp(6), 0, 0);
+        dlcBtn.setLayoutParams(dlclp);
+        dlcBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        dlcBtn.setTypeface(null, android.graphics.Typeface.BOLD);
+        contentArea.addView(dlcBtn);
 
         // --- 状态栏 ---
         statusText = new TextView(activity);
@@ -576,6 +588,8 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             showManageDialog(ITEM_TYPE_LOSTTHING, "祝福/遗物", "nativeRemoveLostThing");
         } else if (id == BTN_PRESCAN) {
             doPreScan();
+        } else if (id == BTN_UNLOCK_DLC) {
+            doUnlockDLC();
         } else if (id == BTN_P1 || id == BTN_P2 || id == BTN_P3 || id == BTN_P4) {
             Object tag = v.getTag();
             if (tag != null) goldInput.setText(tag.toString());
@@ -789,6 +803,25 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             @Override
             public void run() {
                 final String result = nativePreScan();
+                new Handler(Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        statusText.setText(result);
+                        setBusy(false);
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void doUnlockDLC() {
+        if (busy) return;
+        setBusy(true);
+        statusText.setText("\uD83D\uDD13 正在解锁DLC...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final String result = nativeUnlockDLC();
                 new Handler(Looper.getMainLooper()).post(new Runnable() {
                     @Override
                     public void run() {
@@ -1044,7 +1077,6 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             AlertDialog dlg = builder.create();
             dlgRef[0] = dlg;
             if (dlg.getWindow() != null) {
-                dlg.getWindow().setType(2038);
                 dlg.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
                 dlg.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE);
                 dlg.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
@@ -1321,7 +1353,6 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             AlertDialog dlg = builder.create();
             dlgRef[0] = dlg;
             if (dlg.getWindow() != null) {
-                dlg.getWindow().setType(2038);
                 dlg.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
             }
             dlg.show();
@@ -1655,7 +1686,6 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
             AlertDialog dlg = builder.create();
             dlgRef[0] = dlg;
             if (dlg.getWindow() != null) {
-                dlg.getWindow().setType(2038);
                 dlg.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
             }
             dlg.show();

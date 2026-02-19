@@ -1392,7 +1392,7 @@ static int do_unlock_all_dlc(void) {
 
     // 1) 找 ProtoLogin 实例
     if (!find_proto_login_instance()) {
-        LOGW("[dlc] ProtoLogin not found - 请先进入游戏主菜单（点击"开始"按钮后）再试");
+        LOGW("[dlc] ProtoLogin not found - please enter main menu first");
         return -2;
     }
 

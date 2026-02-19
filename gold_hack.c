@@ -145,6 +145,8 @@ static il2cpp_method_get_class_t           fn_method_get_class = NULL;
 static il2cpp_object_get_class_t           fn_object_get_class = NULL;
 static il2cpp_class_get_image_t            fn_class_get_image = NULL;
 static il2cpp_class_get_parent_t           fn_class_get_parent = NULL;
+static il2cpp_class_get_name_t             fn_class_get_name = NULL;
+static il2cpp_class_get_namespace_t        fn_class_get_namespace = NULL;
 
 static ApiEntry g_api_table[] = {
     { "il2cpp_domain_get",                 (void**)&fn_domain_get },
@@ -169,10 +171,12 @@ static ApiEntry g_api_table[] = {
     { "il2cpp_object_get_class",           (void**)&fn_object_get_class },
     { "il2cpp_class_get_image",            (void**)&fn_class_get_image },
     { "il2cpp_class_get_parent",           (void**)&fn_class_get_parent },
+    { "il2cpp_class_get_name",             (void**)&fn_class_get_name },
+    { "il2cpp_class_get_namespace",         (void**)&fn_class_get_namespace },
     { NULL, NULL }
 };
 
-#define API_COUNT 22
+#define API_COUNT 24
 
 // ========== 内存区域信息 ==========
 typedef struct {
@@ -1870,20 +1874,163 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] AddDLC: %d OK, %d total", add_ok, 50);
     }
 
-    // ===== 11) 策略 D: 调用 UpdateDLC + SaveLoginData 刷新状态 =====
-    if (m_updateDLC) {
-        LOGI("[dlc] Strategy D: Calling UpdateDLC()...");
-        exc = NULL;
-        void *r = NULL;
-        SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
-        LOGI("[dlc] UpdateDLC() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
+    // ===== 11) 策略 D: 修改 mLoginData.DLC 然后调用 UpdateDLC 重建 mDLCSet =====
+    int logindata_dlc_modified = 0;
+    {
+        uintptr_t loginData = 0;
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+            loginData = *(volatile uintptr_t *)(g_proto_login_inst + 0x30);
+        }
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+
+        if (loginData && fn_object_get_class) {
+            Il2CppClass ld_klass = fn_object_get_class((Il2CppObject)loginData);
+            const char *ld_name = fn_class_get_name ? fn_class_get_name(ld_klass) : "?";
+            LOGI("[dlc] mLoginData @ %p, class: %s", (void*)loginData, ld_name);
+
+            // 遍历 mLoginData 的所有字段，找到 DLC
+            if (fn_class_get_fields && fn_field_get_name && fn_field_get_offset) {
+                void *fiter = NULL;
+                Il2CppFieldInfo f;
+                int dlc_offset = -1;
+                int gold_offset = -1;
+                while ((f = fn_class_get_fields(ld_klass, &fiter)) != NULL) {
+                    const char *fname = fn_field_get_name(f);
+                    int foffset = fn_field_get_offset(f);
+                    if (verbose) LOGI("[dlc-ld] Field: %s @ 0x%x", fname ? fname : "?", foffset);
+                    if (fname && strcmp(fname, "DLC") == 0) dlc_offset = foffset;
+                    if (fname && strcmp(fname, "Gold") == 0) gold_offset = foffset;
+                }
+
+                // 修改 Gold 字段
+                if (gold_offset >= 0) {
+                    install_sigsegv_handler();
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                        int32_t cur_gold = *(volatile int32_t *)(loginData + gold_offset);
+                        LOGI("[dlc] mLoginData.Gold = %d (offset 0x%x)", cur_gold, gold_offset);
+                        if (cur_gold < 99999) {
+                            *(volatile int32_t *)(loginData + gold_offset) = 99999;
+                            LOGI("[dlc] Set mLoginData.Gold = 99999");
+                        }
+                    }
+                    g_in_safe_access = 0;
+                    uninstall_sigsegv_handler();
+                }
+
+                // 修改 DLC 字段
+                if (dlc_offset >= 0) {
+                    uintptr_t dlc_obj = 0;
+                    install_sigsegv_handler();
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                        dlc_obj = *(volatile uintptr_t *)(loginData + dlc_offset);
+                    }
+                    g_in_safe_access = 0;
+                    uninstall_sigsegv_handler();
+
+                    LOGI("[dlc] mLoginData.DLC @ offset 0x%x = %p", dlc_offset, (void*)dlc_obj);
+
+                    if (dlc_obj && fn_object_get_class) {
+                        Il2CppClass dlc_klass = fn_object_get_class((Il2CppObject)dlc_obj);
+                        const char *dlc_type = fn_class_get_name ? fn_class_get_name(dlc_klass) : "?";
+                        LOGI("[dlc] DLC field type: %s", dlc_type);
+
+                        // 查找 Add/Clear/Count 方法（List<int> 来自 mscorlib，应该能找到）
+                        Il2CppMethodInfo m_list_add = fn_class_get_method_from_name(dlc_klass, "Add", 1);
+                        Il2CppMethodInfo m_list_clear = fn_class_get_method_from_name(dlc_klass, "Clear", 0);
+                        Il2CppMethodInfo m_list_count = fn_class_get_method_from_name(dlc_klass, "get_Count", 0);
+                        LOGI("[dlc] DLC methods: Add=%p Clear=%p Count=%p", m_list_add, m_list_clear, m_list_count);
+
+                        // 如果 method_from_name 失败，通过迭代查找
+                        if (!m_list_add && fn_class_get_methods) {
+                            LOGI("[dlc] Trying iteration for DLC type methods...");
+                            void *mi = NULL;
+                            Il2CppMethodInfo mm;
+                            int total = 0;
+                            while ((mm = fn_class_get_methods(dlc_klass, &mi)) != NULL) {
+                                const char *mn = fn_method_get_name(mm);
+                                int pc = fn_method_get_param_count(mm);
+                                total++;
+                                if (mn && strcmp(mn, "Add") == 0 && pc == 1 && !m_list_add) m_list_add = mm;
+                                if (mn && strcmp(mn, "Clear") == 0 && pc == 0 && !m_list_clear) m_list_clear = mm;
+                                if (mn && strcmp(mn, "get_Count") == 0 && pc == 0 && !m_list_count) m_list_count = mm;
+                                if (verbose && mn) LOGI("[dlc-dlctype] %s(%d)", mn, pc);
+                            }
+                            LOGI("[dlc] DLC type total methods: %d, Add=%p Clear=%p Count=%p",
+                                 total, m_list_add, m_list_clear, m_list_count);
+                        }
+
+                        if (m_list_add) {
+                            // 先清空
+                            if (m_list_clear) {
+                                void *r = NULL;
+                                SAFE_INVOKE(r, m_list_clear, (void*)dlc_obj, NULL, &exc);
+                                LOGI("[dlc] Cleared mLoginData.DLC");
+                            }
+                            // 添加 DLC ID 1-50
+                            int add_ok = 0;
+                            for (int32_t id = 1; id <= 50; id++) {
+                                void *params[1] = { &id };
+                                exc = NULL;
+                                void *r = NULL;
+                                SAFE_INVOKE(r, m_list_add, (void*)dlc_obj, params, &exc);
+                                if (!sigsegv_hit && !exc) add_ok++;
+                            }
+                            LOGI("[dlc] Added %d DLC IDs to mLoginData.DLC", add_ok);
+                            if (add_ok > 0) logindata_dlc_modified = 1;
+
+                            // 验证 Count
+                            if (m_list_count) {
+                                void *r = NULL;
+                                SAFE_INVOKE(r, m_list_count, (void*)dlc_obj, NULL, &exc);
+                                int cnt = -1;
+                                if (!sigsegv_hit && r) { SAFE_UNBOX_INT(cnt, r, -1); }
+                                LOGI("[dlc] mLoginData.DLC.Count = %d", cnt);
+                            }
+                        } else {
+                            LOGI("[dlc] WARN: Cannot find Add method for DLC list type!");
+                        }
+                    } else if (!dlc_obj) {
+                        LOGI("[dlc] mLoginData.DLC is NULL");
+                    }
+                } else {
+                    LOGI("[dlc] DLC field not found in mLoginData!");
+                }
+            }
+        } else {
+            LOGI("[dlc] mLoginData is NULL or API unavailable");
+        }
     }
-    if (m_saveLData) {
-        LOGI("[dlc] Calling SaveLoginData()...");
-        exc = NULL;
-        void *r = NULL;
-        SAFE_INVOKE(r, m_saveLData, (void*)g_proto_login_inst, NULL, &exc);
-        LOGI("[dlc] SaveLoginData() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
+
+    // 如果成功修改了 mLoginData.DLC，调用 UpdateDLC 让游戏重建 mDLCSet
+    if (logindata_dlc_modified) {
+        if (m_updateDLC) {
+            LOGI("[dlc] Strategy D: UpdateDLC() after mLoginData modification...");
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
+            LOGI("[dlc] UpdateDLC() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
+        }
+        if (m_saveLData) {
+            LOGI("[dlc] SaveLoginData() to persist...");
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_saveLData, (void*)g_proto_login_inst, NULL, &exc);
+            LOGI("[dlc] SaveLoginData() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
+        }
+        if (m_loginComplete) {
+            LOGI("[dlc] LoginComplete() to refresh UI...");
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_loginComplete, (void*)g_proto_login_inst, NULL, &exc);
+            LOGI("[dlc] LoginComplete() done (exc=%p sigsegv=%d)", exc, sigsegv_hit);
+        }
+    } else {
+        LOGI("[dlc] mLoginData.DLC not modified - keeping mDLCSet=packAll (no UpdateDLC)");
     }
 
     // ===== 12) 验证最终解锁状态 =====

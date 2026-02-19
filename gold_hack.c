@@ -822,23 +822,58 @@ static int init_il2cpp_context(void) {
     fn_thread_attach(g_domain);
     LOGI("Attached to il2cpp domain");
 
-    size_t asm_count = 0;
-    Il2CppAssembly *assemblies = fn_domain_get_assemblies(g_domain, &asm_count);
-    if (!assemblies || asm_count == 0) { LOGE("No assemblies found"); return -1; }
-    LOGI("Found %zu assemblies", asm_count);
+    // HybridCLR 游戏: Assembly-CSharp.dll 不在静态 assembly 列表中，
+    // 而是由 HybridCLR 在运行时动态加载。需要轮询等待它出现。
+    int asm_max_wait = 60;  // 最多等待 60 秒（HybridCLR 加载热更新 DLL 需要时间）
+    for (int asm_attempt = 0; asm_attempt < asm_max_wait; asm_attempt++) {
+        size_t asm_count = 0;
+        Il2CppAssembly *assemblies = fn_domain_get_assemblies(g_domain, &asm_count);
+        if (!assemblies || asm_count == 0) {
+            LOGW("No assemblies found (attempt %d/%d), waiting 1s...", 
+                 asm_attempt + 1, asm_max_wait);
+            sleep(1);
+            continue;
+        }
 
-    for (size_t i = 0; i < asm_count; i++) {
-        Il2CppAssembly asm_ptr = ((Il2CppAssembly *)assemblies)[i];
-        Il2CppImage img = fn_assembly_get_image(asm_ptr);
-        if (!img) continue;
-        const char *name = fn_image_get_name(img);
-        if (name && strcmp(name, "Assembly-CSharp.dll") == 0) {
-            g_csharp_image = img;
+        // 每隔 10 次打印一次完整 assembly 列表（调试用）
+        if (asm_attempt == 0 || asm_attempt % 10 == 0) {
+            LOGI("Assembly list (attempt %d, count=%zu):", asm_attempt + 1, asm_count);
+            for (size_t i = 0; i < asm_count; i++) {
+                Il2CppAssembly a = ((Il2CppAssembly *)assemblies)[i];
+                Il2CppImage img = fn_assembly_get_image(a);
+                const char *n = img ? fn_image_get_name(img) : "(null)";
+                LOGI("  [%zu] %s", i, n ? n : "(null)");
+            }
+        }
+
+        // 查找 Assembly-CSharp.dll
+        for (size_t i = 0; i < asm_count; i++) {
+            Il2CppAssembly asm_ptr = ((Il2CppAssembly *)assemblies)[i];
+            Il2CppImage img = fn_assembly_get_image(asm_ptr);
+            if (!img) continue;
+            const char *name = fn_image_get_name(img);
+            if (name && strcmp(name, "Assembly-CSharp.dll") == 0) {
+                g_csharp_image = img;
+                break;
+            }
+        }
+        if (g_csharp_image) {
+            LOGI("Found Assembly-CSharp.dll: %p (after %d attempts, total assemblies: %zu)", 
+                 g_csharp_image, asm_attempt + 1, asm_count);
             break;
         }
+
+        if (asm_attempt == 0) {
+            LOGI("Assembly-CSharp.dll not yet loaded (HybridCLR), waiting for dynamic load... "
+                 "(found %zu static assemblies)", asm_count);
+        }
+        sleep(1);
     }
-    if (!g_csharp_image) { LOGE("Assembly-CSharp.dll not found"); return -1; }
-    LOGI("Found Assembly-CSharp.dll: %p", g_csharp_image);
+    if (!g_csharp_image) { 
+        LOGE("Assembly-CSharp.dll not found after %d seconds (HybridCLR may have failed to load it)", 
+             asm_max_wait); 
+        return -1; 
+    }
 
     g_roleinfo_cls = fn_class_from_name(g_csharp_image, "", "RoleInfo");
     if (!g_roleinfo_cls) { LOGE("RoleInfo class not found"); return -1; }

@@ -1307,15 +1307,45 @@ static int find_proto_login_instance(void) {
             // 验证 monitor (+8)
             uintptr_t monitor = *(volatile uintptr_t *)(obj + 8);
             if (monitor != 0 && monitor < 0x10000) { g_in_safe_access = 0; continue; }
-            // 读取关键字段做诊断
-            uintptr_t mDLCSet   = *(volatile uintptr_t *)(obj + 64);
-            uintptr_t baseRoles = *(volatile uintptr_t *)(obj + 88);
+
+            // 严格验证：ProtoLogin 实例字段都是指针/bool
+            // 偏移 48,56,64,72,80,88,96,104,112,120,128 应为 NULL 或有效指针
+            uintptr_t mLoginData  = *(volatile uintptr_t *)(obj + 48);
+            uintptr_t mRestore    = *(volatile uintptr_t *)(obj + 56);
+            uintptr_t mDLCSet     = *(volatile uintptr_t *)(obj + 64);
+            uintptr_t mDLCSetInfo = *(volatile uintptr_t *)(obj + 72);
+            uintptr_t mProd2DLC   = *(volatile uintptr_t *)(obj + 80);
+            uintptr_t baseRoles   = *(volatile uintptr_t *)(obj + 88);
             g_in_safe_access = 0;
+
+            // 每个指针字段必须是 NULL 或有效堆地址 (>= 0x10000)
+            #define BAD_PTR(v) ((v) != 0 && (v) < 0x10000)
+            if (BAD_PTR(mLoginData) || BAD_PTR(mRestore) || BAD_PTR(mDLCSet) ||
+                BAD_PTR(mDLCSetInfo) || BAD_PTR(mProd2DLC) || BAD_PTR(baseRoles)) {
+                continue; // 有非法指针值，false positive
+            }
+            #undef BAD_PTR
+
+            // 至少 2 个指针字段非空（已初始化的 ProtoLogin 应有数据）
+            int non_null = 0;
+            if (mLoginData)  non_null++;
+            if (mRestore)    non_null++;
+            if (mDLCSet)     non_null++;
+            if (mDLCSetInfo) non_null++;
+            if (mProd2DLC)   non_null++;
+            if (baseRoles)   non_null++;
 
             candidates++;
             LOGI("[dlc] ProtoLogin candidate #%d @ 0x%" PRIxPTR
-                 ": mDLCSet=%p, BaseRoles=%p",
-                 candidates, obj, (void*)mDLCSet, (void*)baseRoles);
+                 ": mDLCSet=%p, BaseRoles=%p, mLoginData=%p, non_null=%d",
+                 candidates, obj, (void*)mDLCSet, (void*)baseRoles,
+                 (void*)mLoginData, non_null);
+
+            if (non_null < 2) {
+                LOGW("[dlc]   Rejected: too few non-null fields (%d)", non_null);
+                continue; // ProtoLogin 未初始化或 false positive
+            }
+
             g_proto_login_inst = obj;
             break;
         }
@@ -1362,7 +1392,7 @@ static int do_unlock_all_dlc(void) {
 
     // 1) 找 ProtoLogin 实例
     if (!find_proto_login_instance()) {
-        LOGW("[dlc] ProtoLogin not found - game may not be initialized");
+        LOGW("[dlc] ProtoLogin not found - 请先进入游戏主菜单（点击"开始"按钮后）再试");
         return -2;
     }
 
@@ -1385,42 +1415,53 @@ static int do_unlock_all_dlc(void) {
 
     void *exc = NULL;
 
-    // 3) 先检查当前解锁状态
-    LOGI("[dlc] === Before unlock ===");
-    if (m_isDLCRole) {
-        for (int32_t rid = 0; rid <= 15; rid++) {
-            void *params[1] = { &rid };
-            exc = NULL;
-            // 注意: 我们已替换了 ProtoLogin.IsDLCRole 的 methodPointer
-            //       但 il2cpp_runtime_invoke 会走 invoker_method -> 我们的 hook
-            //       所以这里调用原始未 hook 的 UserInfo.IsDLCRole 更准确
-        }
-    }
+    // 3) 安全调用宏：包裹 il2cpp_runtime_invoke，防止crash
+    // HybridCLR 方法通过 runtime_invoke 调用可能触发未初始化状态的异常
+    #define SAFE_INVOKE(result_var, method, obj, params, exc_ptr) do { \
+        install_sigsegv_handler(); \
+        g_in_safe_access = 1; \
+        if (sigsetjmp(g_jmpbuf, 1) != 0) { \
+            g_in_safe_access = 0; \
+            uninstall_sigsegv_handler(); \
+            LOGW("[dlc] SIGSEGV in runtime_invoke, skipping"); \
+            result_var = NULL; \
+        } else { \
+            result_var = fn_runtime_invoke(method, obj, params, (void **)exc_ptr); \
+            g_in_safe_access = 0; \
+            uninstall_sigsegv_handler(); \
+        } \
+    } while(0)
+
+    // 安全读取 boxed bool/int 返回值
+    #define SAFE_UNBOX_INT(result, boxed, default_val) do { \
+        result = default_val; \
+        if (boxed) { \
+            install_sigsegv_handler(); \
+            g_in_safe_access = 1; \
+            if (sigsetjmp(g_jmpbuf, 1) == 0) { \
+                result = *(int32_t *)((uint8_t *)(boxed) + 0x10); \
+            } \
+            g_in_safe_access = 0; \
+            uninstall_sigsegv_handler(); \
+        } \
+    } while(0)
+
+    // 4) 先检查当前解锁状态
+    LOGI("[dlc] === Before unlock (checking roles 0-15) ===");
     if (m_isUnlock) {
         for (int32_t rid = 0; rid <= 15; rid++) {
             void *params[1] = { &rid };
             exc = NULL;
-            void *result = fn_runtime_invoke(m_isUnlock, (void *)g_proto_login_inst, params, (void **)&exc);
-            if (exc) {
-                LOGW("[dlc] isUnlockRole(%d) exception", rid);
-                continue;
-            }
-            // il2cpp_runtime_invoke 返回 boxed value，bool 在 offset 0x10
+            void *result = NULL;
+            SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
+            if (exc) { LOGW("[dlc] isUnlockRole(%d) exception", rid); continue; }
             int unlocked = 0;
-            if (result) {
-                install_sigsegv_handler();
-                g_in_safe_access = 1;
-                if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                    unlocked = *(int32_t *)((uint8_t *)result + 0x10);
-                }
-                g_in_safe_access = 0;
-                uninstall_sigsegv_handler();
-            }
+            SAFE_UNBOX_INT(unlocked, result, 0);
             LOGI("[dlc]   isUnlockRole(%d) = %d", rid, unlocked);
         }
     }
 
-    // 4) 发现 DLC IDs: 调用 GetDLCId(roleId) 对每个角色
+    // 5) 发现 DLC IDs: 调用 GetDLCId(roleId) 对每个角色
     int32_t dlc_ids[64];
     int     dlc_count = 0;
 
@@ -1429,18 +1470,11 @@ static int do_unlock_all_dlc(void) {
         for (int32_t roleId = 0; roleId <= 30; roleId++) {
             void *params[1] = { &roleId };
             exc = NULL;
-            void *result = fn_runtime_invoke(m_getDLCId, (void *)g_proto_login_inst, params, (void **)&exc);
-            if (exc) continue;
-            if (!result) continue;
-            // Unbox int
+            void *result = NULL;
+            SAFE_INVOKE(result, m_getDLCId, (void *)g_proto_login_inst, params, &exc);
+            if (exc || !result) continue;
             int32_t dlcId = 0;
-            install_sigsegv_handler();
-            g_in_safe_access = 1;
-            if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                dlcId = *(int32_t *)((uint8_t *)result + 0x10);
-            }
-            g_in_safe_access = 0;
-            uninstall_sigsegv_handler();
+            SAFE_UNBOX_INT(dlcId, result, 0);
 
             if (dlcId > 0) {
                 LOGI("[dlc]   Role %d -> DLC ID %d", roleId, dlcId);
@@ -1464,13 +1498,14 @@ static int do_unlock_all_dlc(void) {
         }
     }
 
-    // 5) 调用 AddDLC 添加每个 DLC
+    // 6) 调用 AddDLC 添加每个 DLC
     int added = 0;
     for (int i = 0; i < dlc_count; i++) {
         int32_t dlcId = dlc_ids[i];
         void *params[1] = { &dlcId };
         exc = NULL;
-        fn_runtime_invoke(m_addDLC, (void *)g_proto_login_inst, params, (void **)&exc);
+        void *result = NULL;
+        SAFE_INVOKE(result, m_addDLC, (void *)g_proto_login_inst, params, &exc);
         if (exc) {
             LOGW("[dlc] AddDLC(%d) threw exception", dlcId);
         } else {
@@ -1479,30 +1514,23 @@ static int do_unlock_all_dlc(void) {
         }
     }
 
-    // 6) 验证：再次检查解锁状态
+    // 7) 验证：再次检查解锁状态
     LOGI("[dlc] === After unlock (added %d) ===", added);
     if (m_isUnlock) {
         for (int32_t rid = 0; rid <= 15; rid++) {
             void *params[1] = { &rid };
             exc = NULL;
-            void *result = fn_runtime_invoke(m_isUnlock, (void *)g_proto_login_inst, params, (void **)&exc);
+            void *result = NULL;
+            SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
             if (exc) continue;
             int unlocked = 0;
-            if (result) {
-                install_sigsegv_handler();
-                g_in_safe_access = 1;
-                if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                    unlocked = *(int32_t *)((uint8_t *)result + 0x10);
-                }
-                g_in_safe_access = 0;
-                uninstall_sigsegv_handler();
-            }
+            SAFE_UNBOX_INT(unlocked, result, 0);
             LOGI("[dlc]   isUnlockRole(%d) = %d %s", rid, unlocked,
                  unlocked ? "(UNLOCKED)" : "(locked)");
         }
     }
 
-    // 7) 也修改 mDLCSet 字段，确认写入
+    // 8) 诊断：dump 最终状态
     install_sigsegv_handler();
     g_in_safe_access = 1;
     if (sigsetjmp(g_jmpbuf, 1) == 0) {
@@ -1512,6 +1540,9 @@ static int do_unlock_all_dlc(void) {
     }
     g_in_safe_access = 0;
     uninstall_sigsegv_handler();
+
+    #undef SAFE_INVOKE
+    #undef SAFE_UNBOX_INT
 
     LOGI("[dlc] ===== DLC unlock complete: %d DLCs added =====", added);
     return added;

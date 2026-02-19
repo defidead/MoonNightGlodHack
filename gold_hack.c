@@ -1570,67 +1570,78 @@ static int do_unlock_all_dlc(void) {
 
     LOGI("[dlc] mDLCSet = %p", (void*)mDLCSet);
 
-    // ===== 6) 如果 mDLCSet=NULL，尝试创建 HashSet<int> =====
+    // ===== 6) 如果 mDLCSet=NULL，尝试用 packAll 的 klass 创建 HashSet<int> =====
     if (mDLCSet == 0 && fn_object_new) {
-        LOGI("[dlc] mDLCSet is NULL, attempting to create HashSet<int>...");
+        LOGI("[dlc] mDLCSet is NULL, attempting to create HashSet<int> from packAll klass...");
         
-        // 方案A：用 GetDLCs() 方法获取 HashSet 的类信息
-        // GetDLCs() 应该返回 HashSet<int>，如果返回 null 说明未初始化
-        // 但我们可以从返回类型获取 HashSet<int> 的 class
-        
-        // 方案B：通过 mscorlib 中搜索 HashSet`1 泛型定义
-        // 在 il2cpp 中，泛型实例化类的名字是 "HashSet`1"
-        // 我们需要找到 System.Collections.Generic.HashSet<System.Int32> 的实例化类
-        
-        // 方案C：直接搜索所有 Assembly 中的 HashSet 类
-        // 使用 il2cpp_domain_get_assemblies 遍历所有 assembly
-        Il2CppDomain domain = fn_domain_get();
-        size_t asm_count = 0;
-        Il2CppAssembly *assemblies = fn_domain_get_assemblies(domain, &asm_count);
-        
-        Il2CppClass hashset_int_class = NULL;
-        
-        for (size_t a = 0; a < asm_count && !hashset_int_class; a++) {
-            Il2CppImage img = fn_assembly_get_image(assemblies[a]);
-            if (!img) continue;
-            
-            // 尝试在 System.Collections.Generic 命名空间查找 HashSet`1
-            // 注意：泛型实例化类可能无法通过 class_from_name 直接找到
-            Il2CppClass cls = fn_class_from_name(img, "System.Collections.Generic", "HashSet`1");
-            if (cls) {
-                LOGI("[dlc] Found HashSet`1 class in %s: %p", 
-                     fn_image_get_name(img), cls);
-                // 这是泛型定义，不是实例化的 HashSet<int>
-                // 我们不能直接用 object_new 创建泛型定义的实例
-            }
+        // 读取 packAll (offset 0x60) 的 klass — packAll 应该是 HashSet<int> 类型
+        uintptr_t packAll = 0;
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+            packAll = *(volatile uintptr_t *)(g_proto_login_inst + 0x60);
         }
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
         
-        // 方案D：从 ProtoLogin 的字段类型信息获取 HashSet<int> 的类
-        // il2cpp_field_get_type + il2cpp_class_from_type 可以获取字段类型对应的类
-        // 但这需要更多 API...
-        
-        // 方案E（最简单）：找到一个已存在的 HashSet<int> 实例的 klass
-        // 由于 BaseRoles (offset 88) 是非 NULL 的，如果它是 List<int>，
-        // 我们可以读取它的 klass 来了解 List<int> 的类。
-        // 但 mDLCSet 的类型不同（HashSet<int> vs List<int>）
-        
-        // 方案F：尝试调用 ProtoLogin 的方法来初始化 mDLCSet
-        // 寻找可能初始化 mDLCSet 的方法
-        
-        // 方案G（暴力但有效）：直接在内存中构造一个最小的 HashSet<int>
-        // HashSet<int> 在 Unity/Mono 中的内存布局:
-        //   [+00] Il2CppClass* klass (指向 HashSet<int> 的类元数据)  
-        //   [+08] MonitorData* monitor
-        //   [+10] int[] _buckets
-        //   [+18] Slot[] _slots  
-        //   [+20] int _count
-        //   [+24] int _lastIndex
-        //   [+28] int _freeList
-        //   [+2c] int _freeCount
-        //   [+30] IEqualityComparer<int> _comparer
-        //   [+38] int _version
-        
-        LOGI("[dlc] Cannot create HashSet<int> directly, trying alternative approach...");
+        if (packAll) {
+            // 读取 packAll 对象的 klass
+            uintptr_t hashset_klass = 0;
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                hashset_klass = *(volatile uintptr_t *)(packAll);
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+            
+            LOGI("[dlc] packAll=%p, klass=%p", (void*)packAll, (void*)hashset_klass);
+            
+            if (hashset_klass) {
+                // 用 il2cpp_object_new 创建新的 HashSet<int> 实例
+                Il2CppObject newSet = fn_object_new((Il2CppClass)hashset_klass);
+                LOGI("[dlc] Created new HashSet<int> @ %p", newSet);
+                
+                if (newSet) {
+                    // 调用 .ctor() 初始化 HashSet
+                    Il2CppMethodInfo ctor = fn_class_get_method_from_name(
+                        (Il2CppClass)hashset_klass, ".ctor", 0);
+                    if (ctor) {
+                        LOGI("[dlc] HashSet .ctor found @ %p, calling...", ctor);
+                        void *ctor_result = NULL;
+                        SAFE_INVOKE(ctor_result, ctor, newSet, NULL, &exc);
+                        LOGI("[dlc] HashSet .ctor() called, exc=%p", exc);
+                    } else {
+                        LOGI("[dlc] HashSet .ctor not found, object may still be usable");
+                    }
+                    
+                    // 将新 HashSet 写入 ProtoLogin.mDLCSet (offset 0x40)
+                    install_sigsegv_handler();
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                        *(volatile uintptr_t *)(g_proto_login_inst + 0x40) = (uintptr_t)newSet;
+                        mDLCSet = (uintptr_t)newSet;
+                        LOGI("[dlc] Assigned new HashSet to mDLCSet @ +0x40");
+                    }
+                    g_in_safe_access = 0;
+                    uninstall_sigsegv_handler();
+                    
+                    // 验证写入
+                    uintptr_t verify = 0;
+                    install_sigsegv_handler();
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                        verify = *(volatile uintptr_t *)(g_proto_login_inst + 0x40);
+                    }
+                    g_in_safe_access = 0;
+                    uninstall_sigsegv_handler();
+                    LOGI("[dlc] mDLCSet verification: %p (expected %p)", 
+                         (void*)verify, newSet);
+                }
+            }
+        } else {
+            LOGW("[dlc] packAll is also NULL, cannot determine HashSet<int> klass");
+        }
     }
 
     // ===== 7) 先检查当前解锁状态 =====
@@ -1661,10 +1672,10 @@ static int do_unlock_all_dlc(void) {
         }
     }
 
-    // ===== 8) 尝试 AddDLC（仅当 mDLCSet != NULL）=====
+    // ===== 8) 尝试 AddDLC =====
     int added = 0;
     if (mDLCSet != 0 && m_addDLC) {
-        LOGI("[dlc] mDLCSet is initialized, calling AddDLC...");
+        LOGI("[dlc] mDLCSet is initialized (%p), calling AddDLC...", (void*)mDLCSet);
         for (int32_t dlcId = 1; dlcId <= 20; dlcId++) {
             void *params[1] = { &dlcId };
             exc = NULL;
@@ -1673,18 +1684,35 @@ static int do_unlock_all_dlc(void) {
             if (!exc) {
                 LOGI("[dlc] AddDLC(%d) OK", dlcId);
                 added++;
+            } else {
+                LOGW("[dlc] AddDLC(%d) exception", dlcId);
+            }
+        }
+        
+        // 验证：再次检查解锁状态
+        LOGI("[dlc] === After AddDLC (added %d) ===", added);
+        if (m_isUnlock) {
+            for (int32_t rid = 0; rid <= 15; rid++) {
+                void *params[1] = { &rid };
+                exc = NULL;
+                void *result = NULL;
+                SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
+                int unlocked = -1;
+                if (result) { SAFE_UNBOX_INT(unlocked, result, -1); }
+                LOGI("[dlc]   isUnlockRole(%d) = %d %s", rid, unlocked,
+                     unlocked > 0 ? "(UNLOCKED!)" : "(locked)");
             }
         }
     } else if (mDLCSet == 0) {
         LOGW("[dlc] mDLCSet is NULL - AddDLC would crash, skipping");
         LOGI("[dlc] Will try BaseRoles manipulation instead...");
 
-        // ===== 9) 尝试读取 BaseRoles (List<int>) 的内容 =====
+        // ===== 9) 尝试读取 BaseRoles 的内容 =====
         uintptr_t baseRoles = 0;
         install_sigsegv_handler();
         g_in_safe_access = 1;
         if (sigsetjmp(g_jmpbuf, 1) == 0) {
-            baseRoles = *(volatile uintptr_t *)(g_proto_login_inst + 88);
+            baseRoles = *(volatile uintptr_t *)(g_proto_login_inst + 0x58); // BaseRoles @ offset 0x58
         }
         g_in_safe_access = 0;
         uninstall_sigsegv_handler();
@@ -1741,9 +1769,11 @@ static int do_unlock_all_dlc(void) {
     install_sigsegv_handler();
     g_in_safe_access = 1;
     if (sigsetjmp(g_jmpbuf, 1) == 0) {
-        uintptr_t final_mDLCSet   = *(volatile uintptr_t *)(g_proto_login_inst + 64);
-        uintptr_t final_baseRoles = *(volatile uintptr_t *)(g_proto_login_inst + 88);
-        LOGI("[dlc] mDLCSet=%p, BaseRoles=%p", (void*)final_mDLCSet, (void*)final_baseRoles);
+        uintptr_t final_mDLCSet   = *(volatile uintptr_t *)(g_proto_login_inst + 0x40);
+        uintptr_t final_baseRoles = *(volatile uintptr_t *)(g_proto_login_inst + 0x58);
+        uintptr_t final_packAll   = *(volatile uintptr_t *)(g_proto_login_inst + 0x60);
+        LOGI("[dlc] mDLCSet=%p, BaseRoles=%p, packAll=%p", 
+             (void*)final_mDLCSet, (void*)final_baseRoles, (void*)final_packAll);
     }
     g_in_safe_access = 0;
     uninstall_sigsegv_handler();

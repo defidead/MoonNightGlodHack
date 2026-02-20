@@ -2062,25 +2062,80 @@ static int do_unlock_all_dlc(void) {
         if (unlocked > 0) unlocked_count++;
     }
 
-    // ===== 8) v6.17: 跳过所有 AddDLC/UpdateDLC/SaveLoginData 操作 =====
-    // v6.15/v6.16 从后台线程反复调用这些 Unity C# 方法，
-    // 导致 Unity EventSystem 被干扰，游戏按键失灵。
-    // MethodInfo patch 是内存级修改，永久有效，不需要额外操作。
-    LOGI("[dlc] v6.17: Skipping AddDLC/UpdateDLC/SaveLoginData (caused button malfunction from bg thread)");
+    // ===== 8) v6.22: 重新启用 AddDLC + UpdateDLC =====
+    // v6.17-v6.21 跳过了 AddDLC，导致 mDLCSet 数据为空，
+    // 游戏 UI 读取 mDLCSet 发现没有 DLC 数据 → 角色不显示为已解锁。
+    // isUnlockRole 通过 il2cpp_runtime_invoke 返回 true，但游戏内部
+    // HybridCLR 解释器直接读 mDLCSet，不调用 isUnlockRole！
+    // 必须通过 AddDLC 填充 mDLCSet 才能让 UI 显示解锁。
+    //
+    // v6.17 按键失灵的原因是 DLC monitor 线程反复(30次+)调用 AddDLC/SaveLoginData，
+    // 现在只调用一次，不调用 SaveLoginData。
+    if (m_addDLC) {
+        LOGI("[dlc] v6.22: ===== Calling AddDLC to populate mDLCSet =====");
+        int add_ok = 0;
+        for (int32_t dlcId = 1; dlcId <= 50; dlcId++) {
+            void *params[1] = { &dlcId };
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_addDLC, (void *)g_proto_login_inst, params, &exc);
+            if (sigsegv_hit) {
+                LOGE("[dlc] AddDLC(%d) SIGSEGV, stopping", dlcId);
+                break;
+            }
+            if (!exc) add_ok++;
+        }
+        LOGI("[dlc] v6.22: AddDLC(1-50): %d OK", add_ok);
+
+        // 扩展 DLC ID
+        int extra_dlc_ids[] = {100, 101, 102, 103, 104, 105, 110, 120, 150, 
+                               200, 201, 202, 203, 204, 205, 210, 220, 250, 
+                               300, 301, 302, 303, 400, 500, 1000, 1001, 1002,
+                               2000, 2001, 2002, 3000, 3001, 5000, 10000};
+        int add_ok2 = 0;
+        for (int i = 0; i < (int)(sizeof(extra_dlc_ids)/sizeof(extra_dlc_ids[0])); i++) {
+            int32_t dlcId = extra_dlc_ids[i];
+            void *params[1] = { &dlcId };
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_addDLC, (void *)g_proto_login_inst, params, &exc);
+            if (sigsegv_hit) break;
+            if (!exc) add_ok2++;
+        }
+        LOGI("[dlc] v6.22: AddDLC(extra): %d OK", add_ok2);
+    }
+
+    // UpdateDLC 刷新缓存
+    {
+        Il2CppMethodInfo m_updateDLC = fn_class_get_method_from_name(g_proto_login_cls, "UpdateDLC", 0);
+        if (m_updateDLC) {
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
+            if (!sigsegv_hit && !exc) {
+                LOGI("[dlc] v6.22: ★ UpdateDLC() OK");
+            } else {
+                LOGW("[dlc] v6.22: UpdateDLC() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
+            }
+        }
+    }
+
+    // v6.22: 不调用 SaveLoginData — 避免写入持久数据导致问题
+    LOGI("[dlc] v6.22: Skipping SaveLoginData (not needed, AddDLC already populates mDLCSet)");
 
     if (unlocked_count >= 10) {
         g_dlc_unlocked = 1;
-        LOGI("[dlc] ★ DLC unlock SUCCESS via methodPointer replacement!");
+        LOGI("[dlc] ★ DLC unlock SUCCESS!");
     }
 
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.21 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.22 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }
-/* v6.17: 以下 AddDLC/UpdateDLC/SaveLoginData/验证代码已禁用 */
+/* v6.17: 以下旧的诊断代码已禁用 */
 #if 0
         Il2CppMethodInfo m_getDLCId = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCId", 1);
         if (m_getDLCId) {

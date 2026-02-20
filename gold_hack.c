@@ -1303,6 +1303,15 @@ static Il2CppClass   g_boolean_class    = NULL;
 static void *g_stub_return_true = NULL;   // bool return true stub
 static void *g_stub_invoker_true = NULL;  // invoker wrapper stub (unused now)
 
+// ===== 自定义 methodPointer 替代函数 =====
+// 用于替换 HybridCLR 方法的 methodPointer (field[0])
+// 签名: bool Method(void* this, int32_t arg, MethodInfo* method)
+// 在 ARM64 上, 多余参数在寄存器中传递,无害地被忽略
+static uint8_t custom_return_true_method(void* __this, int32_t arg1, void* arg2, void* method) {
+    (void)__this; (void)arg1; (void)arg2; (void)method;
+    return 1;
+}
+
 // ===== 自定义 C invoker =====
 // invoker 签名: void* invoker(void* methodPtr, void* method, void* obj, void** params, void** exc)
 // 直接返回 boxed true，不调用 methodPtr，不经过 HybridCLR 解释器
@@ -1750,63 +1759,78 @@ static int do_unlock_all_dlc(void) {
         }
     }
 
-    // ===== 6) 安装自定义 C invoker =====
-    // 策略 v5: 直接替换 invoker_method 为我们的 C 函数 custom_bool_true_invoker
-    // 这个函数创建 boxed Boolean(true) 并返回，完全不调用 HybridCLR 解释器
+    // ===== 6) 完整 MethodInfo patch — 伪装 HybridCLR 方法为 AOT =====
+    // 策略 v6: 同时替换 methodPointer 和 invoker，并清除 interpData + HybridCLR 标志
+    // 这样解释器内部调用也会走我们的 C 函数，而不是解释 IL 字节码
     if (!g_mi_hooks_installed && g_boolean_class && fn_object_new) {
-        init_dlc_stubs(); // 仍然需要 methodPointer stub
+        init_dlc_stubs();
         
-        uintptr_t *mi_fields = (uintptr_t *)m_isUnlock;
-        g_orig_isUnlockRole_ptr = mi_fields[0];
-        uintptr_t orig_invoker = mi_fields[1];
-        
-        LOGI("[dlc] isUnlockRole BEFORE modification:");
-        LOGI("[dlc]   [0] methodPointer: %p", (void*)g_orig_isUnlockRole_ptr);
-        LOGI("[dlc]   [1] invoker:       %p", (void*)orig_invoker);
-        LOGI("[dlc]   [10] interpData:   %p", (void*)mi_fields[10]);
-        LOGI("[dlc]   [13] flags:        0x%x", (int)mi_fields[13]);
-
-        uintptr_t page = (uintptr_t)m_isUnlock & ~(uintptr_t)0xFFF;
-        mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
-        uintptr_t page_end = ((uintptr_t)m_isUnlock + 0xC0) & ~(uintptr_t)0xFFF;
-        if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
-
-        // 注意: 不修改 [0] methodPointer! HybridCLR 解释器内部通过 methodPointer 调用,
-        // 修改它会导致解释器崩溃。只替换 invoker 即可影响 il2cpp_runtime_invoke 路径。
-        
-        // [1] invoker_method → 我们的 C 函数 custom_bool_true_invoker
-        mi_fields[1] = (uintptr_t)custom_bool_true_invoker;
-        
-        // [15] invoker 的复制
-        mi_fields[15] = (uintptr_t)custom_bool_true_invoker;
-        
-        LOGI("[dlc] ★ isUnlockRole invoker: %p -> %p (custom_bool_true_invoker)",
-             (void*)orig_invoker, (void*)custom_bool_true_invoker);
-        
-        // 对其他 unlock 方法也做同样的替换
-        Il2CppMethodInfo methods_to_patch[] = {
-            fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockAllDLC", 1),
-            fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockByFirstGame", 1),
-            fn_class_get_method_from_name(g_proto_login_cls, "isUnlockDLC", 1),
+        // 收集所有需要 patch 的方法
+        struct { const char *name; int param_count; } patch_targets[] = {
+            {"isUnlockRole",       1},
+            {"IsDLCRole",          1},
+            {"IsUnlockAllDLC",     1},
+            {"IsUnlockByFirstGame",1},
+            {"isUnlockDLC",        1},
+            {"IsUnlockGuBao",      0},
+            {"isUnlockByItem",     2},
+            {"IsUnlockByGameId",   2},
+            {"IsUnlockByGameIds",  2},
         };
-        const char *method_names[] = {"IsUnlockAllDLC", "IsUnlockByFirstGame", "isUnlockDLC"};
+        int num_targets = sizeof(patch_targets) / sizeof(patch_targets[0]);
+        int patched = 0;
         
-        for (int i = 0; i < 3; i++) {
-            if (!methods_to_patch[i]) continue;
-            uintptr_t *mi2 = (uintptr_t *)methods_to_patch[i];
-            uintptr_t p2 = (uintptr_t)methods_to_patch[i] & ~(uintptr_t)0xFFF;
-            mprotect((void *)p2, 0x2000, PROT_READ | PROT_WRITE);
-            uintptr_t pe2 = ((uintptr_t)methods_to_patch[i] + 0xC0) & ~(uintptr_t)0xFFF;
-            if (pe2 != p2) mprotect((void *)pe2, 0x1000, PROT_READ | PROT_WRITE);
+        for (int t = 0; t < num_targets; t++) {
+            Il2CppMethodInfo mi = fn_class_get_method_from_name(
+                g_proto_login_cls, patch_targets[t].name, patch_targets[t].param_count);
+            if (!mi) {
+                LOGI("[dlc] %s(%d) not found, skip",
+                     patch_targets[t].name, patch_targets[t].param_count);
+                continue;
+            }
             
-            // 不修改 mi2[0] (methodPointer)，只替换 invoker
-            mi2[1] = (uintptr_t)custom_bool_true_invoker;
-            mi2[15] = (uintptr_t)custom_bool_true_invoker;
-            LOGI("[dlc] ★ %s invoker replaced with custom_bool_true_invoker", method_names[i]);
+            uintptr_t *f = (uintptr_t *)mi;
+            
+            LOGI("[dlc] BEFORE %s: ptr=%p inv=%p interp=%p flags=0x%x",
+                 patch_targets[t].name, (void*)f[0], (void*)f[1],
+                 (void*)f[10], (int)f[13]);
+            
+            // 设置页面可写
+            uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
+            mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
+            uintptr_t page_end = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
+            if (page_end != page)
+                mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
+            
+            // 保存 isUnlockRole 的原始 methodPointer
+            if (t == 0) g_orig_isUnlockRole_ptr = f[0];
+            
+            // [0] methodPointer → 我们的 C 函数 (解释器内部调用走这里)
+            f[0] = (uintptr_t)custom_return_true_method;
+            
+            // [1] invoker → 自定义 invoker (il2cpp_runtime_invoke 走这里)
+            f[1] = (uintptr_t)custom_bool_true_invoker;
+            
+            // [10] interpData → NULL (让解释器不再解释 IL，回退到 methodPointer)
+            f[10] = 0;
+            
+            // [11],[12] methodPointer 副本也更新
+            f[11] = (uintptr_t)custom_return_true_method;
+            f[12] = (uintptr_t)custom_return_true_method;
+            
+            // [13] 清除 HybridCLR 标志 (0x100)，保留其他 flags
+            f[13] = f[13] & ~(uintptr_t)0x100;
+            
+            // [15] invoker 副本
+            f[15] = (uintptr_t)custom_bool_true_invoker;
+            
+            LOGI("[dlc] ★ %s PATCHED: ptr=%p inv=%p interp=0 flags=0x%x",
+                 patch_targets[t].name, (void*)f[0], (void*)f[1], (int)f[13]);
+            patched++;
         }
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] Custom C invoker patches installed!");
+        LOGI("[dlc] v6 full MethodInfo patch complete! %d/%d methods patched", patched, num_targets);
     }
     skip_mi_hook:
 

@@ -5074,9 +5074,10 @@ static void *dlc_monitor_thread(void *arg) {
             sleep(3);
             continue;
         } else if (result > 0) {
-            LOGI("[dlc-monitor] ★ %d/16 roles unlocked! Stopping monitor (v6.17).", result);
-            // v6.17: 成功后立即退出，不再从后台线程调用 Unity 方法
-            break;
+            LOGI("[dlc-monitor] ★ %d/16 roles unlocked! Will keep monitoring...", result);
+            // v6.28: 恢复 v6.9 行为 — 成功后放慢频率，持续监控（防止游戏重置）
+            sleep(10);
+            continue;
         } else {
             // result == 0: 所有策略都无效，可能游戏未完全加载
             LOGW("[dlc-monitor] 0 roles unlocked, retrying in 5s...", result);

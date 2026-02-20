@@ -1377,6 +1377,19 @@ static void* custom_bool_false_invoker(void* methodPtr, void* method, void* obj,
     return NULL;
 }
 
+// ===== v6.20: HybridCLR interpreter bridge — 返回 bool true =====
+// HybridCLR 解释器内部调用方法时使用 methodPointerCallByInterp (f[11]),
+// 签名为: void (*)(const MethodInfo* method, uint16_t* argVarIndexs, StackObject* localVarBase, void* ret)
+// StackObject 是 union { int64_t i64; ... }, 写 *(int64_t*)ret = 1 即 bool true
+// 这解决了 v6.10/v6.19 的问题: il2cpp_runtime_invoke 走 invoker(f[1]) 能返回 true,
+// 但 HybridCLR 解释器内部调用走 f[11](旧的解释器蹦床) 读到 interpData=NULL 返回 false
+static void custom_hybridclr_bridge_bool_true(void* method, void* argVarIndexs, void* localVarBase, void* ret) {
+    (void)method; (void)argVarIndexs; (void)localVarBase;
+    if (ret) {
+        *(int64_t*)ret = 1;  // StackObject.i64 = 1 (bool true)
+    }
+}
+
 // 分配 RWX 内存并写入 ARM64 代码
 static void* alloc_executable_stub(const uint32_t *code, size_t code_size) {
     // 使用 mmap 分配可执行内存
@@ -1888,19 +1901,22 @@ static int do_unlock_all_dlc(void) {
             // f[2] = name → 不动!
             // f[10] interpData → NULL (清除 IL 字节码，让解释器不再解释)
             f[10] = 0;
-            // v6.19: 回退到 v6.10 方式 — 不修改 f[11]/f[12]/bitfield
-            // v6.14+ 额外修改了 methodPointerCallByInterp(f[11])、
-            // virtualMethodPointerCallByInterp(f[12]) 和 bitfield@0x4B，
-            // 导致 HybridCLR 的方法分派路径改变，引起游戏按键失效。
-            // v6.10 只修改 f[0]+f[1]+f[10]，按键正常，DLC 部分解锁成功。
+            // v6.20: 设置 f[11]/f[12] 到自定义 HybridCLR 桥接函数
+            // 问题分析:
+            //   v6.10/v6.19: 只改 f[0]+f[1]+f[10]，按键正常但 DLC 不生效
+            //     → HybridCLR 解释器内部调用走 f[11](旧蹦床) 读 interpData(=0) 返回 false
+            //   v6.14-v6.18: 清零 f[11]+f[12]+改 bitfield，DLC 生效但按键坏
+            //     → bitfield 标记 initInterpCallMethodPointer=1 + f[11]=NULL → 调用 NULL 崩溃
+            // 正确做法: f[11]/f[12] 指向自定义桥接，不动 bitfield
+            f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
+            f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
             
-            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p interpData=0 MI=%p (v6.19 minimal)",
-                 mname, (void*)f[0], (void*)f[1], mi);
+            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p bridge=%p MI=%p (v6.20)",
+                 mname, (void*)f[0], (void*)f[1], (void*)f[11], mi);
             
-            // v6.19: 简化日志
             if (strcmp(mname, "isUnlockRole") == 0) {
-                LOGI("[dlc] MI-DUMP %s: f[0]mPtr=%p f[1]inv=%p f[10]interpData=%p MI=%p",
-                     mname, (void*)f[0], (void*)f[1], (void*)f[10], mi);
+                LOGI("[dlc] MI-DUMP %s: f[0]=%p f[1]=%p f[10]=%p f[11]=%p f[12]=%p MI=%p",
+                     mname, (void*)f[0], (void*)f[1], (void*)f[10], (void*)f[11], (void*)f[12], mi);
             }
             
             patched++;
@@ -1939,13 +1955,15 @@ static int do_unlock_all_dlc(void) {
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
             uintptr_t page_end = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;  // MI=104 bytes (Unity 2020)
             if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
-            // v6.19: 回退到 v6.10 方式 — 只改 f[0]+f[1]+f[10]
+            // v6.20: 和 Step 6 一样的修补方式
             f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
             f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
             // f[2] = name → 不动!
             f[10] = 0;                                       // interpData = NULL (0x50)
-            // 不修改 f[11]/f[12]/bitfield — v6.14+ 修改这些导致按键失效
-            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.19 minimal) MI=%p", extra_proto_methods[ep], pc_found, mi);
+            f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // methodPointerCallByInterp
+            f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // virtualMethodPointerCallByInterp
+            // 不修改 bitfield — v6.14+ 改 bitfield 导致按键失效
+            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.20 bridge) MI=%p", extra_proto_methods[ep], pc_found, mi);
             patched++;
         }
         
@@ -1955,7 +1973,7 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6.8.1: Skipping brute-force ProtoLogin patch (caused crash via IsValidGameItem)");
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6.19 MethodInfo patch complete! %d ProtoLogin methods patched (v6.10 style: f[0]+f[1]+f[10] only)", patched);
+        LOGI("[dlc] v6.20 MethodInfo patch complete! %d ProtoLogin methods patched (f[0]+f[1]+f[10]+f[11]/f[12] bridge)", patched);
         
         // ===== 6b) v6.16: 不再 Patch Purchase*/PackageSystem 类 =====
         // v6.15 patch 了 PurchaseShopConfig.IsUnlockAll, PurchaseRedPanel.IsUnlockAllDLC,
@@ -2045,7 +2063,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.19 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.20 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

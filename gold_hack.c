@@ -2254,17 +2254,90 @@ static int do_unlock_all_dlc(void) {
                     direct_add_ok += add_ok2;
                 }
             } else {
-                LOGW("[dlc] v6.25: HashSet.Add method not found on class %s", cls_name);
+                LOGW("[dlc] v6.25: Add method not found on class %s", cls_name);
                 
-                // 备选: 枚举所有方法找 Add
+                // ===== DLCSet 结构分析 =====
+                // DLCSet 不是 HashSet<int>，是自定义游戏类，需要理解其结构
+                LOGI("[dlc] v6.25: ===== DLCSet class analysis =====");
+                
+                // 1) 枚举所有方法（包括继承）
                 if (hashset_cls && fn_class_get_methods && fn_method_get_name) {
                     void *miter = NULL;
                     Il2CppMethodInfo m;
-                    LOGI("[dlc] v6.25: Enumerating methods of %s:", cls_name);
+                    LOGI("[dlc] v6.25: Methods of %s:", cls_name);
                     while ((m = fn_class_get_methods(hashset_cls, &miter)) != NULL) {
                         const char *mname = fn_method_get_name(m);
                         int pc = fn_method_get_param_count ? fn_method_get_param_count(m) : -1;
-                        LOGI("[dlc] v6.25:   %s(%d) MI=%p", mname, pc, m);
+                        LOGI("[dlc] v6.25:   M: %s(%d) MI=%p", mname, pc, m);
+                    }
+                }
+                
+                // 2) 枚举所有字段
+                if (hashset_cls && fn_class_get_fields && fn_field_get_name) {
+                    void *fiter = NULL;
+                    Il2CppFieldInfo fi;
+                    LOGI("[dlc] v6.25: Fields of %s:", cls_name);
+                    while ((fi = fn_class_get_fields(hashset_cls, &fiter)) != NULL) {
+                        const char *fname = fn_field_get_name(fi);
+                        int foff = fn_field_get_offset ? fn_field_get_offset(fi) : -1;
+                        // 获取字段类型名
+                        const char *type_name = "(unknown)";
+                        if (fn_field_get_type && fn_class_from_type) {
+                            void *ftype = fn_field_get_type(fi);
+                            if (ftype) {
+                                Il2CppClass fcls = fn_class_from_type(ftype);
+                                if (fcls && fn_class_get_name)
+                                    type_name = fn_class_get_name(fcls);
+                            }
+                        }
+                        LOGI("[dlc] v6.25:   F: %s (offset=%d, type=%s)", fname, foff, type_name);
+                    }
+                }
+                
+                // 3) 检查父类
+                Il2CppClass parent = (hashset_cls && fn_class_get_parent) ? fn_class_get_parent(hashset_cls) : NULL;
+                if (parent) {
+                    const char *pname = fn_class_get_name ? fn_class_get_name(parent) : "(null)";
+                    const char *pns = fn_class_get_namespace ? fn_class_get_namespace(parent) : "";
+                    LOGI("[dlc] v6.25: Parent class: %s.%s @ %p", pns, pname, parent);
+                    
+                    // 枚举父类方法（找 Add/Contains 等）
+                    if (fn_class_get_methods && fn_method_get_name) {
+                        void *miter = NULL;
+                        Il2CppMethodInfo m;
+                        LOGI("[dlc] v6.25: Parent methods:");
+                        while ((m = fn_class_get_methods(parent, &miter)) != NULL) {
+                            const char *mname = fn_method_get_name(m);
+                            int pc = fn_method_get_param_count ? fn_method_get_param_count(m) : -1;
+                            LOGI("[dlc] v6.25:   M: %s(%d) MI=%p", mname, pc, m);
+                        }
+                    }
+                    
+                    // 如果父类有 Add 方法，直接用
+                    Il2CppMethodInfo parent_add = fn_class_get_method_from_name(parent, "Add", 1);
+                    if (!parent_add) parent_add = fn_class_get_method_from_name(hashset_cls, "add_Item", 1);
+                    if (parent_add) {
+                        LOGI("[dlc] v6.25: ★ Found Add on parent/derived! Trying to add DLC IDs...");
+                        for (int32_t dlcId = 0; dlcId <= 50; dlcId++) {
+                            void *params[1] = { &dlcId };
+                            exc = NULL;
+                            void *r = NULL;
+                            SAFE_INVOKE(r, parent_add, dlc_set_obj, params, &exc);
+                            if (sigsegv_hit) {
+                                LOGE("[dlc] v6.25: parent.Add(%d) SIGSEGV", dlcId);
+                                break;
+                            }
+                            if (!exc) direct_add_ok++;
+                        }
+                        LOGI("[dlc] v6.25: parent.Add(0-50): %d OK", direct_add_ok);
+                    }
+                    
+                    // 再检查祖父类
+                    Il2CppClass grandparent = fn_class_get_parent(parent);
+                    if (grandparent) {
+                        const char *gpname = fn_class_get_name ? fn_class_get_name(grandparent) : "(null)";
+                        const char *gpns = fn_class_get_namespace ? fn_class_get_namespace(grandparent) : "";
+                        LOGI("[dlc] v6.25: Grandparent: %s.%s", gpns, gpname);
                     }
                 }
             }

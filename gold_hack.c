@@ -1771,9 +1771,8 @@ static int do_unlock_all_dlc(void) {
         uintptr_t page_end = ((uintptr_t)m_isUnlock + 0xC0) & ~(uintptr_t)0xFFF;
         if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
 
-        // [0] methodPointer → stub (备用，但 invoker 不会调用它)
-        if (g_stub_return_true)
-            mi_fields[0] = (uintptr_t)g_stub_return_true;
+        // 注意: 不修改 [0] methodPointer! HybridCLR 解释器内部通过 methodPointer 调用,
+        // 修改它会导致解释器崩溃。只替换 invoker 即可影响 il2cpp_runtime_invoke 路径。
         
         // [1] invoker_method → 我们的 C 函数 custom_bool_true_invoker
         mi_fields[1] = (uintptr_t)custom_bool_true_invoker;
@@ -1800,7 +1799,7 @@ static int do_unlock_all_dlc(void) {
             uintptr_t pe2 = ((uintptr_t)methods_to_patch[i] + 0xC0) & ~(uintptr_t)0xFFF;
             if (pe2 != p2) mprotect((void *)pe2, 0x1000, PROT_READ | PROT_WRITE);
             
-            mi2[0] = g_stub_return_true ? (uintptr_t)g_stub_return_true : mi2[0];
+            // 不修改 mi2[0] (methodPointer)，只替换 invoker
             mi2[1] = (uintptr_t)custom_bool_true_invoker;
             mi2[15] = (uintptr_t)custom_bool_true_invoker;
             LOGI("[dlc] ★ %s invoker replaced with custom_bool_true_invoker", method_names[i]);

@@ -1888,31 +1888,19 @@ static int do_unlock_all_dlc(void) {
             // f[2] = name → 不动!
             // f[10] interpData → NULL (清除 IL 字节码，让解释器不再解释)
             f[10] = 0;
-            // f[11] methodPointerCallByInterp → NULL!
-            //   必须为 0! 否则 HybridCLR Runtime::InvokeWithThrow 会走快速路径,
-            //   直接调用 methodPointer 返回 uint8_t=1, 然后作为 void* 返回 0x1,
-            //   不做 Object::Box, 导致 SIGSEGV!
-            f[11] = 0;
-            // f[12] virtualMethodPointerCallByInterp → NULL (同理)
-            f[12] = 0;
+            // v6.19: 回退到 v6.10 方式 — 不修改 f[11]/f[12]/bitfield
+            // v6.14+ 额外修改了 methodPointerCallByInterp(f[11])、
+            // virtualMethodPointerCallByInterp(f[12]) 和 bitfield@0x4B，
+            // 导致 HybridCLR 的方法分派路径改变，引起游戏按键失效。
+            // v6.10 只修改 f[0]+f[1]+f[10]，按键正常，DLC 部分解锁成功。
             
-            // 修改 offset 0x4B 的 bitfield（Unity 2020 位于 f[9] 的第3字节）:
-            //   清除 isInterpterImpl (bit 5) → 告诉 HybridCLR 这不再是解释器方法
-            //   设置 initInterpCallMethodPointer (bit 4) → 防止重新初始化
-            uint8_t *bitfield = (uint8_t *)mi + 0x4B;
-            *bitfield = (*bitfield & ~(1 << 5)) | (1 << 4);
+            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p interpData=0 MI=%p (v6.19 minimal)",
+                 mname, (void*)f[0], (void*)f[1], mi);
             
-            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p interpData=0 mPtrByInterp=0 MI=%p bf=0x%02x",
-                 mname, (void*)f[0], (void*)f[1], mi, *((uint8_t *)mi + 0x4B));
-            
-            // v6.14: dump 完整 MI 结构用于调试 (Unity 2020 layout)
-            if (strcmp(mname, "isUnlockRole") == 0 || strcmp(mname, "isUnlockByItem") == 0) {
-                LOGI("[dlc] MI-DUMP %s: f[0]mPtr=%p f[1]inv=%p f[2]name=%p f[3]klass=%p",
-                     mname, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[3]);
-                LOGI("[dlc] MI-DUMP %s: f[8]tok+fl=%p f[9]slot+pc+bf=%p bf@0x4B=0x%02x",
-                     mname, (void*)f[8], (void*)f[9], *((uint8_t*)mi + 0x4B));
-                LOGI("[dlc] MI-DUMP %s: f[10]interpData=%p f[11]mPtrByInterp=%p f[12]vPtrByInterp=%p",
-                     mname, (void*)f[10], (void*)f[11], (void*)f[12]);
+            // v6.19: 简化日志
+            if (strcmp(mname, "isUnlockRole") == 0) {
+                LOGI("[dlc] MI-DUMP %s: f[0]mPtr=%p f[1]inv=%p f[10]interpData=%p MI=%p",
+                     mname, (void*)f[0], (void*)f[1], (void*)f[10], mi);
             }
             
             patched++;
@@ -1951,17 +1939,13 @@ static int do_unlock_all_dlc(void) {
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
             uintptr_t page_end = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;  // MI=104 bytes (Unity 2020)
             if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
-            // v6.14: Unity 2020 MethodInfo 字段偏移 (无 virtualMethodPointer!)
+            // v6.19: 回退到 v6.10 方式 — 只改 f[0]+f[1]+f[10]
             f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
             f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
             // f[2] = name → 不动!
             f[10] = 0;                                       // interpData = NULL (0x50)
-            f[11] = 0;                                       // methodPointerCallByInterp = NULL (0x58) 必须0!
-            f[12] = 0;                                       // virtualMethodPointerCallByInterp = NULL (0x60)
-            // 修改 bitfield @ 0x4B: 清除 isInterpterImpl, 设置 initInterpCallMethodPointer
-            uint8_t *bf = (uint8_t *)mi + 0x4B;
-            *bf = (*bf & ~(1 << 5)) | (1 << 4);
-            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (by name lookup) MI=%p bf=0x%02x", extra_proto_methods[ep], pc_found, mi, *((uint8_t *)mi + 0x4B));
+            // 不修改 f[11]/f[12]/bitfield — v6.14+ 修改这些导致按键失效
+            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.19 minimal) MI=%p", extra_proto_methods[ep], pc_found, mi);
             patched++;
         }
         
@@ -1971,7 +1955,7 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6.8.1: Skipping brute-force ProtoLogin patch (caused crash via IsValidGameItem)");
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6.16 MethodInfo patch complete! %d ProtoLogin methods patched (minimal safe set)", patched);
+        LOGI("[dlc] v6.19 MethodInfo patch complete! %d ProtoLogin methods patched (v6.10 style: f[0]+f[1]+f[10] only)", patched);
         
         // ===== 6b) v6.16: 不再 Patch Purchase*/PackageSystem 类 =====
         // v6.15 patch 了 PurchaseShopConfig.IsUnlockAll, PurchaseRedPanel.IsUnlockAllDLC,
@@ -2061,7 +2045,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.17 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.19 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

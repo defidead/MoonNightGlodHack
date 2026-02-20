@@ -1549,8 +1549,6 @@ static int do_unlock_all_dlc(void) {
         if (sigsegv_hit) {
             LOGW("[dlc] SIGSEGV calling isUnlockRole(0) - instance INVALID, discarding");
             g_proto_login_inst = 0;
-            #undef SAFE_INVOKE
-            #undef SAFE_UNBOX_INT
             return -3;
         }
         int val = -1;
@@ -1579,8 +1577,6 @@ static int do_unlock_all_dlc(void) {
     // mDLCSet 为 NULL 说明游戏还没完成 UpdateDLC()，需要等待
     if (mDLCSet == 0) {
         LOGI("[dlc] mDLCSet is NULL - game hasn't called UpdateDLC yet, waiting...");
-        #undef SAFE_INVOKE
-        #undef SAFE_UNBOX_INT
         return -2;  // 返回 -2 让轮询继续
     }
 

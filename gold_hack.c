@@ -2010,6 +2010,7 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6.17: Skipping mDLCSet/EnterLayer diagnostics");
     }
     skip_mi_hook:
+    ; // C99/C17 要求 label 后跟语句，不能直接跟声明
 
     // ===== 7) 验证 hook 效果 =====
     int unlocked_count = 0;
@@ -2273,21 +2274,7 @@ static int do_unlock_all_dlc(void) {
 
 #endif /* v6.17 disabled */
 
-/* v6.17: 不会走到这里，上面已经 return */
-#if 0
-    if (unlocked_count >= 10) {
-        g_dlc_unlocked = 1;
-        LOGI("[dlc] ★ DLC unlock SUCCESS via methodPointer replacement!");
-    }
-
-    #undef SAFE_INVOKE
-    #undef SAFE_UNBOX_INT
-
-    LOGI("[dlc] ===== DLC unlock v6.17 complete (unlocked=%d/16, mi_hooks=%d) =====",
-         unlocked_count, g_mi_hooks_installed);
-    return unlocked_count;
-#endif
-}
+/* v6.17: 上面的 #if 0 块中已包含旧的 return 逻辑，不需要额外的 } */
 
 // ========== RoleInfo 实例缓存（避免每次全量扫描）==========
 #define MAX_CACHED_ROLEINFO 8

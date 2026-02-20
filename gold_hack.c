@@ -1765,17 +1765,15 @@ static int do_unlock_all_dlc(void) {
     if (!g_mi_hooks_installed && g_boolean_class && fn_object_new) {
         init_dlc_stubs();
         
-        // 收集所有需要 patch 的方法
+        // 收集所有需要 patch 的方法（只保留确定返回 bool 的方法）
+        // 注意：不要 patch 2 参数方法（isUnlockByItem/IsUnlockByGameId/IsUnlockByGameIds）
+        // 它们的返回类型不确定，强行返回 1 可能被当作指针崩溃
         struct { const char *name; int param_count; } patch_targets[] = {
             {"isUnlockRole",       1},
             {"IsDLCRole",          1},
             {"IsUnlockAllDLC",     1},
             {"IsUnlockByFirstGame",1},
-            {"isUnlockDLC",        1},
             {"IsUnlockGuBao",      0},
-            {"isUnlockByItem",     2},
-            {"IsUnlockByGameId",   2},
-            {"IsUnlockByGameIds",  2},
         };
         int num_targets = sizeof(patch_targets) / sizeof(patch_targets[0]);
         int patched = 0;
@@ -1833,18 +1831,10 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6 full MethodInfo patch complete! %d/%d methods patched", patched, num_targets);
         
         // ===== 6b) Patch 其他 DLC 检查类的方法 =====
-        // 这些类不在 ProtoLogin，但也有 unlock 检查方法
+        // 只 patch 确定返回 bool 且安全的方法
+        // 不 patch PurchaseShopConfig/AchieveConfig 等 — 返回类型不确定，强行返回 1 会崩溃
         struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } extra_patches[] = {
             {"EditorSettingExtension", "", "get_isUnlockAll",    0},
-            {"PurchaseUtils",         "", "IsUnlockDianCang",    1},
-            {"PurchaseShopConfig",    "", "IsUnlockAll",         1},
-            {"PurchaseShopConfig",    "", "IsUnlockByExtra",     1},
-            {"PurchaseRedConfig",     "", "IsUnlockAll",         1},
-            {"PurchaseRedPanel",      "", "IsUnlockAllDLC",      1},
-            {"AchieveConfig",         "", "IsDlcAchieve",        1},
-            {"AchieveConfig",         "", "IsUnlockForGameItemId",1},
-            {"AchieveConfig",         "", "IsUnLockCard",        2},
-            {"PurchaseFriendHelpComponent","","IsUnlockAll",     0},
         };
         int num_extra = sizeof(extra_patches) / sizeof(extra_patches[0]);
         int extra_patched = 0;

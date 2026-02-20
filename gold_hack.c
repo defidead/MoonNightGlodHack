@@ -5769,16 +5769,16 @@ static int hook_kill_func(pid_t pid, int sig) {
 
 // v6.32: hook exit/_exit — 反篡改检测到 kill() 被 hook 后改用 System.exit()
 // System.exit() → Runtime.halt() → _exit() 或 exit()
+// 注意: exit/_exit 是 noreturn 函数, 调用者假设它们永不返回.
+// 所以我们不能直接 return, 而是让线程永远 sleep.
 static void hook_exit_func(int status) {
-    LOGW("[anti-kill] Blocked exit(%d) from anti-tamper check", status);
-    // 不执行, 让调用者继续运行
-    // 设置线程名标识已被拦截
-    return;
+    LOGW("[anti-kill] Blocked exit(%d) from anti-tamper, suspending thread", status);
+    while (1) sleep(3600);  // 挂起反篡改线程
 }
 
 static void hook__exit_func(int status) {
-    LOGW("[anti-kill] Blocked _exit(%d) from anti-tamper check", status);
-    return;
+    LOGW("[anti-kill] Blocked _exit(%d) from anti-tamper, suspending thread", status);
+    while (1) sleep(3600);  // 挂起反篡改线程
 }
 
 // 通用 inline hook 安装函数 (无 trampoline, 16 bytes)

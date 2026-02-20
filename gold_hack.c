@@ -1640,6 +1640,13 @@ static int do_unlock_all_dlc(void) {
     LOGI("[dlc] mDLCSet=%p mDLCSetInfo=%p mProduct2DLC=%p", (void*)mDLCSet, (void*)mDLCSetInfo, (void*)mProduct2DLC);
     LOGI("[dlc] BaseRoles=%p packAll=%p packMagic=%p packClassics=%p",
          (void*)baseRoles, (void*)packAll, (void*)packMagic, (void*)packClassics);
+    
+    // 检查 mDLCSet 原始类型（在修改之前）
+    if (mDLCSet && fn_object_get_class && fn_class_get_name) {
+        Il2CppClass orig_k = fn_object_get_class((Il2CppObject)mDLCSet);
+        const char *orig_name = orig_k ? fn_class_get_name(orig_k) : "?";
+        LOGI("[dlc] mDLCSet ORIGINAL class: %s (same as packAll: %s)", orig_name, mDLCSet == packAll ? "YES" : "NO");
+    }
 
     // ===== 5) 获取 HashSet<int> klass + 通过迭代查找方法 =====
     uintptr_t hashset_klass = 0;
@@ -1664,7 +1671,31 @@ static int do_unlock_all_dlc(void) {
         if (fn_class_get_name && fn_object_get_class) {
             if (mDLCSet) {
                 Il2CppClass k = fn_object_get_class((Il2CppObject)mDLCSet);
-                LOGI("[dlc] mDLCSet class: %s", k ? fn_class_get_name(k) : "?");
+                const char *cn = k ? fn_class_get_name(k) : "?";
+                LOGI("[dlc] mDLCSet class: %s", cn);
+                // 枚举 mDLCSet 类的所有字段
+                if (k && fn_class_get_fields && fn_field_get_name && fn_field_get_offset) {
+                    void *fi = NULL;
+                    Il2CppFieldInfo ff;
+                    while ((ff = fn_class_get_fields(k, &fi)) != NULL) {
+                        const char *fn = fn_field_get_name(ff);
+                        int fo = fn_field_get_offset(ff);
+                        LOGI("[dlc-mds] mDLCSet field: %s @ 0x%x", fn ? fn : "?", fo);
+                    }
+                }
+                // 枚举 mDLCSet 类的所有方法
+                if (k && fn_class_get_methods && fn_method_get_name) {
+                    void *mi = NULL;
+                    Il2CppMethodInfo mm;
+                    int cnt = 0;
+                    while ((mm = fn_class_get_methods(k, &mi)) != NULL) {
+                        const char *mn = fn_method_get_name(mm);
+                        int pc = fn_method_get_param_count(mm);
+                        LOGI("[dlc-mds] mDLCSet method: %s(%d)", mn ? mn : "?", pc);
+                        cnt++;
+                    }
+                    LOGI("[dlc] mDLCSet total methods: %d", cnt);
+                }
             }
             if (packAll && packAll != mDLCSet) {
                 Il2CppClass k = fn_object_get_class((Il2CppObject)packAll);

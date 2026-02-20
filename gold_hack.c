@@ -1871,17 +1871,21 @@ static int do_unlock_all_dlc(void) {
         }
 
         // ===== 6a-extra) 补充 fn_class_get_method_from_name 查找迭代遗漏的方法 =====
-        // fn_class_get_methods 可能不返回某些方法（如父类方法/接口方法）
-        // 用 get_method_from_name 直接查找
+        // v6.8 FIX: 之前只尝试 param_count=0,1，导致 2 参数方法(isUnlockByItem, 
+        // IsUnlockByGameId, IsUnlockByGameIds) 未被找到！现在尝试 0-3 参数。
+        // 新增 isUnlockByItem — 这是 UI 直接调用的关键方法！
         const char *extra_proto_methods[] = {"IsDianCang", "IsOldPlayer", "isUnlockDLC", 
-                                              "IsBoughtAllItems", "IsUnlockByGameId", "IsUnlockByGameIds"};
+                                              "IsBoughtAllItems", "IsUnlockByGameId", "IsUnlockByGameIds",
+                                              "isUnlockByItem"};
         int num_extra_proto = sizeof(extra_proto_methods) / sizeof(extra_proto_methods[0]);
         for (int ep = 0; ep < num_extra_proto; ep++) {
-            // 尝试 1 参数和 0 参数
-            Il2CppMethodInfo mi = fn_class_get_method_from_name(g_proto_login_cls, extra_proto_methods[ep], 1);
-            if (!mi) mi = fn_class_get_method_from_name(g_proto_login_cls, extra_proto_methods[ep], 0);
+            // v6.8: 尝试 0-3 参数（修复之前只尝试 0,1 的 BUG）
+            Il2CppMethodInfo mi = NULL;
+            for (int pc = 0; pc <= 3 && !mi; pc++) {
+                mi = fn_class_get_method_from_name(g_proto_login_cls, extra_proto_methods[ep], pc);
+            }
             if (!mi) {
-                LOGI("[dlc] ProtoLogin.%s not found by name, skip", extra_proto_methods[ep]);
+                LOGI("[dlc] ProtoLogin.%s not found by name (tried 0-3 params), skip", extra_proto_methods[ep]);
                 continue;
             }
             uintptr_t *f = (uintptr_t *)mi;
@@ -1889,8 +1893,9 @@ static int do_unlock_all_dlc(void) {
                 LOGI("[dlc] ProtoLogin.%s already patched, skip", extra_proto_methods[ep]);
                 continue;
             }
-            LOGI("[dlc] BEFORE ProtoLogin.%s: ptr=%p inv=%p interp=%p flags=0x%x MI=%p",
-                 extra_proto_methods[ep], (void*)f[0], (void*)f[1], (void*)f[10], (int)f[13], mi);
+            int pc_found = fn_method_get_param_count ? fn_method_get_param_count(mi) : -1;
+            LOGI("[dlc] BEFORE ProtoLogin.%s(%d): ptr=%p inv=%p interp=%p flags=0x%x MI=%p",
+                 extra_proto_methods[ep], pc_found, (void*)f[0], (void*)f[1], (void*)f[10], (int)f[13], mi);
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
             uintptr_t page_end = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
@@ -1901,12 +1906,66 @@ static int do_unlock_all_dlc(void) {
             f[12] = (uintptr_t)custom_return_true_method;
             f[13] = f[13] & ~(uintptr_t)0x100;
             f[15] = (uintptr_t)custom_bool_true_invoker;
-            LOGI("[dlc] ★ ProtoLogin.%s PATCHED (by name lookup) MI=%p", extra_proto_methods[ep], mi);
+            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (by name lookup) MI=%p", extra_proto_methods[ep], pc_found, mi);
             patched++;
+        }
+        
+        // ===== 6a2) v6.8: 暴力 patch ProtoLogin 所有 bool 返回方法 =====
+        // 迭代所有方法，patch 任何以 "is"/"Is"/"Has" 开头且 <=3 参数的未 patch 方法
+        // 这能捕获所有我们可能遗漏的 DLC 检查方法
+        {
+            LOGI("[dlc] v6.8: ===== Brute-force ProtoLogin bool method patch =====");
+            void *biter = NULL;
+            Il2CppMethodInfo bmi;
+            int brute_patched = 0;
+            while ((bmi = fn_class_get_methods(g_proto_login_cls, &biter)) != NULL) {
+                const char *bname = fn_method_get_name(bmi);
+                if (!bname) continue;
+                int bpc = fn_method_get_param_count ? fn_method_get_param_count(bmi) : -1;
+                if (bpc > 3) continue;  // 太多参数的方法不安全 patch
+                
+                uintptr_t *bf = (uintptr_t *)bmi;
+                // 跳过已 patch 的
+                if (bf[0] == (uintptr_t)custom_return_true_method) continue;
+                
+                // 只 patch 以 is/Is/Has 开头的方法（这些是 bool 返回的检查方法）
+                int should_patch = 0;
+                if (strncmp(bname, "is", 2) == 0 && bname[2] >= 'A' && bname[2] <= 'Z') should_patch = 1;
+                if (strncmp(bname, "Is", 2) == 0) should_patch = 1;
+                if (strncmp(bname, "Has", 3) == 0) should_patch = 1;
+                
+                // 排除非 bool 返回的方法（不 patch getter/setter/数据方法）
+                if (strstr(bname, "Login") || strstr(bname, "Server") || 
+                    strstr(bname, "Send") || strstr(bname, "Check") ||
+                    strstr(bname, "Data") || strstr(bname, "Parse")) should_patch = 0;
+                    
+                if (!should_patch) continue;
+                
+                LOGI("[dlc] v6.8: BRUTE-PATCH ProtoLogin.%s(%d): ptr=%p MI=%p",
+                     bname, bpc, (void*)bf[0], bmi);
+                
+                uintptr_t bpg = (uintptr_t)bmi & ~(uintptr_t)0xFFF;
+                mprotect((void *)bpg, 0x2000, PROT_READ | PROT_WRITE);
+                uintptr_t bpe = ((uintptr_t)bmi + 0xC0) & ~(uintptr_t)0xFFF;
+                if (bpe != bpg) mprotect((void *)bpe, 0x1000, PROT_READ | PROT_WRITE);
+                
+                bf[0] = (uintptr_t)custom_return_true_method;
+                bf[1] = (uintptr_t)custom_bool_true_invoker;
+                bf[10] = 0;
+                bf[11] = (uintptr_t)custom_return_true_method;
+                bf[12] = (uintptr_t)custom_return_true_method;
+                bf[13] = bf[13] & ~(uintptr_t)0x100;
+                bf[15] = (uintptr_t)custom_bool_true_invoker;
+                
+                LOGI("[dlc] v6.8: ★ ProtoLogin.%s(%d) BRUTE-PATCHED", bname, bpc);
+                brute_patched++;
+                patched++;
+            }
+            LOGI("[dlc] v6.8: Brute-force patched %d additional ProtoLogin methods", brute_patched);
         }
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6.7 full MethodInfo patch complete! %d ProtoLogin methods patched", patched);
+        LOGI("[dlc] v6.8 full MethodInfo patch complete! %d ProtoLogin methods patched", patched);
         
         // ===== 6b) Patch 其他 DLC 检查类的方法 =====
         // 添加回安全的 1-param/0-param bool 返回方法
@@ -1914,11 +1973,13 @@ static int do_unlock_all_dlc(void) {
             {"EditorSettingExtension",    "", "get_isUnlockAll",    0},
             {"PurchaseUtils",             "", "IsUnlockDianCang",   1},
             {"PurchaseRedPanel",          "", "IsUnlockAllDLC",     1},
+            {"PurchaseRedPanel",          "", "IsReview",           0},
             {"PurchaseFriendHelpComponent","", "IsUnlockAll",       0},
             {"PurchaseShopConfig",        "", "IsUnlockAll",        1},
             {"PurchaseShopConfig",        "", "IsUnlockByExtra",    1},
             {"PurchaseRedConfig",         "", "IsUnlockAll",        1},
             {"PackageSystem",             "", "IsUnlockAnyDlc",     1},
+            {"PackageSystem",             "", "get_IsAllComplete",  0},
             {"PurchasePocketPanel",       "", "isUnlock",            1},
         };
         int num_extra = sizeof(extra_patches) / sizeof(extra_patches[0]);
@@ -1963,6 +2024,156 @@ static int do_unlock_all_dlc(void) {
             extra_patched++;
         }
         LOGI("[dlc] Extra class patches: %d/%d done", extra_patched, num_extra);
+        
+        // ===== 6b2) v6.8: 暴力 patch 所有 DLC 相关类的 IsUnlock/isUnlock 方法 =====
+        // 遍历关键类的所有方法，patch 以 Is/is/Has 开头的未 patch 方法
+        {
+            const char *brute_classes[] = {"PurchaseUtils", "PurchaseRedPanel", "PurchaseRedConfig",
+                                           "PurchaseShopConfig", "PurchasePocketPanel", 
+                                           "PurchaseFriendHelpComponent", "PackageSystem"};
+            int num_brute_cls = sizeof(brute_classes) / sizeof(brute_classes[0]);
+            int total_brute_cls = 0;
+            
+            for (int bc = 0; bc < num_brute_cls; bc++) {
+                Il2CppClass bcls = fn_class_from_name(g_csharp_image, "", brute_classes[bc]);
+                if (!bcls) continue;
+                
+                void *biter2 = NULL;
+                Il2CppMethodInfo bm;
+                while ((bm = fn_class_get_methods(bcls, &biter2)) != NULL) {
+                    const char *bn = fn_method_get_name(bm);
+                    if (!bn) continue;
+                    int bpc2 = fn_method_get_param_count ? fn_method_get_param_count(bm) : -1;
+                    if (bpc2 > 3) continue;
+                    
+                    uintptr_t *bf2 = (uintptr_t *)bm;
+                    if (bf2[0] == (uintptr_t)custom_return_true_method) continue;
+                    
+                    int sp = 0;
+                    if (strncmp(bn, "Is", 2) == 0 && bn[2] >= 'A' && bn[2] <= 'Z') sp = 1;
+                    if (strncmp(bn, "is", 2) == 0 && bn[2] >= 'A' && bn[2] <= 'Z') sp = 1;
+                    if (strncmp(bn, "Has", 3) == 0) sp = 1;
+                    if (strncmp(bn, "get_Is", 6) == 0) sp = 1;
+                    if (strncmp(bn, "get_is", 6) == 0) sp = 1;
+                    if (!sp) continue;
+                    
+                    LOGI("[dlc] v6.8: BRUTE-CLS %s.%s(%d) ptr=%p MI=%p",
+                         brute_classes[bc], bn, bpc2, (void*)bf2[0], bm);
+                    
+                    uintptr_t pg2 = (uintptr_t)bm & ~(uintptr_t)0xFFF;
+                    mprotect((void *)pg2, 0x2000, PROT_READ | PROT_WRITE);
+                    uintptr_t pe2 = ((uintptr_t)bm + 0xC0) & ~(uintptr_t)0xFFF;
+                    if (pe2 != pg2) mprotect((void *)pe2, 0x1000, PROT_READ | PROT_WRITE);
+                    
+                    bf2[0] = (uintptr_t)custom_return_true_method;
+                    bf2[1] = (uintptr_t)custom_bool_true_invoker;
+                    bf2[10] = 0;
+                    bf2[11] = (uintptr_t)custom_return_true_method;
+                    bf2[12] = (uintptr_t)custom_return_true_method;
+                    bf2[13] = bf2[13] & ~(uintptr_t)0x100;
+                    bf2[15] = (uintptr_t)custom_bool_true_invoker;
+                    
+                    LOGI("[dlc] v6.8: ★ %s.%s(%d) BRUTE-CLS-PATCHED", brute_classes[bc], bn, bpc2);
+                    total_brute_cls++;
+                }
+            }
+            LOGI("[dlc] v6.8: Brute-force class patches: %d total", total_brute_cls);
+        }
+        
+        // ===== 6b3) v6.8: PackageSystem 状态修复 =====
+        // 设置 PackageSystem.allComplete = true (offset 0x29)
+        // 并且设置所有 PackageData.stateEnum = Complete (7)
+        {
+            Il2CppClass pkg_sys_cls = fn_class_from_name(g_csharp_image, "", "PackageSystem");
+            if (pkg_sys_cls) {
+                Il2CppMethodInfo m_pkgInst = fn_class_get_method_from_name(pkg_sys_cls, "get_Instance", 0);
+                if (m_pkgInst) {
+                    void *exc3 = NULL;
+                    void *pkg_inst = NULL;
+                    install_sigsegv_handler();
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                        pkg_inst = fn_runtime_invoke(m_pkgInst, NULL, NULL, &exc3);
+                    }
+                    g_in_safe_access = 0;
+                    uninstall_sigsegv_handler();
+                    
+                    if (pkg_inst && !exc3) {
+                        // unbox if needed (静态属性返回的可能是对象引用)
+                        uintptr_t pkg_addr = (uintptr_t)pkg_inst;
+                        // 检查是否是 boxed object（有 klass 指针）
+                        install_sigsegv_handler();
+                        g_in_safe_access = 1;
+                        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                            uint8_t *p = (uint8_t *)pkg_addr;
+                            uint8_t old_allComplete = p[0x29];
+                            uint8_t old_startUpdate = p[0x28];
+                            LOGI("[dlc] v6.8: PackageSystem instance=%p startUpdate=%d allComplete=%d",
+                                 pkg_inst, old_startUpdate, old_allComplete);
+                            
+                            // 设置 allComplete = true
+                            p[0x29] = 1;
+                            p[0x28] = 1;  // startUpdate also true
+                            LOGI("[dlc] v6.8: ★ PackageSystem.allComplete = 1, startUpdate = 1");
+                            
+                            // 读取 _packageDatas 字典
+                            uintptr_t pkg_datas = *(uintptr_t *)(p + 0x10);
+                            LOGI("[dlc] v6.8: PackageSystem._packageDatas = %p", (void*)pkg_datas);
+                            
+                            if (pkg_datas) {
+                                // Dictionary<int,PackageData> 内部结构:
+                                // [0x10]=buckets, [0x18]=entries, [0x20]=count, ...
+                                // entries 是 Entry[] 数组，每个 Entry: hashCode(4) + next(4) + key(4) + value(ptr)
+                                int32_t dict_count = *(int32_t *)((uint8_t *)pkg_datas + 0x20);
+                                uintptr_t entries = *(uintptr_t *)((uint8_t *)pkg_datas + 0x18);
+                                LOGI("[dlc] v6.8: _packageDatas count=%d entries=%p", dict_count, (void*)entries);
+                                
+                                if (entries && dict_count > 0 && dict_count < 50) {
+                                    // Il2CppArray header: [0x00]=klass, [0x08]=monitor, [0x10]=bounds, [0x18]=max_length, [0x20]=data start
+                                    uint8_t *entry_base = (uint8_t *)entries + 0x20;
+                                    // Each Entry in Dictionary<int,PackageData>:
+                                    // struct { int hashCode; int next; int key; PackageData* value; }
+                                    // 在 64 位上: hashCode(4) + next(4) + key(4) + padding(4) + value(8) = 24 bytes
+                                    int entry_size = 24;  // 4+4+4+4+8 = 24 on ARM64
+                                    
+                                    for (int di = 0; di < dict_count && di < 20; di++) {
+                                        uint8_t *e = entry_base + di * entry_size;
+                                        int32_t ekey = *(int32_t *)(e + 8);  // key offset after hashCode+next
+                                        uintptr_t eval = *(uintptr_t *)(e + 16);  // value offset
+                                        
+                                        if (!eval) continue;
+                                        
+                                        // PackageData fields:
+                                        // [0x10] PackageEnum, [0x14] stateEnum, [0x30] downloadState
+                                        int32_t pkg_enum = *(int32_t *)((uint8_t *)eval + 0x10);
+                                        int32_t state_enum = *(int32_t *)((uint8_t *)eval + 0x14);
+                                        int32_t dl_state = *(int32_t *)((uint8_t *)eval + 0x30);
+                                        
+                                        LOGI("[dlc] v6.8: PackageData[%d]: key=%d PackageEnum=%d stateEnum=%d downloadState=%d",
+                                             di, ekey, pkg_enum, state_enum, dl_state);
+                                        
+                                        // 设置 stateEnum = 7 (Complete)
+                                        if (state_enum != 7) {
+                                            *(int32_t *)((uint8_t *)eval + 0x14) = 7;  // Complete
+                                            LOGI("[dlc] v6.8: ★ PackageData[%d] stateEnum: %d → 7 (Complete)", di, state_enum);
+                                        }
+                                        // 设置 downloadState = 0 (ToBeDownload = idle/done)
+                                        if (dl_state != 0) {
+                                            *(int32_t *)((uint8_t *)eval + 0x30) = 0;
+                                            LOGI("[dlc] v6.8: ★ PackageData[%d] downloadState: %d → 0", di, dl_state);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        g_in_safe_access = 0;
+                        uninstall_sigsegv_handler();
+                    } else {
+                        LOGI("[dlc] v6.8: PackageSystem.get_Instance() returned NULL or exception");
+                    }
+                }
+            }
+        }
         
         // ===== 6c) 直接设置 EditorSetting.isUnlockAll 字段 =====
         // EditorSettingExtension 有静态字段 mInstance，通过它获取 EditorSetting 实例
@@ -2298,7 +2509,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.7 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.8 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

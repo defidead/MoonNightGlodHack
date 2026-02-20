@@ -1932,21 +1932,8 @@ static int do_unlock_all_dlc(void) {
             uint8_t *bitfield = (uint8_t *)mi + 0x4B;
             *bitfield = *bitfield | (1 << 4);  // 只设置 bit4，不清除任何其他 bit
             
-            // v6.28: 恢复 v6.9 的 f[13]/f[15] 越界写入
-            // v6.9 使用 0xC0 布局（错误的大小），f[13]=flags清除HybridCLR标志，f[15]=invoker副本
-            // 虽然在 Unity 2020 中 MI 只有 0x68=104 字节，f[13]/f[15] 越界了，
-            // 但这个"意外"的写入可能修改了后续内存中的关键标志，v6.9 正是靠这个生效的！
-            // 先确保越界区域也可写
-            uintptr_t oob_page = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
-            uintptr_t mi_page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
-            if (oob_page != mi_page)
-                mprotect((void *)oob_page, 0x1000, PROT_READ | PROT_WRITE);
-            f[13] = f[13] & ~(uintptr_t)0x100;  // 清除 HybridCLR 标志
-            f[15] = (uintptr_t)custom_bool_true_invoker;  // invoker 副本
-            
-            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p bridge=%p bf=0x%02x f[13]=0x%lx f[15]=%p MI=%p (v6.28)",
-                 mname, (void*)f[0], (void*)f[1], (void*)f[11], *((uint8_t *)mi + 0x4B),
-                 (unsigned long)f[13], (void*)f[15], mi);
+            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p bridge=%p bf=0x%02x MI=%p (v6.28b)",
+                 mname, (void*)f[0], (void*)f[1], (void*)f[11], *((uint8_t *)mi + 0x4B), mi);
             
             if (strcmp(mname, "isUnlockRole") == 0) {
                 LOGI("[dlc] MI-DUMP %s: f[0]=%p f[1]=%p f[10]=%p f[11]=%p f[12]=%p MI=%p",
@@ -1985,7 +1972,7 @@ static int do_unlock_all_dlc(void) {
                  extra_proto_methods[ep], pc_found, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[10], mi);
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
-            uintptr_t page_end = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;  // v6.28: 扩大到 0xC0 覆盖 f[15]
+            uintptr_t page_end = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;
             if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
             // v6.20: 和 Step 6 一样的修补方式
             f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
@@ -1997,10 +1984,7 @@ static int do_unlock_all_dlc(void) {
             // v6.21: 设置 initInterpCallMethodPointer(bit4)=1 让解释器使用 f[11] 桥接
             uint8_t *bf = (uint8_t *)mi + 0x4B;
             *bf = *bf | (1 << 4);
-            // v6.28: 恢复 v6.9 的 f[13]/f[15] 越界写入（同主循环）
-            f[13] = f[13] & ~(uintptr_t)0x100;
-            f[15] = (uintptr_t)custom_bool_true_invoker;
-            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.28 full) bf=0x%02x MI=%p", extra_proto_methods[ep], pc_found, *bf, mi);
+            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.28b) bf=0x%02x MI=%p", extra_proto_methods[ep], pc_found, *bf, mi);
             patched++;
         }
         
@@ -2054,7 +2038,7 @@ static int do_unlock_all_dlc(void) {
                 
                 uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
                 mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
-                uintptr_t pe = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;  // v6.28: 扩大到 0xC0
+                uintptr_t pe = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;
                 if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
                 
                 f[0]  = (uintptr_t)custom_return_true_method;
@@ -2064,11 +2048,8 @@ static int do_unlock_all_dlc(void) {
                 f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
                 uint8_t *bf = (uint8_t *)mi + 0x4B;
                 *bf = *bf | (1 << 4);
-                // v6.28: 恢复 v6.9 的 f[13]/f[15] 越界写入
-                f[13] = f[13] & ~(uintptr_t)0x100;
-                f[15] = (uintptr_t)custom_bool_true_invoker;
                 
-                LOGI("[dlc] ★ %s.%s PATCHED (v6.28)", extra_patches[e].cls_name, extra_patches[e].method_name);
+                LOGI("[dlc] ★ %s.%s PATCHED (v6.28b)", extra_patches[e].cls_name, extra_patches[e].method_name);
                 extra_patched++;
             }
             LOGI("[dlc] Extra class patches: %d installed", extra_patched);

@@ -1896,7 +1896,7 @@ static int do_unlock_all_dlc(void) {
         }
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6.5 full MethodInfo patch complete! %d ProtoLogin methods patched", patched);
+        LOGI("[dlc] v6.6 full MethodInfo patch complete! %d ProtoLogin methods patched", patched);
         
         // ===== 6b) Patch 其他 DLC 检查类的方法 =====
         // 添加回安全的 1-param/0-param bool 返回方法
@@ -1986,111 +1986,44 @@ static int do_unlock_all_dlc(void) {
             }
         }
 
-        // ===== 6d) v6.5: NOP void 方法 — 阻止购买 UI 显示 =====
-        // updatePayBtns, updateUnlock, updatePayState 是 void 方法,
-        // 内部检查 DLC 状态并显示/隐藏购买按钮
-        // 把它们 NOP 掉，让购买按钮永远不显示
-        {
-            struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } void_nops[] = {
-                {"EnterLayer",              "", "updatePayBtns",     0},
-                {"EnterLayer",              "", "UpdateDLCEnter",    0},
-                {"EnterLayer",              "", "UpdateTryBtn",      0},
-                {"EnterLayerSwitchMode",    "", "updateUnlock",      0},
-                {"PurchaseRedPopupRole",    "", "updatePayState",    0},
-            };
-            int num_void_nops = sizeof(void_nops) / sizeof(void_nops[0]);
-            int void_patched = 0;
-            
-            LOGI("[dlc] ===== v6.5: NOP void UI methods =====");
-            for (int v = 0; v < num_void_nops; v++) {
-                Il2CppClass cls = fn_class_from_name(g_csharp_image, 
-                    void_nops[v].ns, void_nops[v].cls_name);
-                if (!cls) {
-                    LOGI("[dlc] v6.5: Class %s not found, skip", void_nops[v].cls_name);
-                    continue;
-                }
-                Il2CppMethodInfo mi = fn_class_get_method_from_name(
-                    cls, void_nops[v].method_name, void_nops[v].param_count);
-                if (!mi) {
-                    LOGI("[dlc] v6.5: %s.%s(%d) not found, skip",
-                         void_nops[v].cls_name, void_nops[v].method_name,
-                         void_nops[v].param_count);
-                    continue;
-                }
-                
-                uintptr_t *f = (uintptr_t *)mi;
-                LOGI("[dlc] v6.5: BEFORE %s.%s: ptr=%p inv=%p flags=0x%x",
-                     void_nops[v].cls_name, void_nops[v].method_name,
-                     (void*)f[0], (void*)f[1], (int)f[13]);
-                
-                uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
-                mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
-                uintptr_t pe = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
-                if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
-                
-                f[0]  = (uintptr_t)custom_void_nop_method;
-                f[1]  = (uintptr_t)custom_void_nop_invoker;
-                f[10] = 0;  // 清除 interpData
-                f[11] = (uintptr_t)custom_void_nop_method;
-                f[12] = (uintptr_t)custom_void_nop_method;
-                f[13] = f[13] & ~(uintptr_t)0x100;  // 清除 HybridCLR 标记
-                f[15] = (uintptr_t)custom_void_nop_invoker;
-                
-                LOGI("[dlc] v6.5: ★ %s.%s NOP'd (void→nop)", void_nops[v].cls_name, void_nops[v].method_name);
-                void_patched++;
-            }
-            LOGI("[dlc] v6.5: Void NOP patches: %d/%d done", void_patched, num_void_nops);
-        }
+        // ===== 6d) v6.6: 不再 NOP void 方法！让原始方法正常运行 =====
+        // v6.5 中 NOP void 方法是错误的：
+        // - updatePayBtns: 对已解锁 DLC 会 HIDE 购买按钮，NOP 后按钮保持默认可见
+        // - updateUnlock: 显示已解锁的游戏模式，NOP 后小猪妖不可见
+        // - UpdateDLCEnter: 设置 DLC 入口，NOP 后 DLC 入口消失
+        // 正确做法：让这些方法正常运行，通过 AddDLC 设置正确的 DLC 数据
+        // HybridCLR 解释器内部调用会直接读取 mDLCSet 数据
+        LOGI("[dlc] v6.6: ===== Keeping void UI methods intact (no NOP) =====");
+        LOGI("[dlc] v6.6: updatePayBtns/updateUnlock/UpdateDLCEnter will run with patched DLC data");
 
-        // ===== 6e) v6.5: isShow* 方法返回 false — 阻止购买面板子区域显示 =====
+        // ===== 6e) v6.6: 验证 mDLCSet 数据状态 =====
+        // 读取 ProtoLogin 实例的 mDLCSet (offset 64) 和 mDLCSetInfo (offset 72)
         {
-            struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } false_patches[] = {
-                {"PurchaseRedPanel",  "", "isShowDianCang",  0},
-                {"PurchaseRedPanel",  "", "isShowGuBao",     0},
-                {"PurchaseRedPanel",  "", "isShowChangWan",  0},
-            };
-            int num_false = sizeof(false_patches) / sizeof(false_patches[0]);
-            int false_patched = 0;
+            uint8_t *inst = (uint8_t *)g_proto_login_inst;
+            uintptr_t dlcSet = *(uintptr_t *)(inst + 64);
+            uintptr_t dlcSetInfo = *(uintptr_t *)(inst + 72);
+            uintptr_t loginData = *(uintptr_t *)(inst + 48);
+            LOGI("[dlc] v6.6: ProtoLogin instance=%p", (void*)g_proto_login_inst);
+            LOGI("[dlc] v6.6:   mLoginData=%p  mDLCSet=%p  mDLCSetInfo=%p",
+                 (void*)loginData, (void*)dlcSet, (void*)dlcSetInfo);
             
-            LOGI("[dlc] ===== v6.5: Patch isShow* → return false =====");
-            for (int fp = 0; fp < num_false; fp++) {
-                Il2CppClass cls = fn_class_from_name(g_csharp_image,
-                    false_patches[fp].ns, false_patches[fp].cls_name);
-                if (!cls) {
-                    LOGI("[dlc] v6.5: Class %s not found, skip", false_patches[fp].cls_name);
-                    continue;
+            // 尝试读取 mDLCSet 的 Count（HashSet<int> 的 _count 字段）
+            if (dlcSet) {
+                install_sigsegv_handler();
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                    // HashSet<int> 布局: [0x00]=klass, [0x08]=monitor, [0x10]=_buckets, 
+                    // [0x18]=_entries, [0x20]=_count(?), ...
+                    // 尝试读取多个可能的 count 位置
+                    int32_t cnt1 = *(int32_t *)((uint8_t *)dlcSet + 0x30);
+                    int32_t cnt2 = *(int32_t *)((uint8_t *)dlcSet + 0x38);
+                    int32_t cnt3 = *(int32_t *)((uint8_t *)dlcSet + 0x40);
+                    LOGI("[dlc] v6.6:   mDLCSet possible counts: @0x30=%d @0x38=%d @0x40=%d",
+                         cnt1, cnt2, cnt3);
                 }
-                Il2CppMethodInfo mi = fn_class_get_method_from_name(
-                    cls, false_patches[fp].method_name, false_patches[fp].param_count);
-                if (!mi) {
-                    LOGI("[dlc] v6.5: %s.%s(%d) not found, skip",
-                         false_patches[fp].cls_name, false_patches[fp].method_name,
-                         false_patches[fp].param_count);
-                    continue;
-                }
-                
-                uintptr_t *f = (uintptr_t *)mi;
-                LOGI("[dlc] v6.5: BEFORE %s.%s: ptr=%p inv=%p flags=0x%x",
-                     false_patches[fp].cls_name, false_patches[fp].method_name,
-                     (void*)f[0], (void*)f[1], (int)f[13]);
-                
-                uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
-                mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
-                uintptr_t pe = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
-                if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
-                
-                f[0]  = (uintptr_t)custom_return_false_method;
-                f[1]  = (uintptr_t)custom_bool_false_invoker;
-                f[10] = 0;
-                f[11] = (uintptr_t)custom_return_false_method;
-                f[12] = (uintptr_t)custom_return_false_method;
-                f[13] = f[13] & ~(uintptr_t)0x100;
-                f[15] = (uintptr_t)custom_bool_false_invoker;
-                
-                LOGI("[dlc] v6.5: ★ %s.%s → return false", false_patches[fp].cls_name, false_patches[fp].method_name);
-                false_patched++;
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
             }
-            LOGI("[dlc] v6.5: isShow false patches: %d/%d done", false_patched, num_false);
         }
 
         // ===== 6f) v6.5: 枚举 EnterLayer 所有方法用于调试 =====
@@ -2153,6 +2086,83 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] AddDLC(1-50): %d OK", add_ok);
     }
 
+    // ===== 8b) v6.6: 扩展 DLC ID 范围，添加更多可能的 DLC ID =====
+    if (m_addDLC) {
+        int add_ok2 = 0;
+        // 某些 DLC ID 可能大于 50（如 100, 200, 1000 等）
+        int extra_dlc_ids[] = {100, 101, 102, 103, 104, 105, 110, 120, 150, 
+                               200, 201, 202, 203, 204, 205, 210, 220, 250, 
+                               300, 301, 302, 303, 400, 500, 1000, 1001, 1002,
+                               2000, 2001, 2002, 3000, 3001, 5000, 10000};
+        for (int i = 0; i < (int)(sizeof(extra_dlc_ids)/sizeof(extra_dlc_ids[0])); i++) {
+            int32_t dlcId = extra_dlc_ids[i];
+            void *params[1] = { &dlcId };
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_addDLC, (void *)g_proto_login_inst, params, &exc);
+            if (sigsegv_hit) break;
+            if (!exc) add_ok2++;
+        }
+        LOGI("[dlc] v6.6: AddDLC(extra IDs): %d OK", add_ok2);
+    }
+
+    // ===== 8c) v6.6: 调用 UpdateDLC 触发 DLC 状态重新计算 =====
+    {
+        Il2CppMethodInfo m_updateDLC = fn_class_get_method_from_name(g_proto_login_cls, "UpdateDLC", 0);
+        if (m_updateDLC) {
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
+            if (!sigsegv_hit && !exc) {
+                LOGI("[dlc] v6.6: ★ UpdateDLC() called successfully");
+            } else {
+                LOGI("[dlc] v6.6: UpdateDLC() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
+            }
+        } else {
+            LOGI("[dlc] v6.6: UpdateDLC method not found");
+        }
+    }
+
+    // ===== 8d) v6.6: 调用 SaveLoginData 持久化 DLC 数据 =====
+    {
+        Il2CppMethodInfo m_save = fn_class_get_method_from_name(g_proto_login_cls, "SaveLoginData", 0);
+        if (m_save) {
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_save, (void*)g_proto_login_inst, NULL, &exc);
+            if (!sigsegv_hit && !exc) {
+                LOGI("[dlc] v6.6: ★ SaveLoginData() called successfully");
+            } else {
+                LOGI("[dlc] v6.6: SaveLoginData() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
+            }
+        }
+    }
+
+    // ===== 8e) v6.6: 验证关键 DLC 检查方法的返回值 =====
+    // 注意: 这些方法已被补丁为 return true，所以这里验证的是 invoker 层面
+    // 真正的验证需要看 HybridCLR 解释器内部调用的结果
+    {
+        const char *check_methods[] = {"IsDianCang", "IsUnlockGuBao", "IsOldPlayer", "IsBoughtAllItems"};
+        for (int cm = 0; cm < 4; cm++) {
+            Il2CppMethodInfo m_check = fn_class_get_method_from_name(g_proto_login_cls, check_methods[cm], 
+                (strcmp(check_methods[cm], "IsOldPlayer") == 0 || strcmp(check_methods[cm], "IsBoughtAllItems") == 0) ? 0 : 1);
+            if (m_check) {
+                int32_t arg = 0;
+                void *params[1] = { &arg };
+                void *nparams = (strcmp(check_methods[cm], "IsOldPlayer") == 0 || 
+                                 strcmp(check_methods[cm], "IsBoughtAllItems") == 0) ? NULL : params;
+                exc = NULL;
+                void *r = NULL;
+                SAFE_INVOKE(r, m_check, (void*)g_proto_login_inst, nparams, &exc);
+                int val = -1;
+                if (!sigsegv_hit && r) { SAFE_UNBOX_INT(val, r, -1); }
+                LOGI("[dlc] v6.6:   %s() = %d (via invoke, patched=%s)", 
+                     check_methods[cm], val,
+                     (*(uintptr_t*)m_check == (uintptr_t)custom_return_true_method) ? "YES" : "NO");
+            }
+        }
+    }
+
     // ===== 9) 尝试找 get_DLCSetInfo 方法并调用（触发缓存更新）=====
     {
         Il2CppMethodInfo m_getDSI = fn_class_get_method_from_name(g_proto_login_cls, "get_DLCSetInfo", 0);
@@ -2203,7 +2213,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.5 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.6 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

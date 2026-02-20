@@ -1829,8 +1829,42 @@ static int do_unlock_all_dlc(void) {
             patched++;
         }
 
+        // ===== 6a-extra) 补充 fn_class_get_method_from_name 查找迭代遗漏的方法 =====
+        // fn_class_get_methods 可能不返回某些方法（如父类方法/接口方法）
+        // 用 get_method_from_name 直接查找
+        const char *extra_proto_methods[] = {"IsDianCang", "IsOldPlayer", "isUnlockDLC"};
+        int num_extra_proto = sizeof(extra_proto_methods) / sizeof(extra_proto_methods[0]);
+        for (int ep = 0; ep < num_extra_proto; ep++) {
+            // 尝试 1 参数和 0 参数
+            Il2CppMethodInfo mi = fn_class_get_method_from_name(g_proto_login_cls, extra_proto_methods[ep], 1);
+            if (!mi) mi = fn_class_get_method_from_name(g_proto_login_cls, extra_proto_methods[ep], 0);
+            if (!mi) {
+                LOGI("[dlc] ProtoLogin.%s not found by name, skip", extra_proto_methods[ep]);
+                continue;
+            }
+            uintptr_t *f = (uintptr_t *)mi;
+            if (f[0] == (uintptr_t)custom_return_true_method) {
+                LOGI("[dlc] ProtoLogin.%s already patched, skip", extra_proto_methods[ep]);
+                continue;
+            }
+            LOGI("[dlc] BEFORE ProtoLogin.%s: ptr=%p inv=%p interp=%p flags=0x%x MI=%p",
+                 extra_proto_methods[ep], (void*)f[0], (void*)f[1], (void*)f[10], (int)f[13], mi);
+            uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
+            mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
+            uintptr_t page_end = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
+            if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
+            f[0] = (uintptr_t)custom_return_true_method;
+            f[1] = (uintptr_t)custom_bool_true_invoker;
+            f[10] = 0; f[11] = (uintptr_t)custom_return_true_method;
+            f[12] = (uintptr_t)custom_return_true_method;
+            f[13] = f[13] & ~(uintptr_t)0x100;
+            f[15] = (uintptr_t)custom_bool_true_invoker;
+            LOGI("[dlc] ★ ProtoLogin.%s PATCHED (by name lookup) MI=%p", extra_proto_methods[ep], mi);
+            patched++;
+        }
+
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6.3 full MethodInfo patch complete! %d methods patched (iteration)", patched);
+        LOGI("[dlc] v6.4 full MethodInfo patch complete! %d methods patched", patched);
         
         // ===== 6b) Patch 其他 DLC 检查类的方法 =====
         // 添加回安全的 1-param/0-param bool 返回方法
@@ -1839,6 +1873,11 @@ static int do_unlock_all_dlc(void) {
             {"PurchaseUtils",             "", "IsUnlockDianCang",   1},
             {"PurchaseRedPanel",          "", "IsUnlockAllDLC",     1},
             {"PurchaseFriendHelpComponent","", "IsUnlockAll",       0},
+            {"PurchaseShopConfig",        "", "IsUnlockAll",        1},
+            {"PurchaseShopConfig",        "", "IsUnlockByExtra",    1},
+            {"PurchaseRedConfig",         "", "IsUnlockAll",        1},
+            {"PackageSystem",             "", "IsUnlockAnyDlc",     1},
+            {"PurchasePocketPanel",       "", "isUnlock",            1},
         };
         int num_extra = sizeof(extra_patches) / sizeof(extra_patches[0]);
         int extra_patched = 0;

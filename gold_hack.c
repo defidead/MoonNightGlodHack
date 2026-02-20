@@ -2145,10 +2145,18 @@ static int do_unlock_all_dlc(void) {
         } else if (!result) {
             LOGE("[dlc]   isUnlockRole(%d) result=NULL (no exc, no sigsegv)", rid);
         } else {
-            // v6.14-diag: 打印 boxed result 的原始字节
-            uint8_t *rb = (uint8_t *)result;
-            LOGI("[dlc]   isUnlockRole(%d) boxed=%p raw: [0x10]=0x%02x [0x11]=0x%02x [0x12]=0x%02x [0x13]=0x%02x klass=%p",
-                 rid, result, rb[0x10], rb[0x11], rb[0x12], rb[0x13], *(void**)result);
+            // v6.14-diag: 安全地打印 boxed result 的原始字节
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                uint8_t *rb = (uint8_t *)result;
+                LOGI("[dlc]   isUnlockRole(%d) boxed=%p raw: [0x10]=0x%02x [0x11]=0x%02x [0x12]=0x%02x [0x13]=0x%02x klass=%p",
+                     rid, result, rb[0x10], rb[0x11], rb[0x12], rb[0x13], *(void**)result);
+            } else {
+                LOGE("[dlc]   isUnlockRole(%d) SIGSEGV reading boxed result %p", rid, result);
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
             SAFE_UNBOX_INT(unlocked, result, -1);
         }
         LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,

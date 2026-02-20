@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.16"
+#define LOG_TAG "GoldHack v6.21"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1388,6 +1388,11 @@ static void custom_hybridclr_bridge_bool_true(void* method, void* argVarIndexs, 
     if (ret) {
         *(int64_t*)ret = 1;  // StackObject.i64 = 1 (bool true)
     }
+    static int call_count = 0;
+    if (call_count < 20) {
+        LOGI("[bridge] custom_hybridclr_bridge_bool_true called #%d method=%p ret=%p", call_count, method, ret);
+        call_count++;
+    }
 }
 
 // 分配 RWX 内存并写入 ARM64 代码
@@ -1906,13 +1911,19 @@ static int do_unlock_all_dlc(void) {
             //   v6.10/v6.19: 只改 f[0]+f[1]+f[10]，按键正常但 DLC 不生效
             //     → HybridCLR 解释器内部调用走 f[11](旧蹦床) 读 interpData(=0) 返回 false
             //   v6.14-v6.18: 清零 f[11]+f[12]+改 bitfield，DLC 生效但按键坏
-            //     → bitfield 标记 initInterpCallMethodPointer=1 + f[11]=NULL → 调用 NULL 崩溃
-            // 正确做法: f[11]/f[12] 指向自定义桥接，不动 bitfield
+            //     → bitfield initInterpCallMethodPointer=1 + f[11]=NULL → 解释器调用 NULL 崩溃
+            // v6.21 修复: f[11]/f[12] 指向有效桥接 + 设置 initInterpCallMethodPointer=1
+            // 解释器优先级: initInterpCallMethodPointer(bit4)=1 → 使用 f[11] 桥接
+            //   跟 isInterpterImpl(bit5) 无关，只要 bit4=1 就走 f[11]
             f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
             f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
+            // 设置 bitfield: initInterpCallMethodPointer(bit4)=1
+            // 不清 isInterpterImpl(bit5)，保留其他标志
+            uint8_t *bitfield = (uint8_t *)mi + 0x4B;
+            *bitfield = *bitfield | (1 << 4);  // 只设置 bit4，不清除任何其他 bit
             
-            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p bridge=%p MI=%p (v6.20)",
-                 mname, (void*)f[0], (void*)f[1], (void*)f[11], mi);
+            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p bridge=%p bf=0x%02x MI=%p (v6.21)",
+                 mname, (void*)f[0], (void*)f[1], (void*)f[11], *((uint8_t *)mi + 0x4B), mi);
             
             if (strcmp(mname, "isUnlockRole") == 0) {
                 LOGI("[dlc] MI-DUMP %s: f[0]=%p f[1]=%p f[10]=%p f[11]=%p f[12]=%p MI=%p",
@@ -1962,8 +1973,10 @@ static int do_unlock_all_dlc(void) {
             f[10] = 0;                                       // interpData = NULL (0x50)
             f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // methodPointerCallByInterp
             f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // virtualMethodPointerCallByInterp
-            // 不修改 bitfield — v6.14+ 改 bitfield 导致按键失效
-            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.20 bridge) MI=%p", extra_proto_methods[ep], pc_found, mi);
+            // v6.21: 设置 initInterpCallMethodPointer(bit4)=1 让解释器使用 f[11] 桥接
+            uint8_t *bf = (uint8_t *)mi + 0x4B;
+            *bf = *bf | (1 << 4);
+            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.21 bridge+bf) bf=0x%02x MI=%p", extra_proto_methods[ep], pc_found, *bf, mi);
             patched++;
         }
         
@@ -1973,7 +1986,7 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6.8.1: Skipping brute-force ProtoLogin patch (caused crash via IsValidGameItem)");
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6.20 MethodInfo patch complete! %d ProtoLogin methods patched (f[0]+f[1]+f[10]+f[11]/f[12] bridge)", patched);
+        LOGI("[dlc] v6.21 MethodInfo patch complete! %d methods patched (f[0-1]+f[10-12]+bitfield)", patched);
         
         // ===== 6b) v6.16: 不再 Patch Purchase*/PackageSystem 类 =====
         // v6.15 patch 了 PurchaseShopConfig.IsUnlockAll, PurchaseRedPanel.IsUnlockAllDLC,
@@ -2063,7 +2076,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.20 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.21 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

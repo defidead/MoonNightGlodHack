@@ -5767,6 +5767,40 @@ static int hook_kill_func(pid_t pid, int sig) {
     return (int)syscall(__NR_kill, pid, sig);
 }
 
+// v6.32: hook exit/_exit — 反篡改检测到 kill() 被 hook 后改用 System.exit()
+// System.exit() → Runtime.halt() → _exit() 或 exit()
+static void hook_exit_func(int status) {
+    LOGW("[anti-kill] Blocked exit(%d) from anti-tamper check", status);
+    // 不执行, 让调用者继续运行
+    // 设置线程名标识已被拦截
+    return;
+}
+
+static void hook__exit_func(int status) {
+    LOGW("[anti-kill] Blocked _exit(%d) from anti-tamper check", status);
+    return;
+}
+
+// 通用 inline hook 安装函数 (无 trampoline, 16 bytes)
+static int install_simple_hook(void *target, void *hook, const char *name) {
+    if (!target || !hook) return -1;
+    uintptr_t page = (uintptr_t)target & ~(uintptr_t)0xFFF;
+    if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE) != 0) {
+            LOGE("[anti-kill] mprotect failed for %s: %s", name, strerror(errno));
+            return -1;
+        }
+    }
+    uint32_t *code = (uint32_t *)target;
+    code[0] = 0x58000050;  // LDR X16, [PC, #8]
+    code[1] = 0xD61F0200;  // BR X16
+    *(uint64_t *)(code + 2) = (uint64_t)hook;
+    __builtin___clear_cache((char *)target, (char *)((uint8_t*)target + 16));
+    mprotect((void *)page, 0x2000, PROT_READ | PROT_EXEC);
+    LOGI("[anti-kill] %s @ %p hooked → %p", name, target, hook);
+    return 0;
+}
+
 static void install_kill_hook(void) {
     // 查找 libc 的 kill() 函数
     void *kill_addr = dlsym(RTLD_DEFAULT, "kill");
@@ -5804,6 +5838,18 @@ static void install_kill_hook(void) {
     mprotect((void *)page, 0x2000, PROT_READ | PROT_EXEC);
 
     LOGI("[anti-kill] kill() hooked successfully");
+    
+    // v6.32: 也 hook exit() 和 _exit() — 反篡改在 kill() 被拦截后改用 System.exit(10)
+    void *exit_addr = dlsym(RTLD_DEFAULT, "exit");
+    if (exit_addr) install_simple_hook(exit_addr, (void*)hook_exit_func, "exit()");
+    
+    void *_exit_addr = dlsym(RTLD_DEFAULT, "_exit");
+    if (_exit_addr) install_simple_hook(_exit_addr, (void*)hook__exit_func, "_exit()");
+    
+    // 也尝试 _Exit (C99)
+    void *Exit_addr = dlsym(RTLD_DEFAULT, "_Exit");
+    if (Exit_addr && Exit_addr != _exit_addr) 
+        install_simple_hook(Exit_addr, (void*)hook__exit_func, "_Exit()");
 }
 
 // ========== .so 入口（constructor）==========

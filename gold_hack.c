@@ -1289,17 +1289,35 @@ static int bypass_dlc_lock(void) {
     return hooked;
 }
 
-// ========== DLC 解锁 - MethodInfo 改写方式（绕过 HybridCLR 解释器限制）==========
-// HybridCLR 解释器内部调用绕过 methodPointer，所以 replace_method_pointer 无效。
-// 新方案：分配 RWX 内存，写入 ARM64 stub 返回 true，然后修改 MethodInfo
-// 让 HybridCLR 认为 isUnlockRole 是 native 方法，从而走 methodPointer 路径。
+// ========== DLC 解锁 - 自定义 C invoker 方案 ==========
+// HybridCLR 解释器的 invoker 忽略 methodPointer，直接通过 interpData 执行 IL 字节码。
+// 方案 v5: 写自定义 C invoker 函数，直接返回 boxed true，完全绕过 HybridCLR 解释器。
+// il2cpp_runtime_invoke 调用 invoker(methodPtr, method, obj, params, exc)
+// 我们的 invoker 忽略所有参数，创建 boxed Boolean(true) 并返回。
 static Il2CppClass   g_proto_login_cls  = NULL;
 static uintptr_t     g_proto_login_inst = 0;
+static Il2CppClass   g_boolean_class    = NULL;
 
 // ===== ARM64 可执行 stub（分配后长期存活）=====
-// 用于替换 HybridCLR 方法的 methodPointer / invoker_method
+// 用于替换 HybridCLR 方法的 methodPointer
 static void *g_stub_return_true = NULL;   // bool return true stub
-static void *g_stub_invoker_true = NULL;  // invoker wrapper stub
+static void *g_stub_invoker_true = NULL;  // invoker wrapper stub (unused now)
+
+// ===== 自定义 C invoker =====
+// invoker 签名: void* invoker(void* methodPtr, void* method, void* obj, void** params, void** exc)
+// 直接返回 boxed true，不调用 methodPtr，不经过 HybridCLR 解释器
+static void* custom_bool_true_invoker(void* methodPtr, void* method, void* obj, void** params, void** exc) {
+    if (!fn_object_new || !g_boolean_class) {
+        return NULL;  // 无法创建对象
+    }
+    // 创建一个 System.Boolean 对象
+    Il2CppObject boxed = fn_object_new(g_boolean_class);
+    if (boxed) {
+        // Il2CppObject 结构: [0x00]=klass, [0x08]=monitor, [0x10]=value
+        *(int32_t *)((uint8_t *)boxed + 0x10) = 1;  // true
+    }
+    return boxed;
+}
 
 // 分配 RWX 内存并写入 ARM64 代码
 static void* alloc_executable_stub(const uint32_t *code, size_t code_size) {
@@ -1712,89 +1730,61 @@ static int do_unlock_all_dlc(void) {
         }
     }
 
-    // ===== 5) 安装 MethodInfo 全面改写 =====
-    // 策略: 不只替换 methodPointer, 还要修改 invoker / interpData / flags
-    // 让 HybridCLR 认为这是 AOT 方法, 从而走 methodPointer 路径
-    if (!g_mi_hooks_installed) {
-        init_dlc_stubs();
-        if (!g_stub_return_true) {
-            LOGE("[dlc] Failed to create ARM64 stub!");
-            goto skip_mi_hook;
-        }
-
-        // 先找一个 AOT 方法作为参考（获取 AOT invoker 地址）
-        uintptr_t aot_invoker = 0;
-        {
-            Il2CppClass obj_cls = NULL;
-            size_t asm_count = 0;
-            Il2CppAssembly *asms = fn_domain_get_assemblies(g_domain, &asm_count);
-            for (size_t a = 0; a < asm_count && !obj_cls; a++) {
-                Il2CppImage img = fn_assembly_get_image(asms[a]);
-                if (!img) continue;
-                const char *iname = fn_image_get_name(img);
-                if (iname && (strstr(iname, "mscorlib") || strstr(iname, "corlib"))) {
-                    obj_cls = fn_class_from_name(img, "System", "Object");
-                }
-            }
-            if (obj_cls) {
-                Il2CppMethodInfo m_tostr = fn_class_get_method_from_name(obj_cls, "ToString", 0);
-                if (m_tostr) {
-                    uintptr_t *aot_mi = (uintptr_t *)m_tostr;
-                    aot_invoker = aot_mi[1];
-                    LOGI("[dlc] AOT invoker (Object.ToString): %p", (void*)aot_invoker);
-                    LOGI("[dlc] AOT flags byte +0x68: 0x%x", (int)aot_mi[13]);
-                }
+    // ===== 5) 查找 System.Boolean 类（用于自定义 invoker boxing）=====
+    if (!g_boolean_class) {
+        // 从 mscorlib 查找 System.Boolean
+        size_t asm_count = 0;
+        Il2CppAssembly *asms = fn_domain_get_assemblies(g_domain, &asm_count);
+        for (size_t a = 0; a < asm_count && !g_boolean_class; a++) {
+            Il2CppImage img = fn_assembly_get_image(asms[a]);
+            if (!img) continue;
+            const char *iname = fn_image_get_name(img);
+            if (iname && (strstr(iname, "mscorlib") || strstr(iname, "corlib"))) {
+                g_boolean_class = fn_class_from_name(img, "System", "Boolean");
+                if (g_boolean_class)
+                    LOGI("[dlc] System.Boolean class: %p (from %s)", g_boolean_class, iname);
             }
         }
+        if (!g_boolean_class) {
+            LOGE("[dlc] System.Boolean class not found!");
+        }
+    }
 
-        // 修改 isUnlockRole 的 MethodInfo
+    // ===== 6) 安装自定义 C invoker =====
+    // 策略 v5: 直接替换 invoker_method 为我们的 C 函数 custom_bool_true_invoker
+    // 这个函数创建 boxed Boolean(true) 并返回，完全不调用 HybridCLR 解释器
+    if (!g_mi_hooks_installed && g_boolean_class && fn_object_new) {
+        init_dlc_stubs(); // 仍然需要 methodPointer stub
+        
         uintptr_t *mi_fields = (uintptr_t *)m_isUnlock;
         g_orig_isUnlockRole_ptr = mi_fields[0];
         uintptr_t orig_invoker = mi_fields[1];
-        uintptr_t orig_interp_data = mi_fields[10];
-        uintptr_t orig_flags = mi_fields[13];
         
         LOGI("[dlc] isUnlockRole BEFORE modification:");
         LOGI("[dlc]   [0] methodPointer: %p", (void*)g_orig_isUnlockRole_ptr);
         LOGI("[dlc]   [1] invoker:       %p", (void*)orig_invoker);
-        LOGI("[dlc]   [10] interpData:   %p", (void*)orig_interp_data);
-        LOGI("[dlc]   [11] virtCallPtr:  %p", (void*)mi_fields[11]);
-        LOGI("[dlc]   [12] dup ptr:      %p", (void*)mi_fields[12]);
-        LOGI("[dlc]   [13] flags:        0x%x", (int)orig_flags);
+        LOGI("[dlc]   [10] interpData:   %p", (void*)mi_fields[10]);
+        LOGI("[dlc]   [13] flags:        0x%x", (int)mi_fields[13]);
 
         uintptr_t page = (uintptr_t)m_isUnlock & ~(uintptr_t)0xFFF;
         mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
-        // 如果 MethodInfo 跨页了
         uintptr_t page_end = ((uintptr_t)m_isUnlock + 0xC0) & ~(uintptr_t)0xFFF;
         if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
 
-        // [0] methodPointer → 我们的 stub (MOV W0,1; RET)
-        mi_fields[0] = (uintptr_t)g_stub_return_true;
+        // [0] methodPointer → stub (备用，但 invoker 不会调用它)
+        if (g_stub_return_true)
+            mi_fields[0] = (uintptr_t)g_stub_return_true;
         
-        // [1] invoker_method → 尝试用 AOT invoker
-        // 注意: AOT invoker 签名可能不匹配 (ToString 返回 string, isUnlockRole 返回 bool)
-        // 如果 AOT invoker 内部调用 methodPointer 并 box 返回值, 签名不匹配会有问题
-        // 所以先不替换 invoker, 只替换其他字段, 看 HybridCLR invoker 是否会走 methodPointer
-        // mi_fields[1] = aot_invoker; // 暂不替换
-
-        // [10] interpData → NULL (去掉解释器数据)
-        mi_fields[10] = 0;
-        LOGI("[dlc] ★ isUnlockRole [10] interpData: %p -> NULL", (void*)orig_interp_data);
+        // [1] invoker_method → 我们的 C 函数 custom_bool_true_invoker
+        mi_fields[1] = (uintptr_t)custom_bool_true_invoker;
         
-        // [11,12] 也更新为新的 methodPointer
-        mi_fields[11] = (uintptr_t)g_stub_return_true;
-        mi_fields[12] = (uintptr_t)g_stub_return_true;
-        LOGI("[dlc] ★ isUnlockRole [11,12] updated to stub");
+        // [15] invoker 的复制
+        mi_fields[15] = (uintptr_t)custom_bool_true_invoker;
         
-        // [13] flags → 0x001 (去掉 HybridCLR 标志 0x100)
-        mi_fields[13] = orig_flags & ~0x100;
-        LOGI("[dlc] ★ isUnlockRole [13] flags: 0x%x -> 0x%x", 
-             (int)orig_flags, (int)mi_fields[13]);
+        LOGI("[dlc] ★ isUnlockRole invoker: %p -> %p (custom_bool_true_invoker)",
+             (void*)orig_invoker, (void*)custom_bool_true_invoker);
         
-        LOGI("[dlc] ★ isUnlockRole.methodPointer: %p -> %p",
-             (void*)g_orig_isUnlockRole_ptr, g_stub_return_true);
-
-        // 对其他方法做同样的修改
+        // 对其他 unlock 方法也做同样的替换
         Il2CppMethodInfo methods_to_patch[] = {
             fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockAllDLC", 1),
             fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockByFirstGame", 1),
@@ -1810,20 +1800,18 @@ static int do_unlock_all_dlc(void) {
             uintptr_t pe2 = ((uintptr_t)methods_to_patch[i] + 0xC0) & ~(uintptr_t)0xFFF;
             if (pe2 != p2) mprotect((void *)pe2, 0x1000, PROT_READ | PROT_WRITE);
             
-            mi2[0] = (uintptr_t)g_stub_return_true;  // methodPointer
-            mi2[10] = 0;                               // interpData
-            mi2[11] = (uintptr_t)g_stub_return_true;  // virtCallPtr
-            mi2[12] = (uintptr_t)g_stub_return_true;  // dup ptr
-            mi2[13] = mi2[13] & ~0x100;               // flags
-            LOGI("[dlc] ★ %s MethodInfo fully patched", method_names[i]);
+            mi2[0] = g_stub_return_true ? (uintptr_t)g_stub_return_true : mi2[0];
+            mi2[1] = (uintptr_t)custom_bool_true_invoker;
+            mi2[15] = (uintptr_t)custom_bool_true_invoker;
+            LOGI("[dlc] ★ %s invoker replaced with custom_bool_true_invoker", method_names[i]);
         }
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] MethodInfo full patches installed!");
+        LOGI("[dlc] Custom C invoker patches installed!");
     }
     skip_mi_hook:
 
-    // ===== 6) 验证 hook 效果 =====
+    // ===== 7) 验证 hook 效果 =====
     int unlocked_count = 0;
     LOGI("[dlc] === Verification: isUnlockRole via il2cpp_runtime_invoke ===");
     for (int32_t rid = 0; rid <= 15; rid++) {
@@ -1836,103 +1824,6 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
              unlocked > 0 ? " ✓" : " ✗");
         if (unlocked > 0) unlocked_count++;
-    }
-
-    // ===== 7) 如果仍然返回 0，尝试替换 invoker_method =====
-    if (unlocked_count == 0 && g_mi_hooks_installed) {
-        LOGI("[dlc] Still 0 unlocked after interpData/flags patch. Trying invoker replacement...");
-        
-        // 找 IsDLCRole(1) 的 invoker — 它是 bool(int) 签名的 AOT 方法
-        // IsDLCRole 的 invoker 和 isUnlockRole 签名完全匹配!
-        uintptr_t matching_invoker = 0;
-        const char *invoker_source = NULL;
-        {
-            Il2CppMethodInfo m_isDLCRole = fn_class_get_method_from_name(g_proto_login_cls, "IsDLCRole", 1);
-            if (m_isDLCRole) {
-                uintptr_t *drmi = (uintptr_t *)m_isDLCRole;
-                matching_invoker = drmi[1];
-                invoker_source = "ProtoLogin.IsDLCRole";
-                LOGI("[dlc] IsDLCRole invoker: %p, methodPtr: %p, flags: 0x%x",
-                     (void*)drmi[1], (void*)drmi[0], (int)drmi[13]);
-                // dump IsDLCRole MethodInfo for comparison
-                LOGI("[dlc] IsDLCRole MI dump: [10]=%p [11]=%p [12]=%p",
-                     (void*)drmi[10], (void*)drmi[11], (void*)drmi[12]);
-            }
-        }
-        
-        // 如果 IsDLCRole 不可用，搜索 UserInfo.IsDLCRole
-        if (!matching_invoker) {
-            Il2CppClass ui_cls = fn_class_from_name(g_csharp_image, "", "UserInfo");
-            if (ui_cls) {
-                Il2CppMethodInfo m_uidr = fn_class_get_method_from_name(ui_cls, "IsDLCRole", 1);
-                if (m_uidr) {
-                    uintptr_t *uiami = (uintptr_t *)m_uidr;
-                    matching_invoker = uiami[1];
-                    invoker_source = "UserInfo.IsDLCRole";
-                }
-            }
-        }
-        
-        // 如果还没找到，从 mscorlib 找任何 bool(int32) 方法
-        if (!matching_invoker) {
-            // 退而求其次: 用 Object.ToString 的 invoker (已知不匹配但测试用)
-            LOGI("[dlc] No matching invoker found for bool(int) signature");
-        }
-        
-        if (matching_invoker) {
-            LOGI("[dlc] Using invoker from %s: %p", invoker_source, (void*)matching_invoker);
-            uintptr_t *mi_fields = (uintptr_t *)m_isUnlock;
-            uintptr_t old_invoker = mi_fields[1];
-            
-            uintptr_t page = (uintptr_t)m_isUnlock & ~(uintptr_t)0xFFF;
-            mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
-            mi_fields[1] = matching_invoker;
-            // 也更新 [15] 如果它是 invoker 的复制
-            mi_fields[15] = matching_invoker;
-            LOGI("[dlc] ★ invoker replaced: %p -> %p (%s)", 
-                 (void*)old_invoker, (void*)matching_invoker, invoker_source);
-            
-            // 重新验证
-            unlocked_count = 0;
-            LOGI("[dlc] === Re-verification after invoker replacement ===");
-            for (int32_t rid = 0; rid <= 15; rid++) {
-                void *params[1] = { &rid };
-                exc = NULL;
-                void *result = NULL;
-                SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
-                int unlocked = -1;
-                if (sigsegv_hit) {
-                    LOGE("[dlc]   isUnlockRole(%d) = SIGSEGV! Reverting invoker...", rid);
-                    mi_fields[1] = old_invoker;
-                    mi_fields[15] = old_invoker;
-                    LOGI("[dlc] Invoker reverted to %p", (void*)old_invoker);
-                    unlocked_count = 0;
-                    break;
-                }
-                if (result) { SAFE_UNBOX_INT(unlocked, result, -1); }
-                LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
-                     unlocked > 0 ? " ✓" : " ✗");
-                if (unlocked > 0) unlocked_count++;
-            }
-            
-            // 如果成功，也替换其他方法的 invoker
-            if (unlocked_count > 0) {
-                LOGI("[dlc] ★ invoker replacement works! Applying to other methods...");
-                Il2CppMethodInfo methods_to_fix[] = {
-                    fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockAllDLC", 1),
-                    fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockByFirstGame", 1),
-                    fn_class_get_method_from_name(g_proto_login_cls, "isUnlockDLC", 1),
-                };
-                for (int i = 0; i < 3; i++) {
-                    if (!methods_to_fix[i]) continue;
-                    uintptr_t *mf = (uintptr_t *)methods_to_fix[i];
-                    uintptr_t pf = (uintptr_t)methods_to_fix[i] & ~(uintptr_t)0xFFF;
-                    mprotect((void *)pf, 0x2000, PROT_READ | PROT_WRITE);
-                    mf[1] = matching_invoker;
-                    mf[15] = matching_invoker;
-                }
-            }
-        }
     }
 
     // ===== 8) 尝试通过 AddDLC 添加所有 DLC ID =====

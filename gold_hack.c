@@ -1910,62 +1910,13 @@ static int do_unlock_all_dlc(void) {
             patched++;
         }
         
-        // ===== 6a2) v6.8: 暴力 patch ProtoLogin 所有 bool 返回方法 =====
-        // 迭代所有方法，patch 任何以 "is"/"Is"/"Has" 开头且 <=3 参数的未 patch 方法
-        // 这能捕获所有我们可能遗漏的 DLC 检查方法
-        {
-            LOGI("[dlc] v6.8: ===== Brute-force ProtoLogin bool method patch =====");
-            void *biter = NULL;
-            Il2CppMethodInfo bmi;
-            int brute_patched = 0;
-            while ((bmi = fn_class_get_methods(g_proto_login_cls, &biter)) != NULL) {
-                const char *bname = fn_method_get_name(bmi);
-                if (!bname) continue;
-                int bpc = fn_method_get_param_count ? fn_method_get_param_count(bmi) : -1;
-                if (bpc > 3) continue;  // 太多参数的方法不安全 patch
-                
-                uintptr_t *bf = (uintptr_t *)bmi;
-                // 跳过已 patch 的
-                if (bf[0] == (uintptr_t)custom_return_true_method) continue;
-                
-                // 只 patch 以 is/Is/Has 开头的方法（这些是 bool 返回的检查方法）
-                int should_patch = 0;
-                if (strncmp(bname, "is", 2) == 0 && bname[2] >= 'A' && bname[2] <= 'Z') should_patch = 1;
-                if (strncmp(bname, "Is", 2) == 0) should_patch = 1;
-                if (strncmp(bname, "Has", 3) == 0) should_patch = 1;
-                
-                // 排除非 bool 返回的方法（不 patch getter/setter/数据方法）
-                if (strstr(bname, "Login") || strstr(bname, "Server") || 
-                    strstr(bname, "Send") || strstr(bname, "Check") ||
-                    strstr(bname, "Data") || strstr(bname, "Parse")) should_patch = 0;
-                    
-                if (!should_patch) continue;
-                
-                LOGI("[dlc] v6.8: BRUTE-PATCH ProtoLogin.%s(%d): ptr=%p MI=%p",
-                     bname, bpc, (void*)bf[0], bmi);
-                
-                uintptr_t bpg = (uintptr_t)bmi & ~(uintptr_t)0xFFF;
-                mprotect((void *)bpg, 0x2000, PROT_READ | PROT_WRITE);
-                uintptr_t bpe = ((uintptr_t)bmi + 0xC0) & ~(uintptr_t)0xFFF;
-                if (bpe != bpg) mprotect((void *)bpe, 0x1000, PROT_READ | PROT_WRITE);
-                
-                bf[0] = (uintptr_t)custom_return_true_method;
-                bf[1] = (uintptr_t)custom_bool_true_invoker;
-                bf[10] = 0;
-                bf[11] = (uintptr_t)custom_return_true_method;
-                bf[12] = (uintptr_t)custom_return_true_method;
-                bf[13] = bf[13] & ~(uintptr_t)0x100;
-                bf[15] = (uintptr_t)custom_bool_true_invoker;
-                
-                LOGI("[dlc] v6.8: ★ ProtoLogin.%s(%d) BRUTE-PATCHED", bname, bpc);
-                brute_patched++;
-                patched++;
-            }
-            LOGI("[dlc] v6.8: Brute-force patched %d additional ProtoLogin methods", brute_patched);
-        }
+        // ===== 6a2) v6.8.1: 不再暴力 patch ProtoLogin =====
+        // v6.8 暴力 patch 了 IsValidGameItem(2) 导致崩溃
+        // IsValidGameItem 不是 unlock 检查，而是数据验证，返回 true 会让游戏访问不存在的数据
+        LOGI("[dlc] v6.8.1: Skipping brute-force ProtoLogin patch (caused crash via IsValidGameItem)");
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6.8 full MethodInfo patch complete! %d ProtoLogin methods patched", patched);
+        LOGI("[dlc] v6.8.1 full MethodInfo patch complete! %d ProtoLogin methods patched", patched);
         
         // ===== 6b) Patch 其他 DLC 检查类的方法 =====
         // 添加回安全的 1-param/0-param bool 返回方法
@@ -1973,7 +1924,6 @@ static int do_unlock_all_dlc(void) {
             {"EditorSettingExtension",    "", "get_isUnlockAll",    0},
             {"PurchaseUtils",             "", "IsUnlockDianCang",   1},
             {"PurchaseRedPanel",          "", "IsUnlockAllDLC",     1},
-            {"PurchaseRedPanel",          "", "IsReview",           0},
             {"PurchaseFriendHelpComponent","", "IsUnlockAll",       0},
             {"PurchaseShopConfig",        "", "IsUnlockAll",        1},
             {"PurchaseShopConfig",        "", "IsUnlockByExtra",    1},
@@ -2025,60 +1975,10 @@ static int do_unlock_all_dlc(void) {
         }
         LOGI("[dlc] Extra class patches: %d/%d done", extra_patched, num_extra);
         
-        // ===== 6b2) v6.8: 暴力 patch 所有 DLC 相关类的 IsUnlock/isUnlock 方法 =====
-        // 遍历关键类的所有方法，patch 以 Is/is/Has 开头的未 patch 方法
-        {
-            const char *brute_classes[] = {"PurchaseUtils", "PurchaseRedPanel", "PurchaseRedConfig",
-                                           "PurchaseShopConfig", "PurchasePocketPanel", 
-                                           "PurchaseFriendHelpComponent", "PackageSystem"};
-            int num_brute_cls = sizeof(brute_classes) / sizeof(brute_classes[0]);
-            int total_brute_cls = 0;
-            
-            for (int bc = 0; bc < num_brute_cls; bc++) {
-                Il2CppClass bcls = fn_class_from_name(g_csharp_image, "", brute_classes[bc]);
-                if (!bcls) continue;
-                
-                void *biter2 = NULL;
-                Il2CppMethodInfo bm;
-                while ((bm = fn_class_get_methods(bcls, &biter2)) != NULL) {
-                    const char *bn = fn_method_get_name(bm);
-                    if (!bn) continue;
-                    int bpc2 = fn_method_get_param_count ? fn_method_get_param_count(bm) : -1;
-                    if (bpc2 > 3) continue;
-                    
-                    uintptr_t *bf2 = (uintptr_t *)bm;
-                    if (bf2[0] == (uintptr_t)custom_return_true_method) continue;
-                    
-                    int sp = 0;
-                    if (strncmp(bn, "Is", 2) == 0 && bn[2] >= 'A' && bn[2] <= 'Z') sp = 1;
-                    if (strncmp(bn, "is", 2) == 0 && bn[2] >= 'A' && bn[2] <= 'Z') sp = 1;
-                    if (strncmp(bn, "Has", 3) == 0) sp = 1;
-                    if (strncmp(bn, "get_Is", 6) == 0) sp = 1;
-                    if (strncmp(bn, "get_is", 6) == 0) sp = 1;
-                    if (!sp) continue;
-                    
-                    LOGI("[dlc] v6.8: BRUTE-CLS %s.%s(%d) ptr=%p MI=%p",
-                         brute_classes[bc], bn, bpc2, (void*)bf2[0], bm);
-                    
-                    uintptr_t pg2 = (uintptr_t)bm & ~(uintptr_t)0xFFF;
-                    mprotect((void *)pg2, 0x2000, PROT_READ | PROT_WRITE);
-                    uintptr_t pe2 = ((uintptr_t)bm + 0xC0) & ~(uintptr_t)0xFFF;
-                    if (pe2 != pg2) mprotect((void *)pe2, 0x1000, PROT_READ | PROT_WRITE);
-                    
-                    bf2[0] = (uintptr_t)custom_return_true_method;
-                    bf2[1] = (uintptr_t)custom_bool_true_invoker;
-                    bf2[10] = 0;
-                    bf2[11] = (uintptr_t)custom_return_true_method;
-                    bf2[12] = (uintptr_t)custom_return_true_method;
-                    bf2[13] = bf2[13] & ~(uintptr_t)0x100;
-                    bf2[15] = (uintptr_t)custom_bool_true_invoker;
-                    
-                    LOGI("[dlc] v6.8: ★ %s.%s(%d) BRUTE-CLS-PATCHED", brute_classes[bc], bn, bpc2);
-                    total_brute_cls++;
-                }
-            }
-            LOGI("[dlc] v6.8: Brute-force class patches: %d total", total_brute_cls);
-        }
+        // ===== 6b2) v6.8.1: 不再暴力 patch 其他类 =====
+        // v6.8 暴力 patch 了 IsDownloading, IsPreDownload, IsFilterItem, IsOnlyContainPvPShop 等
+        // 这些不是 unlock 检查，返回 true 会导致游戏逻辑错误和崩溃
+        LOGI("[dlc] v6.8.1: Skipping brute-force class patches (caused crash via IsDownloading/IsFilterItem/etc)");
         
         // ===== 6b3) v6.8: PackageSystem 状态修复 =====
         // 设置 PackageSystem.allComplete = true (offset 0x29)
@@ -2509,7 +2409,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.8 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.8.1 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

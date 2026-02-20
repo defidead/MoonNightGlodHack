@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack"
+#define LOG_TAG "GoldHack v6.16"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1990,37 +1990,10 @@ static int do_unlock_all_dlc(void) {
         // 现在让包的真实下载状态保持不变，游戏会正确显示"需要下载"
         LOGI("[dlc] v6.9: Skipping PackageSystem state fix (caused crash loading missing assets)");
         
-        // ===== 6c) 直接设置 EditorSetting.isUnlockAll 字段 =====
-        // EditorSettingExtension 有静态字段 mInstance，通过它获取 EditorSetting 实例
-        // 然后将 offset 0x19 处的 bool isUnlockAll 设为 true
-        {
-            Il2CppClass es_ext_cls = fn_class_from_name(g_csharp_image, "", "EditorSettingExtension");
-            if (es_ext_cls) {
-                Il2CppMethodInfo m_getInst = fn_class_get_method_from_name(es_ext_cls, "get_Instance", 0);
-                if (m_getInst) {
-                    void *exc2 = NULL;
-                    void *es_inst = NULL;
-                    install_sigsegv_handler();
-                    g_in_safe_access = 1;
-                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                        es_inst = fn_runtime_invoke(m_getInst, NULL, NULL, &exc2);
-                    }
-                    g_in_safe_access = 0;
-                    uninstall_sigsegv_handler();
-                    
-                    if (es_inst && !exc2) {
-                        LOGI("[dlc] EditorSetting instance: %p", es_inst);
-                        // 设置 [0x19] isUnlockAll = true
-                        uint8_t *p = (uint8_t *)es_inst;
-                        uint8_t old_val = p[0x19];
-                        p[0x19] = 1;
-                        LOGI("[dlc] ★ EditorSetting.isUnlockAll: %d -> 1", old_val);
-                    } else {
-                        LOGI("[dlc] EditorSetting.get_Instance() returned NULL or exception");
-                    }
-                }
-            }
-        }
+        // ===== 6c) v6.17: 跳过 EditorSetting.isUnlockAll =====
+        // 这是编辑器模式标志，在生产环境设置可能导致游戏状态异常
+        // 而且每次 get_Instance() 都返回 NULL，完全没用
+        LOGI("[dlc] v6.17: Skipping EditorSetting (editor-mode flag, not needed)");
 
         // ===== 6d) v6.6: 不再 NOP void 方法！让原始方法正常运行 =====
         // v6.5 中 NOP void 方法是错误的：
@@ -2032,64 +2005,9 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6.6: ===== Keeping void UI methods intact (no NOP) =====");
         LOGI("[dlc] v6.6: updatePayBtns/updateUnlock/UpdateDLCEnter will run with patched DLC data");
 
-        // ===== 6e) v6.6: 验证 mDLCSet 数据状态 =====
-        // 读取 ProtoLogin 实例的 mDLCSet (offset 64) 和 mDLCSetInfo (offset 72)
-        {
-            uint8_t *inst = (uint8_t *)g_proto_login_inst;
-            uintptr_t dlcSet = *(uintptr_t *)(inst + 64);
-            uintptr_t dlcSetInfo = *(uintptr_t *)(inst + 72);
-            uintptr_t loginData = *(uintptr_t *)(inst + 48);
-            LOGI("[dlc] v6.6: ProtoLogin instance=%p", (void*)g_proto_login_inst);
-            LOGI("[dlc] v6.6:   mLoginData=%p  mDLCSet=%p  mDLCSetInfo=%p",
-                 (void*)loginData, (void*)dlcSet, (void*)dlcSetInfo);
-            
-            // 尝试读取 mDLCSet 的 Count（HashSet<int> 的 _count 字段）
-            if (dlcSet) {
-                install_sigsegv_handler();
-                g_in_safe_access = 1;
-                if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                    // HashSet<int> 布局: [0x00]=klass, [0x08]=monitor, [0x10]=_buckets, 
-                    // [0x18]=_entries, [0x20]=_count(?), ...
-                    // 尝试读取多个可能的 count 位置
-                    int32_t cnt1 = *(int32_t *)((uint8_t *)dlcSet + 0x30);
-                    int32_t cnt2 = *(int32_t *)((uint8_t *)dlcSet + 0x38);
-                    int32_t cnt3 = *(int32_t *)((uint8_t *)dlcSet + 0x40);
-                    LOGI("[dlc] v6.6:   mDLCSet possible counts: @0x30=%d @0x38=%d @0x40=%d",
-                         cnt1, cnt2, cnt3);
-                }
-                g_in_safe_access = 0;
-                uninstall_sigsegv_handler();
-            }
-        }
-
-        // ===== 6f) v6.5: 枚举 EnterLayer 所有方法用于调试 =====
-        {
-            Il2CppClass enter_cls = fn_class_from_name(g_csharp_image, "", "EnterLayer");
-            if (enter_cls && fn_class_get_methods && fn_method_get_name) {
-                LOGI("[dlc] v6.5: ===== EnterLayer methods dump =====");
-                void *iter = NULL;
-                Il2CppMethodInfo m;
-                int method_count = 0;
-                while ((m = fn_class_get_methods(enter_cls, &iter)) != NULL) {
-                    const char *name = fn_method_get_name(m);
-                    if (!name) continue;
-                    int pc = fn_method_get_param_count ? fn_method_get_param_count(m) : -1;
-                    uintptr_t mptr = *(uintptr_t *)m;
-                    // 只打印关键方法
-                    if (strstr(name, "Pay") || strstr(name, "pay") || 
-                        strstr(name, "DLC") || strstr(name, "dlc") ||
-                        strstr(name, "Pig") || strstr(name, "pig") ||
-                        strstr(name, "Unlock") || strstr(name, "unlock") ||
-                        strstr(name, "Update") || strstr(name, "update") ||
-                        strstr(name, "Try") || strstr(name, "Show") ||
-                        strstr(name, "Mode") || strstr(name, "Page")) {
-                        LOGI("[dlc] v6.5:   EnterLayer.%s(%d) ptr=%p MI=%p", name, pc, (void*)mptr, m);
-                    }
-                    method_count++;
-                }
-                LOGI("[dlc] v6.5: EnterLayer total methods: %d", method_count);
-            }
-        }
+        // ===== 6e/6f) v6.17: 跳过 mDLCSet 验证和 EnterLayer dump =====
+        // 这些是纯诊断代码，不需要每次运行
+        LOGI("[dlc] v6.17: Skipping mDLCSet/EnterLayer diagnostics");
     }
     skip_mi_hook:
 
@@ -2128,9 +2046,26 @@ static int do_unlock_all_dlc(void) {
         if (unlocked > 0) unlocked_count++;
     }
 
-    // ===== 8) 尝试通过 AddDLC 添加所有 DLC ID =====
-    // v6.7: 先调用 GetDLCId 发现实际 DLC ID 映射
-    {
+    // ===== 8) v6.17: 跳过所有 AddDLC/UpdateDLC/SaveLoginData 操作 =====
+    // v6.15/v6.16 从后台线程反复调用这些 Unity C# 方法，
+    // 导致 Unity EventSystem 被干扰，游戏按键失灵。
+    // MethodInfo patch 是内存级修改，永久有效，不需要额外操作。
+    LOGI("[dlc] v6.17: Skipping AddDLC/UpdateDLC/SaveLoginData (caused button malfunction from bg thread)");
+
+    if (unlocked_count >= 10) {
+        g_dlc_unlocked = 1;
+        LOGI("[dlc] ★ DLC unlock SUCCESS via methodPointer replacement!");
+    }
+
+    #undef SAFE_INVOKE
+    #undef SAFE_UNBOX_INT
+
+    LOGI("[dlc] ===== DLC unlock v6.17 complete (unlocked=%d/16, mi_hooks=%d) =====",
+         unlocked_count, g_mi_hooks_installed);
+    return unlocked_count;
+}
+/* v6.17: 以下 AddDLC/UpdateDLC/SaveLoginData/验证代码已禁用 */
+#if 0
         Il2CppMethodInfo m_getDLCId = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCId", 1);
         if (m_getDLCId) {
             LOGI("[dlc] v6.7: ===== GetDLCId mapping (PackageEnum → DLC ID) =====");
@@ -2336,6 +2271,10 @@ static int do_unlock_all_dlc(void) {
         }
     }
 
+#endif /* v6.17 disabled */
+
+/* v6.17: 不会走到这里，上面已经 return */
+#if 0
     if (unlocked_count >= 10) {
         g_dlc_unlocked = 1;
         LOGI("[dlc] ★ DLC unlock SUCCESS via methodPointer replacement!");
@@ -2344,9 +2283,10 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.16 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.17 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
+#endif
 }
 
 // ========== RoleInfo 实例缓存（避免每次全量扫描）==========
@@ -4726,10 +4666,9 @@ static void *dlc_monitor_thread(void *arg) {
             sleep(3);
             continue;
         } else if (result > 0) {
-            LOGI("[dlc-monitor] ★ %d/16 roles unlocked! Will keep monitoring...", result);
-            // 成功后放慢频率，持续监控（防止游戏重置）
-            sleep(10);
-            continue;
+            LOGI("[dlc-monitor] ★ %d/16 roles unlocked! Stopping monitor (v6.17).", result);
+            // v6.17: 成功后立即退出，不再从后台线程调用 Unity 方法
+            break;
         } else {
             // result == 0: 所有策略都无效，可能游戏未完全加载
             LOGW("[dlc-monitor] 0 roles unlocked, retrying in 5s...", result);

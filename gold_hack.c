@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.31"
+#define LOG_TAG "GoldHack v6.32"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1404,6 +1404,354 @@ static void custom_hybridclr_bridge_bool_true(void* method, void* argVarIndexs, 
     }
 }
 
+// ===== v6.32: Interpreter::Execute inline hook =====
+// 核心洞察: MI field patches (f[0], f[1], f[11], f[12]) 只影响 AOT→interp 调用路径.
+// 解释器内部的 interp→interp 调用 (CallInterp_void IR 指令) 直接调用
+// Interpreter::Execute(MethodInfo*, StackObject*, void* ret), 完全绕过 MI 的函数指针字段.
+// 唯一的解决方案: hook Interpreter::Execute 本身.
+//
+// Execute 签名: static void Execute(const MethodInfo* methodInfo, StackObject* args, void* ret)
+// ARM64 ABI: X0=methodInfo, X1=args, X2=ret
+//
+// Hook 策略:
+// 1. 从桥接函数 (所有 HybridCLR 方法共享的 methodPointer) 反汇编找到 Execute 的 BL 调用
+// 2. 在 Execute 入口安装 inline hook, 跳转到我们的 trampoline
+// 3. Trampoline: 检查 X0 是否在目标 MI 列表中
+//    - 匹配: 向 [X2] 写入 1 (bool true) 并返回
+//    - 不匹配: 跳转到 trampoline 执行原始指令, 然后跳回 Execute+16
+
+// 目标 MethodInfo 列表 (运行时填充)
+#define MAX_EXECUTE_HOOK_TARGETS 64
+static uintptr_t g_execute_hook_targets[MAX_EXECUTE_HOOK_TARGETS];
+static int g_execute_hook_target_count = 0;
+static volatile int g_execute_hook_installed = 0;
+
+// Execute 原始入口地址 (被 hook 后用于 trampoline)
+static uintptr_t g_execute_addr = 0;
+// 保存的原始指令 (前 16 字节 = 4 条 ARM64 指令)
+static uint32_t g_execute_saved_insns[4];
+// Trampoline 地址
+static void *g_execute_trampoline = NULL;
+
+// 添加一个 MethodInfo 到 Execute hook 目标列表
+static void execute_hook_add_target(void *mi) {
+    if (!mi) return;
+    // 去重
+    for (int i = 0; i < g_execute_hook_target_count; i++) {
+        if (g_execute_hook_targets[i] == (uintptr_t)mi) return;
+    }
+    if (g_execute_hook_target_count < MAX_EXECUTE_HOOK_TARGETS) {
+        g_execute_hook_targets[g_execute_hook_target_count++] = (uintptr_t)mi;
+        LOGI("[exec-hook] Added target MI=%p (#%d)", mi, g_execute_hook_target_count);
+    }
+}
+
+// 从 ARM64 BL 指令解码目标地址
+// BL: 0x94000000 | (imm26)  或  BL: 0x97FFFFFF | ...
+// imm26 是有符号偏移, 单位是 4 字节
+static uintptr_t decode_bl_target(uintptr_t insn_addr) {
+    uint32_t insn = *(uint32_t *)insn_addr;
+    // BL 指令: opcode = 100101, 即 insn[31:26] == 0b100101
+    if ((insn >> 26) != 0x25) return 0;  // 不是 BL
+    // 提取 imm26 (有符号)
+    int32_t imm26 = (int32_t)(insn & 0x03FFFFFF);
+    // 符号扩展 26 位到 32 位
+    if (imm26 & 0x02000000) imm26 |= (int32_t)0xFC000000;
+    // 目标地址 = insn_addr + imm26 * 4
+    return insn_addr + (int64_t)imm26 * 4;
+}
+
+// 从桥接函数反汇编, 找到 Interpreter::Execute 的地址
+// 桥接函数是所有 HybridCLR 方法共享的 methodPointer,
+// 它内部会调用 Interpreter::Execute(method, args, ret)
+// 我们查找前 128 字节内的 BL 指令
+static uintptr_t find_execute_from_bridge(uintptr_t bridge_addr) {
+    if (!bridge_addr) return 0;
+    LOGI("[exec-hook] Scanning bridge function @ %p for BL to Execute...", (void*)bridge_addr);
+    
+    // 反汇编桥接函数的前 256 字节, 找所有 BL 指令
+    // Execute 通常是桥接函数中最大的被调用函数
+    uintptr_t bl_targets[16];
+    int bl_count = 0;
+    
+    install_sigsegv_handler();
+    g_in_safe_access = 1;
+    if (sigsetjmp(g_jmpbuf, 1) != 0) {
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        LOGE("[exec-hook] SIGSEGV scanning bridge function");
+        return 0;
+    }
+    
+    for (int i = 0; i < 64 && bl_count < 16; i++) {  // 64 instructions = 256 bytes
+        uintptr_t addr = bridge_addr + i * 4;
+        uint32_t insn = *(volatile uint32_t *)addr;
+        
+        // 检查是否是 RET (0xD65F03C0)
+        if (insn == 0xD65F03C0) {
+            LOGI("[exec-hook] Hit RET at bridge+%d, stopping scan", i*4);
+            break;
+        }
+        
+        uintptr_t target = decode_bl_target(addr);
+        if (target) {
+            LOGI("[exec-hook] BL at bridge+0x%x -> %p", i*4, (void*)target);
+            bl_targets[bl_count++] = target;
+        }
+    }
+    g_in_safe_access = 0;
+    uninstall_sigsegv_handler();
+    
+    if (bl_count == 0) {
+        LOGE("[exec-hook] No BL instructions found in bridge function");
+        return 0;
+    }
+    
+    // 启发式: Execute 通常是桥接函数中调用的最大函数
+    // 我们可以通过检查每个 BL 目标函数的大小来判断
+    // 更简单的方法: 桥接函数通常结构是:
+    //   setup stack frame
+    //   prepare args from MethodInfo
+    //   BL Interpreter::Execute   ← 这是我们要找的
+    //   cleanup and return
+    // Execute 通常是桥接中唯一或最后一个 BL 调用
+    // 使用最后一个 BL (在 RET 之前)
+    uintptr_t execute_addr = bl_targets[bl_count - 1];
+    
+    // 但如果桥接函数很复杂, 可能有多个 BL
+    // 验证: Execute 函数应该很大 (几千条指令)
+    // 简单检查: 函数的前几条指令应该是标准的栈帧建立
+    install_sigsegv_handler();
+    g_in_safe_access = 1;
+    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+        // 检查目标函数的第一条指令
+        uint32_t first_insn = *(volatile uint32_t *)execute_addr;
+        // STP 指令 (栈帧建立) 通常以 0xA9 开头 (STP Xt, Xt, [SP, #imm]!)
+        // 或 SUB SP, SP, #imm (0xD1)
+        uint32_t opcode_hi = first_insn >> 24;
+        LOGI("[exec-hook] Execute candidate @ %p, first insn=0x%08x (hi=0x%02x)",
+             (void*)execute_addr, first_insn, opcode_hi);
+    }
+    g_in_safe_access = 0;
+    uninstall_sigsegv_handler();
+    
+    LOGI("[exec-hook] ★ Selected Execute @ %p (BL #%d of %d)", 
+         (void*)execute_addr, bl_count, bl_count);
+    return execute_addr;
+}
+
+// 安装 Execute inline hook 带 trampoline
+// Trampoline 结构 (在 RWX 内存中):
+//
+// === entry point (from hook at Execute) ===
+//   STP X0, X1, [SP, #-16]!    ; 保存 X0, X1
+//   LDR X1, =target_list       ; 加载目标列表地址
+//   LDR X16, =target_count     ; 加载目标数量地址
+//   LDR W16, [X16]             ; 读取目标数量
+// loop:
+//   CBZ W16, not_found
+//   LDR X17, [X1], #8          ; 读取下一个目标 MI
+//   CMP X0, X17                ; 比较
+//   B.EQ found
+//   SUB W16, W16, #1
+//   B loop
+// not_found:
+//   LDP X0, X1, [SP], #16      ; 恢复 X0, X1
+//   <execute saved 4 instructions> ; 执行原始指令
+//   LDR X16, =Execute+16       ; 跳回 Execute 继续
+//   BR X16
+// found:
+//   LDP X0, X1, [SP], #16      ; 恢复 X0, X1
+//   ; X2 = ret pointer (第三个参数, 未被修改)
+//   MOV X16, #1
+//   STR X16, [X2]              ; *(int64_t*)ret = 1 (bool true)
+//   RET                        ; 直接返回, 不执行原始 Execute
+//
+// 但上面的纯汇编方式太复杂。改用 C 函数方式:
+// trampoline 跳转到 C 函数, C 函数做判断, 然后调用原始 Execute 或直接返回。
+
+// C hook 函数: 检查 MethodInfo 是否需要返回 true
+// 如果匹配, 写 ret=1 并返回 (不调用原始 Execute)
+// 如果不匹配, 调用原始 Execute (通过 trampoline)
+typedef void (*execute_func_t)(const void* methodInfo, void* args, void* ret);
+static execute_func_t g_orig_execute = NULL;  // 指向 trampoline (执行原始指令后跳回 Execute+16)
+
+static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
+    // 快速路径: 检查 methodInfo 是否在目标列表中
+    uintptr_t mi_addr = (uintptr_t)methodInfo;
+    for (int i = 0; i < g_execute_hook_target_count; i++) {
+        if (g_execute_hook_targets[i] == mi_addr) {
+            // 匹配! 写 ret=1 并返回
+            if (ret) {
+                *(int64_t*)ret = 1;  // StackObject.i64 = 1 (bool true)
+            }
+            static int hook_calls = 0;
+            if (hook_calls < 50) {
+                LOGI("[exec-hook] ★ INTERCEPTED Execute(MI=%p) -> ret=1 #%d", methodInfo, hook_calls);
+                hook_calls++;
+            }
+            return;
+        }
+    }
+    // 不匹配, 调用原始 Execute
+    g_orig_execute(methodInfo, args, ret);
+}
+
+// 安装 Execute inline hook, 返回 0=成功
+static int install_execute_hook(uintptr_t execute_addr) {
+    if (!execute_addr) return -1;
+    if (g_execute_hook_installed) return 0;
+    
+    LOGI("[exec-hook] Installing inline hook on Execute @ %p", (void*)execute_addr);
+    g_execute_addr = execute_addr;
+    
+    // 1. 保存原始前 16 字节 (4 条指令)
+    install_sigsegv_handler();
+    g_in_safe_access = 1;
+    if (sigsetjmp(g_jmpbuf, 1) != 0) {
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        LOGE("[exec-hook] SIGSEGV reading Execute instructions");
+        return -1;
+    }
+    memcpy(g_execute_saved_insns, (void*)execute_addr, 16);
+    g_in_safe_access = 0;
+    uninstall_sigsegv_handler();
+    
+    LOGI("[exec-hook] Saved instructions: %08x %08x %08x %08x",
+         g_execute_saved_insns[0], g_execute_saved_insns[1],
+         g_execute_saved_insns[2], g_execute_saved_insns[3]);
+    
+    // 2. 分配 trampoline (执行保存的 4 条指令, 然后跳回 Execute+16)
+    // trampoline 布局:
+    //   [0-3]   4 条原始指令 (16 bytes)
+    //   [4]     LDR X16, [PC, #8]   (0x58000050)
+    //   [5]     BR X16              (0xD61F0200)
+    //   [6-7]   .quad Execute+16    (8 bytes)
+    // 总共 32 bytes
+    
+    // 检查保存的指令中是否有 PC 相对指令 (ADRP, ADR, B, BL, LDR literal, etc.)
+    // 如果有, trampoline 需要 fixup. 简单做法: 检查并报告.
+    int has_pc_relative = 0;
+    for (int i = 0; i < 4; i++) {
+        uint32_t insn = g_execute_saved_insns[i];
+        uint32_t op = insn >> 24;
+        // ADRP: 1xx10000 (bit31=1, [28:24]=10000)
+        if ((insn & 0x9F000000) == 0x90000000) { has_pc_relative = 1; LOGW("[exec-hook] insn[%d] is ADRP: 0x%08x", i, insn); }
+        // ADR: 0xx10000
+        if ((insn & 0x9F000000) == 0x10000000) { has_pc_relative = 1; LOGW("[exec-hook] insn[%d] is ADR: 0x%08x", i, insn); }
+        // B/BL: 000101xx (B) or 100101xx (BL)
+        if ((insn >> 26) == 0x05 || (insn >> 26) == 0x25) { has_pc_relative = 1; LOGW("[exec-hook] insn[%d] is B/BL: 0x%08x", i, insn); }
+        // CBZ/CBNZ: 0x34/0x35/0xB4/0xB5
+        if (op == 0x34 || op == 0x35 || op == 0xB4 || op == 0xB5) { has_pc_relative = 1; LOGW("[exec-hook] insn[%d] is CBZ/CBNZ: 0x%08x", i, insn); }
+        // TBZ/TBNZ: 0x36/0x37/0xB6/0xB7
+        if (op == 0x36 || op == 0x37 || op == 0xB6 || op == 0xB7) { has_pc_relative = 1; LOGW("[exec-hook] insn[%d] is TBZ/TBNZ: 0x%08x", i, insn); }
+        // LDR literal: 0x18/0x1C/0x58/0x5C/0x98/0x9C/0xD8/0xDC
+        if (op == 0x18 || op == 0x1C || op == 0x58 || op == 0x5C ||
+            op == 0x98 || op == 0x9C || op == 0xD8 || op == 0xDC) { has_pc_relative = 1; LOGW("[exec-hook] insn[%d] is LDR literal: 0x%08x", i, insn); }
+    }
+    
+    if (has_pc_relative) {
+        LOGW("[exec-hook] WARNING: PC-relative instructions in saved area, trampoline may crash!");
+        LOGW("[exec-hook] Will attempt ADRP fixup...");
+    }
+    
+    // 分配 trampoline RWX 内存
+    void *tramp_mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tramp_mem == MAP_FAILED) {
+        LOGE("[exec-hook] mmap trampoline failed: %s", strerror(errno));
+        return -1;
+    }
+    
+    uint32_t *tramp = (uint32_t *)tramp_mem;
+    int ti = 0;
+    
+    // 写入保存的 4 条指令, 处理 PC 相对指令的 fixup
+    for (int i = 0; i < 4; i++) {
+        uint32_t insn = g_execute_saved_insns[i];
+        
+        // ADRP fixup: 重新计算 immhi:immlo 使得在新地址产生相同的结果
+        if ((insn & 0x9F000000) == 0x90000000) {
+            // ADRP Xd, label
+            // Original: PC_old = execute_addr + i*4, target_page = (PC_old & ~0xFFF) + (imm << 12)
+            // New:      PC_new = tramp_addr + ti*4, need same target_page
+            uintptr_t pc_old = execute_addr + i * 4;
+            // 解码原始 imm
+            uint32_t immlo = (insn >> 29) & 0x3;
+            uint32_t immhi = (insn >> 5) & 0x7FFFF;
+            int64_t imm_orig = (int64_t)(((int64_t)((immhi << 2) | immlo)) << 12);
+            // 符号扩展 21+12=33 位
+            if (imm_orig & (1LL << 32)) imm_orig |= ~((1LL << 33) - 1);
+            
+            uintptr_t target_page = (pc_old & ~(uintptr_t)0xFFF) + imm_orig;
+            uintptr_t pc_new = (uintptr_t)tramp_mem + ti * 4;
+            int64_t new_imm = (int64_t)(target_page - (pc_new & ~(uintptr_t)0xFFF));
+            int64_t new_imm_pages = new_imm >> 12;
+            
+            // 检查是否超出 ±4GB 范围
+            if (new_imm_pages > 0xFFFFF || new_imm_pages < -(int64_t)0x100000) {
+                LOGE("[exec-hook] ADRP fixup out of range! Cannot hook Execute.");
+                munmap(tramp_mem, 4096);
+                return -1;
+            }
+            
+            uint32_t rd = insn & 0x1F;
+            uint32_t new_immlo = ((uint32_t)new_imm_pages) & 0x3;
+            uint32_t new_immhi = (((uint32_t)new_imm_pages) >> 2) & 0x7FFFF;
+            insn = 0x90000000 | (new_immlo << 29) | (new_immhi << 5) | rd;
+            LOGI("[exec-hook] ADRP fixup: insn[%d] -> 0x%08x (target_page=%p)", i, insn, (void*)target_page);
+        }
+        
+        tramp[ti++] = insn;
+    }
+    
+    // 跳回 Execute+16
+    tramp[ti++] = 0x58000050;  // LDR X16, [PC, #8]
+    tramp[ti++] = 0xD61F0200;  // BR X16
+    uint64_t *ret_addr = (uint64_t *)&tramp[ti];
+    *ret_addr = (uint64_t)(execute_addr + 16);
+    
+    __builtin___clear_cache((char*)tramp_mem, (char*)tramp_mem + 4096);
+    
+    g_execute_trampoline = tramp_mem;
+    g_orig_execute = (execute_func_t)tramp_mem;
+    
+    LOGI("[exec-hook] Trampoline @ %p (returns to %p)", tramp_mem, (void*)(execute_addr + 16));
+    
+    // 3. 安装 hook: 覆盖 Execute 入口 16 字节
+    uintptr_t page = execute_addr & ~(uintptr_t)0xFFF;
+    if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("[exec-hook] mprotect RWX failed for Execute: %s", strerror(errno));
+        if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE) != 0) {
+            LOGE("[exec-hook] mprotect RW also failed");
+            return -1;
+        }
+    }
+    // 跨页检查
+    uintptr_t page_end = (execute_addr + 16) & ~(uintptr_t)0xFFF;
+    if (page_end != page) {
+        mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
+    }
+    
+    uint32_t *target_code = (uint32_t *)execute_addr;
+    target_code[0] = 0x58000050;  // LDR X16, [PC, #8]
+    target_code[1] = 0xD61F0200;  // BR X16
+    uint64_t *hook_addr = (uint64_t *)&target_code[2];
+    *hook_addr = (uint64_t)(void*)hook_execute_func;
+    
+    __builtin___clear_cache((char *)execute_addr, (char *)(execute_addr + 16));
+    mprotect((void *)page, 0x2000, PROT_READ | PROT_EXEC);
+    if (page_end != page) {
+        mprotect((void *)page_end, 0x1000, PROT_READ | PROT_EXEC);
+    }
+    
+    g_execute_hook_installed = 1;
+    LOGI("[exec-hook] ★ Execute hook installed! Hook=%p, Trampoline=%p, Execute=%p",
+         (void*)hook_execute_func, tramp_mem, (void*)execute_addr);
+    return 0;
+}
+
 // 分配 RWX 内存并写入 ARM64 代码
 static void* alloc_executable_stub(const uint32_t *code, size_t code_size) {
     // 使用 mmap 分配可执行内存
@@ -1842,6 +2190,44 @@ static int do_unlock_all_dlc(void) {
     if (!g_mi_hooks_installed && g_boolean_class && fn_object_new) {
         init_dlc_stubs();
         
+        // ===== v6.32: 在 patch 任何 MI 之前, 先找到 Execute 并安装 hook =====
+        // 从第一个 HybridCLR 方法的原始 f[0] (bridge addr) 反汇编找到 Execute
+        if (!g_execute_hook_installed) {
+            // 用 isUnlockRole 的原始 f[0] 作为 bridge (patch 前)
+            uintptr_t bridge_for_exec = 0;
+            Il2CppMethodInfo tmp_mi = fn_class_get_method_from_name(g_proto_login_cls, "isUnlockRole", 1);
+            if (tmp_mi) {
+                uintptr_t *tf = (uintptr_t *)tmp_mi;
+                if (tf[0] != (uintptr_t)custom_return_true_method && tf[0] > 0x700000000000ULL) {
+                    bridge_for_exec = tf[0];
+                }
+            }
+            // 备选: 用已保存的原始 methodPointer
+            if (!bridge_for_exec && g_orig_isUnlockRole_ptr) {
+                bridge_for_exec = g_orig_isUnlockRole_ptr;
+            }
+            // 备选: 从 AddDLC 的 f[0] 获取
+            if (!bridge_for_exec && m_addDLC) {
+                uintptr_t *af = (uintptr_t *)m_addDLC;
+                if (af[0] > 0x700000000000ULL && af[0] != (uintptr_t)custom_return_true_method) {
+                    bridge_for_exec = af[0];
+                }
+            }
+            
+            if (bridge_for_exec) {
+                LOGI("[dlc] v6.32: Bridge address for Execute discovery: %p", (void*)bridge_for_exec);
+                uintptr_t exec_addr = find_execute_from_bridge(bridge_for_exec);
+                if (exec_addr) {
+                    int hook_ret = install_execute_hook(exec_addr);
+                    LOGI("[dlc] v6.32: install_execute_hook returned %d", hook_ret);
+                } else {
+                    LOGE("[dlc] v6.32: Could not find Execute from bridge!");
+                }
+            } else {
+                LOGE("[dlc] v6.32: Could not get bridge address for Execute discovery!");
+            }
+        }
+        
         // v6.3: 用方法迭代 patch ProtoLogin 所有匹配方法（解决同名方法多个重载只 patch 第一个的问题）
         // 只 patch 返回 bool 的方法名
         // v6.27: 恢复 v6.10 完整方法列表
@@ -1878,6 +2264,9 @@ static int do_unlock_all_dlc(void) {
             
             LOGI("[dlc] BEFORE %s: mPtr=%p inv=%p name=%p interpData=%p MI=%p",
                  mname, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[10], mi);
+            
+            // v6.32: 注册到 Execute hook 目标列表 (在 patch f[0] 之前!)
+            execute_hook_add_target(mi);
             
             // 设置页面可写
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
@@ -2051,6 +2440,8 @@ static int do_unlock_all_dlc(void) {
             int pc_found = fn_method_get_param_count ? fn_method_get_param_count(mi) : -1;
             LOGI("[dlc] BEFORE ProtoLogin.%s(%d): mPtr=%p inv=%p name=%p interpData=%p MI=%p",
                  extra_proto_methods[ep], pc_found, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[10], mi);
+            // v6.32: 注册到 Execute hook 目标列表
+            execute_hook_add_target(mi);
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
             uintptr_t page_end = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;
@@ -2137,6 +2528,9 @@ static int do_unlock_all_dlc(void) {
                 LOGI("[dlc] BEFORE %s.%s: mPtr=%p inv=%p interpData=%p",
                      extra_patches[e].cls_name, extra_patches[e].method_name,
                      (void*)f[0], (void*)f[1], (void*)f[10]);
+                
+                // v6.32: 注册到 Execute hook 目标列表
+                execute_hook_add_target(mi);
                 
                 uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
                 mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
@@ -2606,8 +3000,8 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.31 complete (patched=%d/16, real=%d/16, mi_hooks=%d) =====",
-         unlocked_count, real_unlocked_count, g_mi_hooks_installed);
+    LOGI("[dlc] ===== DLC unlock v6.32 complete (patched=%d/16, real=%d/16, mi_hooks=%d, exec_hook=%d, targets=%d) =====",
+         unlocked_count, real_unlocked_count, g_mi_hooks_installed, g_execute_hook_installed, g_execute_hook_target_count);
     return unlocked_count;
 }
 /* v6.17: 以下旧的诊断代码已禁用 */

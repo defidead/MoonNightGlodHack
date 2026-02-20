@@ -1335,7 +1335,9 @@ static void custom_bool_true_invoker(void* methodPtr, void* method, void* obj, v
     LOGI("[invoker] custom_bool_true_invoker called! methodPtr=%p method=%p obj=%p ret=%p",
          methodPtr, method, obj, ret);
     if (ret) {
+        uint8_t before = *(uint8_t *)ret;
         *(uint8_t *)ret = 1;  // true (bool = 1 byte value type)
+        LOGI("[invoker] wrote ret: before=0x%02x after=0x%02x @%p", before, *(uint8_t*)ret, ret);
     }
 }
 
@@ -1887,7 +1889,7 @@ static int do_unlock_all_dlc(void) {
             *bitfield = (*bitfield & ~(1 << 5)) | (1 << 4);
             
             LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p interpData=0 mPtrByInterp=%p MI=%p bf=0x%02x",
-                 mname, (void*)f[0], (void*)f[1], mi, (void*)f[11], *((uint8_t *)mi + 0x4B));
+                 mname, (void*)f[0], (void*)f[1], (void*)f[11], mi, *((uint8_t *)mi + 0x4B));
             
             // v6.14: dump 完整 MI 结构用于调试 (Unity 2020 layout)
             if (strcmp(mname, "isUnlockRole") == 0 || strcmp(mname, "isUnlockByItem") == 0) {
@@ -2143,6 +2145,10 @@ static int do_unlock_all_dlc(void) {
         } else if (!result) {
             LOGE("[dlc]   isUnlockRole(%d) result=NULL (no exc, no sigsegv)", rid);
         } else {
+            // v6.14-diag: 打印 boxed result 的原始字节
+            uint8_t *rb = (uint8_t *)result;
+            LOGI("[dlc]   isUnlockRole(%d) boxed=%p raw: [0x10]=0x%02x [0x11]=0x%02x [0x12]=0x%02x [0x13]=0x%02x klass=%p",
+                 rid, result, rb[0x10], rb[0x11], rb[0x12], rb[0x13], *(void**)result);
             SAFE_UNBOX_INT(unlocked, result, -1);
         }
         LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,

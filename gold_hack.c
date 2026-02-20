@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.26"
+#define LOG_TAG "GoldHack v6.27"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1843,11 +1843,12 @@ static int do_unlock_all_dlc(void) {
         
         // v6.3: 用方法迭代 patch ProtoLogin 所有匹配方法（解决同名方法多个重载只 patch 第一个的问题）
         // 只 patch 返回 bool 的方法名
-        // v6.16: 只保留核心解锁方法，移除 IsDLCRole/IsUnlockByFirstGame/IsUnlockGuBao
-        // IsDLCRole: 标识角色是否为DLC角色，强制true会让免费角色也变成DLC角色
-        // IsUnlockByFirstGame/IsUnlockGuBao: 可能影响游戏内其他功能按钮
+        // v6.27: 恢复 v6.10 完整方法列表
+        // v6.16 删减了 IsDLCRole/IsUnlockByFirstGame/IsUnlockGuBao，导致 DLC 无法解锁
+        // 当时的"按钮失灵"实际是浮窗拦截触摸导致的（v6.18 已用 FLAG_NOT_TOUCH_MODAL 修复）
         const char *safe_method_names[] = {
-            "isUnlockRole", "IsUnlockAllDLC",
+            "isUnlockRole", "IsDLCRole", "IsUnlockAllDLC",
+            "IsUnlockByFirstGame", "IsUnlockGuBao",
         };
         int num_safe = sizeof(safe_method_names) / sizeof(safe_method_names[0]);
         int patched = 0;
@@ -1946,12 +1947,10 @@ static int do_unlock_all_dlc(void) {
         // v6.8 FIX: 之前只尝试 param_count=0,1，导致 2 参数方法(isUnlockByItem, 
         // IsUnlockByGameId, IsUnlockByGameIds) 未被找到！现在尝试 0-3 参数。
         // 新增 isUnlockByItem — 这是 UI 直接调用的关键方法！
-        // v6.16: 精简列表 — 移除 IsOldPlayer/IsBoughtAllItems/IsUnlockByGameId/IsUnlockByGameIds/isUnlockByItem
-        // IsOldPlayer: 改变玩家身份标识，影响游戏行为
-        // IsBoughtAllItems: 让游戏认为所有物品已购买，隐藏购买按钮
-        // IsUnlockByGameId/s: 可能影响特定游戏功能判断
-        // isUnlockByItem: 物品解锁判断，强制true可能影响物品系统
-        const char *extra_proto_methods[] = {"IsDianCang", "isUnlockDLC"};
+        // v6.27: 恢复 v6.10 完整列表（isUnlockByItem 是 UI 直接调用的关键方法）
+        const char *extra_proto_methods[] = {"IsDianCang", "IsOldPlayer", "isUnlockDLC", 
+                                              "IsBoughtAllItems", "IsUnlockByGameId", "IsUnlockByGameIds",
+                                              "isUnlockByItem"};
         int num_extra_proto = sizeof(extra_proto_methods) / sizeof(extra_proto_methods[0]);
         for (int ep = 0; ep < num_extra_proto; ep++) {
             // v6.8: 尝试 0-3 参数（修复之前只尝试 0,1 的 BUG）
@@ -1997,12 +1996,63 @@ static int do_unlock_all_dlc(void) {
         g_mi_hooks_installed = 1;
         LOGI("[dlc] v6.21 MethodInfo patch complete! %d methods patched (f[0-1]+f[10-12]+bitfield)", patched);
         
-        // ===== 6b) v6.16: 不再 Patch Purchase*/PackageSystem 类 =====
-        // v6.15 patch 了 PurchaseShopConfig.IsUnlockAll, PurchaseRedPanel.IsUnlockAllDLC,
-        // PurchasePocketPanel.isUnlock, PurchaseFriendHelpComponent.IsUnlockAll 等方法，
-        // 导致游戏商店/面板 UI 逻辑混乱，大部分功能按键无法使用。
-        // 正确做法：只 patch ProtoLogin 的核心解锁方法，让 UI 类用原始逻辑运行。
-        LOGI("[dlc] v6.16: Skipping Purchase*/PackageSystem class patches (caused button malfunction)");
+        // ===== 6b) v6.27: 恢复 extra class patches (v6.10 水平) =====
+        // v6.16 移除了这些 patch 声称"按钮失灵"，但实际上按钮问题是浮窗拦截触摸导致的
+        // （v6.18 已通过 FLAG_NOT_TOUCH_MODAL + collapsed 修复）。现在安全恢复。
+        {
+            struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } extra_patches[] = {
+                {"PurchaseUtils",             "", "IsUnlockDianCang",   1},
+                {"PurchaseRedPanel",          "", "IsUnlockAllDLC",     1},
+                {"PurchaseFriendHelpComponent","", "IsUnlockAll",       0},
+                {"PurchaseShopConfig",        "", "IsUnlockAll",        1},
+                {"PurchaseShopConfig",        "", "IsUnlockByExtra",    1},
+                {"PurchaseRedConfig",         "", "IsUnlockAll",        1},
+                {"PackageSystem",             "", "IsUnlockAnyDlc",     1},
+                {"PurchasePocketPanel",       "", "isUnlock",            1},
+            };
+            int num_extra = sizeof(extra_patches) / sizeof(extra_patches[0]);
+            int extra_patched = 0;
+            
+            LOGI("[dlc] ===== Patching extra unlock check classes (v6.27 restored) =====");
+            for (int e = 0; e < num_extra; e++) {
+                Il2CppClass cls = fn_class_from_name(g_csharp_image, 
+                    extra_patches[e].ns, extra_patches[e].cls_name);
+                if (!cls) {
+                    LOGI("[dlc] Class %s not found, skip", extra_patches[e].cls_name);
+                    continue;
+                }
+                Il2CppMethodInfo mi = fn_class_get_method_from_name(
+                    cls, extra_patches[e].method_name, extra_patches[e].param_count);
+                if (!mi) {
+                    LOGI("[dlc] %s.%s(%d) method not found, skip",
+                         extra_patches[e].cls_name, extra_patches[e].method_name,
+                         extra_patches[e].param_count);
+                    continue;
+                }
+                
+                uintptr_t *f = (uintptr_t *)mi;
+                LOGI("[dlc] BEFORE %s.%s: mPtr=%p inv=%p interpData=%p",
+                     extra_patches[e].cls_name, extra_patches[e].method_name,
+                     (void*)f[0], (void*)f[1], (void*)f[10]);
+                
+                uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
+                mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
+                uintptr_t pe = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;
+                if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
+                
+                f[0]  = (uintptr_t)custom_return_true_method;
+                f[1]  = (uintptr_t)custom_bool_true_invoker;
+                f[10] = 0;
+                f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
+                f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
+                uint8_t *bf = (uint8_t *)mi + 0x4B;
+                *bf = *bf | (1 << 4);
+                
+                LOGI("[dlc] ★ %s.%s PATCHED (v6.27)", extra_patches[e].cls_name, extra_patches[e].method_name);
+                extra_patched++;
+            }
+            LOGI("[dlc] Extra class patches: %d installed", extra_patched);
+        }
         
         // ===== 6b2) v6.8.1: 不再暴力 patch 其他类 =====
         // v6.8 暴力 patch 了 IsDownloading, IsPreDownload, IsFilterItem, IsOnlyContainPvPShop 等

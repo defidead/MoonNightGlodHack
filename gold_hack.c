@@ -1328,6 +1328,38 @@ static void* custom_bool_true_invoker(void* methodPtr, void* method, void* obj, 
     return boxed;
 }
 
+// ===== v6.5: void NOP method — 替换 void 方法让其什么都不做 =====
+// 签名: void Method(void* this, MethodInfo* method) 
+// ARM64 会忽略多余参数
+static void custom_void_nop_method(void* __this, void* method) {
+    (void)__this; (void)method;
+    // do nothing — NOP
+}
+
+// ===== v6.5: void NOP invoker — void 方法的 invoker 直接返回 NULL =====
+static void* custom_void_nop_invoker(void* methodPtr, void* method, void* obj, void** params, void** exc) {
+    (void)methodPtr; (void)method; (void)obj; (void)params; (void)exc;
+    return NULL;  // void 方法不需要返回值
+}
+
+// ===== v6.5: bool return false method — 返回 false =====
+static uint8_t custom_return_false_method(void* __this, int32_t arg1, void* arg2, void* method) {
+    (void)__this; (void)arg1; (void)arg2; (void)method;
+    return 0;
+}
+
+// ===== v6.5: bool false invoker — 返回 boxed Boolean(false) =====
+static void* custom_bool_false_invoker(void* methodPtr, void* method, void* obj, void** params, void** exc) {
+    if (!fn_object_new || !g_boolean_class) {
+        return NULL;
+    }
+    Il2CppObject boxed = fn_object_new(g_boolean_class);
+    if (boxed) {
+        *(int32_t *)((uint8_t *)boxed + 0x10) = 0;  // false
+    }
+    return boxed;
+}
+
 // 分配 RWX 内存并写入 ARM64 代码
 static void* alloc_executable_stub(const uint32_t *code, size_t code_size) {
     // 使用 mmap 分配可执行内存
@@ -1864,7 +1896,7 @@ static int do_unlock_all_dlc(void) {
         }
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6.4 full MethodInfo patch complete! %d methods patched", patched);
+        LOGI("[dlc] v6.5 full MethodInfo patch complete! %d ProtoLogin methods patched", patched);
         
         // ===== 6b) Patch 其他 DLC 检查类的方法 =====
         // 添加回安全的 1-param/0-param bool 返回方法
@@ -1953,6 +1985,142 @@ static int do_unlock_all_dlc(void) {
                 }
             }
         }
+
+        // ===== 6d) v6.5: NOP void 方法 — 阻止购买 UI 显示 =====
+        // updatePayBtns, updateUnlock, updatePayState 是 void 方法,
+        // 内部检查 DLC 状态并显示/隐藏购买按钮
+        // 把它们 NOP 掉，让购买按钮永远不显示
+        {
+            struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } void_nops[] = {
+                {"EnterLayer",              "", "updatePayBtns",     0},
+                {"EnterLayer",              "", "UpdateDLCEnter",    0},
+                {"EnterLayer",              "", "UpdateTryBtn",      0},
+                {"EnterLayerSwitchMode",    "", "updateUnlock",      0},
+                {"PurchaseRedPopupRole",    "", "updatePayState",    0},
+            };
+            int num_void_nops = sizeof(void_nops) / sizeof(void_nops[0]);
+            int void_patched = 0;
+            
+            LOGI("[dlc] ===== v6.5: NOP void UI methods =====");
+            for (int v = 0; v < num_void_nops; v++) {
+                Il2CppClass cls = fn_class_from_name(g_csharp_image, 
+                    void_nops[v].ns, void_nops[v].cls_name);
+                if (!cls) {
+                    LOGI("[dlc] v6.5: Class %s not found, skip", void_nops[v].cls_name);
+                    continue;
+                }
+                Il2CppMethodInfo mi = fn_class_get_method_from_name(
+                    cls, void_nops[v].method_name, void_nops[v].param_count);
+                if (!mi) {
+                    LOGI("[dlc] v6.5: %s.%s(%d) not found, skip",
+                         void_nops[v].cls_name, void_nops[v].method_name,
+                         void_nops[v].param_count);
+                    continue;
+                }
+                
+                uintptr_t *f = (uintptr_t *)mi;
+                LOGI("[dlc] v6.5: BEFORE %s.%s: ptr=%p inv=%p flags=0x%x",
+                     void_nops[v].cls_name, void_nops[v].method_name,
+                     (void*)f[0], (void*)f[1], (int)f[13]);
+                
+                uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
+                mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
+                uintptr_t pe = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
+                if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
+                
+                f[0]  = (uintptr_t)custom_void_nop_method;
+                f[1]  = (uintptr_t)custom_void_nop_invoker;
+                f[10] = 0;  // 清除 interpData
+                f[11] = (uintptr_t)custom_void_nop_method;
+                f[12] = (uintptr_t)custom_void_nop_method;
+                f[13] = f[13] & ~(uintptr_t)0x100;  // 清除 HybridCLR 标记
+                f[15] = (uintptr_t)custom_void_nop_invoker;
+                
+                LOGI("[dlc] v6.5: ★ %s.%s NOP'd (void→nop)", void_nops[v].cls_name, void_nops[v].method_name);
+                void_patched++;
+            }
+            LOGI("[dlc] v6.5: Void NOP patches: %d/%d done", void_patched, num_void_nops);
+        }
+
+        // ===== 6e) v6.5: isShow* 方法返回 false — 阻止购买面板子区域显示 =====
+        {
+            struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } false_patches[] = {
+                {"PurchaseRedPanel",  "", "isShowDianCang",  0},
+                {"PurchaseRedPanel",  "", "isShowGuBao",     0},
+                {"PurchaseRedPanel",  "", "isShowChangWan",  0},
+            };
+            int num_false = sizeof(false_patches) / sizeof(false_patches[0]);
+            int false_patched = 0;
+            
+            LOGI("[dlc] ===== v6.5: Patch isShow* → return false =====");
+            for (int fp = 0; fp < num_false; fp++) {
+                Il2CppClass cls = fn_class_from_name(g_csharp_image,
+                    false_patches[fp].ns, false_patches[fp].cls_name);
+                if (!cls) {
+                    LOGI("[dlc] v6.5: Class %s not found, skip", false_patches[fp].cls_name);
+                    continue;
+                }
+                Il2CppMethodInfo mi = fn_class_get_method_from_name(
+                    cls, false_patches[fp].method_name, false_patches[fp].param_count);
+                if (!mi) {
+                    LOGI("[dlc] v6.5: %s.%s(%d) not found, skip",
+                         false_patches[fp].cls_name, false_patches[fp].method_name,
+                         false_patches[fp].param_count);
+                    continue;
+                }
+                
+                uintptr_t *f = (uintptr_t *)mi;
+                LOGI("[dlc] v6.5: BEFORE %s.%s: ptr=%p inv=%p flags=0x%x",
+                     false_patches[fp].cls_name, false_patches[fp].method_name,
+                     (void*)f[0], (void*)f[1], (int)f[13]);
+                
+                uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
+                mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
+                uintptr_t pe = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
+                if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
+                
+                f[0]  = (uintptr_t)custom_return_false_method;
+                f[1]  = (uintptr_t)custom_bool_false_invoker;
+                f[10] = 0;
+                f[11] = (uintptr_t)custom_return_false_method;
+                f[12] = (uintptr_t)custom_return_false_method;
+                f[13] = f[13] & ~(uintptr_t)0x100;
+                f[15] = (uintptr_t)custom_bool_false_invoker;
+                
+                LOGI("[dlc] v6.5: ★ %s.%s → return false", false_patches[fp].cls_name, false_patches[fp].method_name);
+                false_patched++;
+            }
+            LOGI("[dlc] v6.5: isShow false patches: %d/%d done", false_patched, num_false);
+        }
+
+        // ===== 6f) v6.5: 枚举 EnterLayer 所有方法用于调试 =====
+        {
+            Il2CppClass enter_cls = fn_class_from_name(g_csharp_image, "", "EnterLayer");
+            if (enter_cls && fn_class_get_methods && fn_method_get_name) {
+                LOGI("[dlc] v6.5: ===== EnterLayer methods dump =====");
+                void *iter = NULL;
+                Il2CppMethodInfo m;
+                int method_count = 0;
+                while ((m = fn_class_get_methods(enter_cls, &iter)) != NULL) {
+                    const char *name = fn_method_get_name(m);
+                    if (!name) continue;
+                    int pc = fn_method_get_param_count ? fn_method_get_param_count(m) : -1;
+                    uintptr_t mptr = *(uintptr_t *)m;
+                    // 只打印关键方法
+                    if (strstr(name, "Pay") || strstr(name, "pay") || 
+                        strstr(name, "DLC") || strstr(name, "dlc") ||
+                        strstr(name, "Pig") || strstr(name, "pig") ||
+                        strstr(name, "Unlock") || strstr(name, "unlock") ||
+                        strstr(name, "Update") || strstr(name, "update") ||
+                        strstr(name, "Try") || strstr(name, "Show") ||
+                        strstr(name, "Mode") || strstr(name, "Page")) {
+                        LOGI("[dlc] v6.5:   EnterLayer.%s(%d) ptr=%p MI=%p", name, pc, (void*)mptr, m);
+                    }
+                    method_count++;
+                }
+                LOGI("[dlc] v6.5: EnterLayer total methods: %d", method_count);
+            }
+        }
     }
     skip_mi_hook:
 
@@ -2035,7 +2203,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v4 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.5 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

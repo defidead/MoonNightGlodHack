@@ -1297,6 +1297,7 @@ static int bypass_dlc_lock(void) {
 static Il2CppClass   g_proto_login_cls  = NULL;
 static uintptr_t     g_proto_login_inst = 0;
 static Il2CppClass   g_boolean_class    = NULL;
+static volatile int  g_verification_complete = 0;  // v6.7: 验证完成后设为1，用于追踪解释器调用
 
 // ===== ARM64 可执行 stub（分配后长期存活）=====
 // 用于替换 HybridCLR 方法的 methodPointer
@@ -1308,7 +1309,15 @@ static void *g_stub_invoker_true = NULL;  // invoker wrapper stub (unused now)
 // 签名: bool Method(void* this, int32_t arg, MethodInfo* method)
 // 在 ARM64 上, 多余参数在寄存器中传递,无害地被忽略
 static uint8_t custom_return_true_method(void* __this, int32_t arg1, void* arg2, void* method) {
-    (void)__this; (void)arg1; (void)arg2; (void)method;
+    // v6.7: 追踪是否有解释器在调用我们的补丁函数
+    if (g_verification_complete) {
+        static int post_calls = 0;
+        if (post_calls < 30) {
+            LOGI("[intercept] custom_return_true CALLED post-verify! this=%p arg=%d method=%p #%d",
+                 __this, arg1, method, post_calls);
+            post_calls++;
+        }
+    }
     return 1;
 }
 
@@ -1864,7 +1873,8 @@ static int do_unlock_all_dlc(void) {
         // ===== 6a-extra) 补充 fn_class_get_method_from_name 查找迭代遗漏的方法 =====
         // fn_class_get_methods 可能不返回某些方法（如父类方法/接口方法）
         // 用 get_method_from_name 直接查找
-        const char *extra_proto_methods[] = {"IsDianCang", "IsOldPlayer", "isUnlockDLC"};
+        const char *extra_proto_methods[] = {"IsDianCang", "IsOldPlayer", "isUnlockDLC", 
+                                              "IsBoughtAllItems", "IsUnlockByGameId", "IsUnlockByGameIds"};
         int num_extra_proto = sizeof(extra_proto_methods) / sizeof(extra_proto_methods[0]);
         for (int ep = 0; ep < num_extra_proto; ep++) {
             // 尝试 1 参数和 0 参数
@@ -1896,7 +1906,7 @@ static int do_unlock_all_dlc(void) {
         }
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6.6 full MethodInfo patch complete! %d ProtoLogin methods patched", patched);
+        LOGI("[dlc] v6.7 full MethodInfo patch complete! %d ProtoLogin methods patched", patched);
         
         // ===== 6b) Patch 其他 DLC 检查类的方法 =====
         // 添加回安全的 1-param/0-param bool 返回方法
@@ -2073,6 +2083,44 @@ static int do_unlock_all_dlc(void) {
     }
 
     // ===== 8) 尝试通过 AddDLC 添加所有 DLC ID =====
+    // v6.7: 先调用 GetDLCId 发现实际 DLC ID 映射
+    {
+        Il2CppMethodInfo m_getDLCId = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCId", 1);
+        if (m_getDLCId) {
+            LOGI("[dlc] v6.7: ===== GetDLCId mapping (PackageEnum → DLC ID) =====");
+            for (int32_t pe = 0; pe <= 30; pe++) {
+                void *params[1] = { &pe };
+                exc = NULL;
+                void *r = NULL;
+                SAFE_INVOKE(r, m_getDLCId, (void*)g_proto_login_inst, params, &exc);
+                int dlcId = -1;
+                if (!sigsegv_hit && r) { SAFE_UNBOX_INT(dlcId, r, -1); }
+                if (dlcId > 0) {
+                    LOGI("[dlc] v6.7:   PackageEnum(%d) → DLC ID %d", pe, dlcId);
+                }
+            }
+        }
+        // 同样调用 GetProductId
+        Il2CppMethodInfo m_getProductId = fn_class_get_method_from_name(g_proto_login_cls, "GetProductId", 1);
+        if (m_getProductId) {
+            LOGI("[dlc] v6.7: ===== GetProductId mapping =====");
+            for (int32_t pe = 0; pe <= 30; pe++) {
+                void *params[1] = { &pe };
+                exc = NULL;
+                void *r = NULL;
+                SAFE_INVOKE(r, m_getProductId, (void*)g_proto_login_inst, params, &exc);
+                // ProductId 是 string，result 是 Il2CppString*
+                if (!sigsegv_hit && r) {
+                    LOGI("[dlc] v6.7:   PackageEnum(%d) → ProductId=%p", pe, r);
+                }
+            }
+        }
+    }
+
+    // v6.7: 设置验证完成标志，之后 custom_return_true_method 的调用来自解释器
+    g_verification_complete = 1;
+    LOGI("[dlc] v6.7: g_verification_complete=1, now tracking interpreter calls to custom_return_true");
+
     if (m_addDLC) {
         int add_ok = 0;
         for (int32_t dlcId = 1; dlcId <= 50; dlcId++) {
@@ -2135,6 +2183,43 @@ static int do_unlock_all_dlc(void) {
             } else {
                 LOGI("[dlc] v6.6: SaveLoginData() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
             }
+        }
+    }
+
+    // ===== 8e2) v6.7: 调用 GetDLCs() 查看当前 DLC 集合 =====
+    {
+        Il2CppMethodInfo m_getDLCs = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCs", 0);
+        if (m_getDLCs) {
+            exc = NULL;
+            void *dlcs_result = NULL;
+            SAFE_INVOKE(dlcs_result, m_getDLCs, (void*)g_proto_login_inst, NULL, &exc);
+            LOGI("[dlc] v6.7: GetDLCs() = %p (exc=%p sigsegv=%d)", dlcs_result, exc, sigsegv_hit);
+        }
+        // 再读一次 mDLCSet 验证是否被 AddDLC 填充
+        uint8_t *inst = (uint8_t *)g_proto_login_inst;
+        uintptr_t dlcSet = *(uintptr_t *)(inst + 64);
+        uintptr_t dlcSetInfo = *(uintptr_t *)(inst + 72);
+        LOGI("[dlc] v6.7: POST-AddDLC: mDLCSet=%p mDLCSetInfo=%p", (void*)dlcSet, (void*)dlcSetInfo);
+        if (dlcSet) {
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                // 尝试读取 HashSet 的 klass name
+                uintptr_t klass = *(uintptr_t *)dlcSet;
+                if (klass) {
+                    const char *kname = fn_class_get_name ? fn_class_get_name((void*)klass) : "?";
+                    LOGI("[dlc] v6.7:   mDLCSet klass=%p name=%s", (void*)klass, kname ? kname : "null");
+                }
+                // 读取几个偏移找 count
+                for (int off = 0x18; off <= 0x50; off += 8) {
+                    int32_t v = *(int32_t *)((uint8_t *)dlcSet + off);
+                    if (v > 0 && v < 10000) {
+                        LOGI("[dlc] v6.7:   mDLCSet[0x%x] = %d (possible count)", off, v);
+                    }
+                }
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
         }
     }
 
@@ -2213,7 +2298,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.6 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.7 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

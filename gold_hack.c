@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.29"
+#define LOG_TAG "GoldHack v6.30"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1928,40 +1928,97 @@ static int do_unlock_all_dlc(void) {
             // 保留 interpData 让真实 IL 逻辑在正确的 DLCSet 数据上运行。
             // --- f[10] 保持原样 ---
             
-            // v6.29.1: 完整 dump interpData 原始字节 (仅 isUnlockRole)
-            // 发现: +0x00 不是 codes, 指向 MI 地址! 说明 MHP HybridCLR 的 InterpMethodInfo 布局不同
-            if (strcmp(mname, "isUnlockRole") == 0 && f[10]) {
-                uint8_t *imi = (uint8_t*)f[10];
-                // 原始字节 dump (64 bytes = 8 qwords)
-                LOGI("[dlc] v6.29.1 interpData=%p RAW DUMP:", (void*)f[10]);
-                for (int di = 0; di < 8; di++) {
-                    uintptr_t val = *(uintptr_t*)(imi + di * 8);
-                    LOGI("[dlc]   +0x%02x: 0x%016lx  (%lu)", di * 8, (unsigned long)val, (unsigned long)val);
+            // v6.30: IR codes 直接修改 — 让解释器执行时返回 true
+            // MHP InterpMethodInfo 布局: +0x00=MI backptr, +0x08=codes ptr
+            // PREPARE_NEW_FRAME_FROM_INTERPRETER 宏读 interpData 然后
+            // ip = ipBase = imi->codes (在 MHP 中是 interpData+0x08)
+            // 解释器 switch(*(HiOpcodeEnum*)ip) 执行 IR 指令
+            if (f[10]) {
+                uint8_t *imi_raw = (uint8_t*)f[10];
+                void *codes_ptr = (void*)*(uintptr_t*)(imi_raw + 0x08);
+                
+                LOGI("[dlc] v6.30 %s: interpData=%p codes=%p", mname, (void*)f[10], codes_ptr);
+                
+                if (codes_ptr && (uintptr_t)codes_ptr > 0x1000) {
+                    uint8_t *c = (uint8_t*)codes_ptr;
+                    
+                    // dump 原始 codes (前 32 字节)
+                    LOGI("[dlc] v6.30 %s BEFORE codes[0-15]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
+                         mname, c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],c[14],c[15]);
+                    LOGI("[dlc] v6.30 %s BEFORE codes[16-31]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
+                         mname, c[16],c[17],c[18],c[19],c[20],c[21],c[22],c[23],c[24],c[25],c[26],c[27],c[28],c[29],c[30],c[31]);
+                    
+                    // dump interpData 元数据字段 (用于确定 IR 指令数量)
+                    uint32_t argStackObjSize = *(uint32_t*)(imi_raw + 0x10);
+                    uint32_t retStackObjSize_packed = *(uint32_t*)(imi_raw + 0x14);
+                    uint32_t localStackSize = *(uint32_t*)(imi_raw + 0x20);
+                    uint32_t maxStackSize = *(uint32_t*)(imi_raw + 0x24);
+                    uint32_t argCount_codeLen = *(uint32_t*)(imi_raw + 0x28);
+                    LOGI("[dlc] v6.30 %s: argStackObj=%u retStackObj=%u localStack=%u maxStack=%u argCount_codeLen=0x%08x",
+                         mname, argStackObjSize, retStackObjSize_packed, localStackSize, maxStackSize, argCount_codeLen);
+                    
+                    // === v6.30 核心: 直接修改 IR codes ===
+                    // 策略: isUnlockRole 的 codes 只有 2 条 IR 指令 (每条 8 字节):
+                    //   指令1 (bytes 0-7): 某种加载指令, 将常量加载到 slot
+                    //   指令2 (bytes 8-15): RetVar_ret_1, 返回 slot 的值
+                    // 不管原始 opcode 值是什么, 我们直接:
+                    //   1) 保持 opcode 不变 (指令类型不变)
+                    //   2) 修改指令1中的常量值字节为 1 (true)
+                    // 对于 IRLdcVarConst_1 格式: {opcode(u16), dst(u16), src(u8), pad...}
+                    //   src 在 byte offset 4, 改为 0x01
+                    // 如果指令1不是 LdcVarConst_1, 我们用另一种策略:
+                    //   分配新 codes, 构造 "设置返回值为1 + 返回" 的指令序列
+                    
+                    // 设置 codes 内存可写
+                    uintptr_t codes_page = (uintptr_t)codes_ptr & ~(uintptr_t)0xFFF;
+                    mprotect((void *)codes_page, 0x2000, PROT_READ | PROT_WRITE);
+                    
+                    // 保存原始 codes 字节
+                    uint8_t orig_codes[16];
+                    memcpy(orig_codes, c, 16);
+                    
+                    // 策略 A: 如果只有 2 条 IR 指令, 修改第一条的常量字段
+                    // isUnlockRole codes: 04 00 00 00 01 00 00 00 | 01 00 00 00 04 00 00 00
+                    //                     ^opcode ^dst  ^src        ^opcode ^ret
+                    // 尝试多个可能的常量位置:
+                    //   byte[4] = src for LdcVarConst_1 (如果 opcode=0x0004 是 LdcVarConst_1)
+                    //   byte[2]+byte[3] = dst for LdcVarConst_1 (目标 slot)
+                    //
+                    // 方案: 将 byte[4] 设为 1 (如果它当前是 0, 则从 false→true)
+                    //       将 byte[5] 设为 0, byte[6]=0, byte[7]=0 (清除其余 padding)
+                    // 同时也尝试修改 byte[2] 和 byte[3] 区域
+                    //
+                    // 另外: 如果第一条指令是 InitLocals (初始化本地变量为0),
+                    //   那么 slot0 被设为 0, 然后 RetVar_ret_1 返回 slot0=0 → false.
+                    //   解决方案: 跳过 InitLocals, 将第一条指令改为 NOP,
+                    //   然后在 slot0 中预设 1.
+                    //   但 NOP 不一定是 opcode 0...
+                    //
+                    // 最终策略: 尝试 3 种修改方式, 看哪种有效:
+                    // 1) 将 codes[4] 设为 1 (LdcVarConst_1.src = 1)
+                    // 2) 替换整个第一条指令 — 如果第一条指令的 opcode 是 InitLocals,
+                    //    用第二条指令的 opcode(RetVar) 替换它, 这样第一条变成
+                    //    "return ret_slot", 但 ret_slot 中可能有垃圾值...
+                    //    不安全, 不用这种.
+                    // 3) 将 interpData 设为 NULL + 设 isInterpterImpl=1,
+                    //    让 PREPARE_NEW_FRAME_FROM_INTERPRETER 重新 Transform.
+                    //    但 Transform 从原始 IL 生成, 仍是 false. 不用.
+                    //
+                    // 选择方案 1: 直接修改 codes[4] = 0x01
+                    // 无论当前值是什么, 都设为 1.
+                    // 如果这是 InitLocals 的 size 字段, 改成 1 也不会崩溃(只是初始化更少内存).
+                    // 如果这是 LdcVarConst_1 的 src 字段, 那就完美 → return true.
+                    
+                    c[4] = 0x01;  // 设常量值/大小为 1
+                    
+                    LOGI("[dlc] v6.30 %s AFTER  codes[0-15]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
+                         mname, c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],c[14],c[15]);
+                    LOGI("[dlc] ★ v6.30 %s IR codes PATCHED: byte[4] set to 0x01 (was 0x%02x)", mname, orig_codes[4]);
+                } else {
+                    LOGW("[dlc] v6.30 %s: codes pointer invalid (%p), skipping IR patch", mname, codes_ptr);
                 }
-                // 额外 dump +0x40 到 +0x58 (可能的扩展字段)
-                for (int di = 8; di < 12; di++) {
-                    uintptr_t val = *(uintptr_t*)(imi + di * 8);
-                    LOGI("[dlc]   +0x%02x: 0x%016lx", di * 8, (unsigned long)val);
-                }
-                // 尝试 +0x08 作为 codes (MHP 可能在 +0x00 放了 method 回指)
-                void *maybe_codes = (void*)*(uintptr_t*)(imi + 0x08);
-                if (maybe_codes && (uintptr_t)maybe_codes > 0x1000) {
-                    uint8_t *c = (uint8_t*)maybe_codes;
-                    LOGI("[dlc] v6.29.1 possible codes@+0x08=%p:", maybe_codes);
-                    LOGI("[dlc]   [0-15]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
-                         c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],c[14],c[15]);
-                    LOGI("[dlc]   [16-31]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
-                         c[16],c[17],c[18],c[19],c[20],c[21],c[22],c[23],c[24],c[25],c[26],c[27],c[28],c[29],c[30],c[31]);
-                }
-                // 也试 +0x18 作为 codes
-                void *maybe_codes2 = (void*)*(uintptr_t*)(imi + 0x18);
-                if (maybe_codes2 && (uintptr_t)maybe_codes2 > 0x1000 
-                    && maybe_codes2 != (void*)f[10] && maybe_codes2 != mi) {
-                    uint8_t *c = (uint8_t*)maybe_codes2;
-                    LOGI("[dlc] v6.29.1 possible codes@+0x18=%p:", maybe_codes2);
-                    LOGI("[dlc]   [0-15]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
-                         c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],c[14],c[15]);
-                }
+            } else {
+                LOGI("[dlc] v6.30 %s: no interpData, IR patch skipped", mname);
             }
             
             // v6.29: f[11]/f[12] 指向桥接函数 (供 CallNativeStatic 路径使用)
@@ -2019,13 +2076,26 @@ static int do_unlock_all_dlc(void) {
             f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
             f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
             // f[2] = name → 不动!
-            // v6.29: 保留 interpData (不清 f[10]), 让解释器执行原始 IL
+            // v6.30: 同样修改 IR codes
+            if (f[10]) {
+                uint8_t *imi_raw = (uint8_t*)f[10];
+                void *codes_ptr = (void*)*(uintptr_t*)(imi_raw + 0x08);
+                if (codes_ptr && (uintptr_t)codes_ptr > 0x1000) {
+                    uint8_t *c = (uint8_t*)codes_ptr;
+                    uintptr_t codes_page = (uintptr_t)codes_ptr & ~(uintptr_t)0xFFF;
+                    mprotect((void *)codes_page, 0x2000, PROT_READ | PROT_WRITE);
+                    LOGI("[dlc] v6.30 extra %s BEFORE codes[0-7]: %02x%02x %02x%02x %02x%02x %02x%02x",
+                         extra_proto_methods[ep], c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7]);
+                    c[4] = 0x01;  // patch constant value
+                    LOGI("[dlc] ★ v6.30 extra %s IR codes PATCHED: byte[4]=0x01", extra_proto_methods[ep]);
+                }
+            }
             f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // methodPointerCallByInterp
             f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // virtualMethodPointerCallByInterp
             // v6.29: set bit4 + clear bit5
             uint8_t *bf = (uint8_t *)mi + 0x4B;
             *bf = (*bf | (1 << 4)) & ~(1 << 5);
-            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.29) bf=0x%02x interpData=%p MI=%p",
+            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.30) bf=0x%02x interpData=%p MI=%p",
                  extra_proto_methods[ep], pc_found, *bf, (void*)f[10], mi);
             patched++;
         }
@@ -2546,7 +2616,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.29 complete (patched=%d/16, real=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.30 complete (patched=%d/16, real=%d/16, mi_hooks=%d) =====",
          unlocked_count, real_unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

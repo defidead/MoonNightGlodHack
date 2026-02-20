@@ -1834,13 +1834,13 @@ static int do_unlock_all_dlc(void) {
                 continue;
             }
             
-            LOGI("[dlc] BEFORE %s: ptr=%p virt=%p inv=%p interp=%p MI=%p",
-                 mname, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[11], mi);
+            LOGI("[dlc] BEFORE %s: mPtr=%p inv=%p name=%p interpData=%p MI=%p",
+                 mname, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[10], mi);
             
             // 设置页面可写
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
-            uintptr_t page_end = ((uintptr_t)mi + 0x70) & ~(uintptr_t)0xFFF;  // MI=112 bytes=0x70
+            uintptr_t page_end = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;  // MI=104 bytes=0x68 (Unity 2020)
             if (page_end != page)
                 mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
             
@@ -1848,56 +1848,55 @@ static int do_unlock_all_dlc(void) {
             if (strcmp(mname, "isUnlockRole") == 0 && g_orig_isUnlockRole_ptr == 0)
                 g_orig_isUnlockRole_ptr = f[0];
             
-            // ===== v6.12: 使用正确的 MethodInfo 字段偏移 =====
-            // MethodInfo layout (ARM64, 112 bytes = 0x70):
+            // ===== v6.14: Unity 2020 MethodInfo 字段偏移 (无 virtualMethodPointer!) =====
+            // Unity 2020.3.49f1c1 MethodInfo layout (ARM64, 104 bytes = 0x68, 13 qwords):
             //   f[0]  = 0x00: methodPointer
-            //   f[1]  = 0x08: virtualMethodPointer
-            //   f[2]  = 0x10: invoker_method
-            //   f[3]  = 0x18: name
-            //   f[4]  = 0x20: klass
-            //   f[5]  = 0x28: return_type
-            //   f[6]  = 0x30: parameters
-            //   f[7]  = 0x38: rgctx_data/methodMetadataHandle
-            //   f[8]  = 0x40: genericMethod/genericContainerHandle
-            //   f[9]  = 0x48: token(4) + flags(2) + iflags(2)
-            //   f[10] = 0x50: slot(2) + params_count(1) + bitfield(1) + padding(4)
-            //                 bitfield: is_generic:1, is_inflated:1, wrapper_type:1,
-            //                           has_full_generic_sharing_signature:1,
-            //                           initInterpCallMethodPointer:1, isInterpterImpl:1
-            //   f[11] = 0x58: interpData (InterpMethodInfo*)
-            //   f[12] = 0x60: methodPointerCallByInterp
-            //   f[13] = 0x68: virtualMethodPointerCallByInterp
+            //   f[1]  = 0x08: invoker_method          ← Unity 2020 没有 virtualMethodPointer!
+            //   f[2]  = 0x10: name
+            //   f[3]  = 0x18: klass
+            //   f[4]  = 0x20: return_type
+            //   f[5]  = 0x28: parameters
+            //   f[6]  = 0x30: rgctx_data/methodMetadataHandle
+            //   f[7]  = 0x38: genericMethod/genericContainerHandle
+            //   f[8]  = 0x40: token(4) + flags(2) + iflags(2)
+            //   f[9]  = 0x48: slot(2) + params_count(1) + bitfield(1) + padding(4)
+            //                 bitfield byte at 0x4B:
+            //                   bit0: is_generic, bit1: is_inflated, bit2: wrapper_type,
+            //                   bit3: is_marshaled_from_native,
+            //                   bit4: initInterpCallMethodPointer, bit5: isInterpterImpl
+            //   f[10] = 0x50: interpData (InterpMethodInfo*)   [HybridCLR]
+            //   f[11] = 0x58: methodPointerCallByInterp        [HybridCLR]
+            //   f[12] = 0x60: virtualMethodPointerCallByInterp [HybridCLR]
             
             // f[0] methodPointer → 我们的 C 函数（直接调用路径）
             f[0] = (uintptr_t)custom_return_true_method;
-            // f[1] virtualMethodPointer → 同上（虚调用路径）
-            f[1] = (uintptr_t)custom_return_true_method;
-            // f[2] invoker_method → 自定义 invoker (il2cpp_runtime_invoke 走这里)
-            f[2] = (uintptr_t)custom_bool_true_invoker;
-            // f[11] interpData → NULL (清除 IL 字节码，让解释器不再解释)
-            f[11] = 0;
-            // f[12] methodPointerCallByInterp → 我们的 C 函数（HybridCLR 解释器调用原生方法走这里）
+            // f[1] invoker_method → 自定义 invoker (il2cpp_runtime_invoke 走这里)
+            f[1] = (uintptr_t)custom_bool_true_invoker;
+            // f[2] = name → 不动!
+            // f[10] interpData → NULL (清除 IL 字节码，让解释器不再解释)
+            f[10] = 0;
+            // f[11] methodPointerCallByInterp → 我们的 C 函数（HybridCLR 解释器调用原生方法走这里）
+            f[11] = (uintptr_t)custom_return_true_method;
+            // f[12] virtualMethodPointerCallByInterp → 同上
             f[12] = (uintptr_t)custom_return_true_method;
-            // f[13] virtualMethodPointerCallByInterp → 同上
-            f[13] = (uintptr_t)custom_return_true_method;
             
-            // 修改 offset 0x53 的 bitfield：
+            // 修改 offset 0x4B 的 bitfield（Unity 2020 位于 f[9] 的第3字节）:
             //   清除 isInterpterImpl (bit 5) → 告诉 HybridCLR 这不再是解释器方法
             //   设置 initInterpCallMethodPointer (bit 4) → 防止重新初始化
-            uint8_t *bitfield = (uint8_t *)mi + 0x53;
+            uint8_t *bitfield = (uint8_t *)mi + 0x4B;
             *bitfield = (*bitfield & ~(1 << 5)) | (1 << 4);
             
-            LOGI("[dlc] ★ %s PATCHED: ptr=%p virt=%p inv=%p interpData=0 MI=%p bf=0x%02x",
-                 mname, (void*)f[0], (void*)f[1], (void*)f[2], mi, *((uint8_t *)mi + 0x53));
+            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p interpData=0 mPtrByInterp=%p MI=%p bf=0x%02x",
+                 mname, (void*)f[0], (void*)f[1], mi, (void*)f[11], *((uint8_t *)mi + 0x4B));
             
-            // v6.12: dump 完整 MI 结构用于调试
+            // v6.14: dump 完整 MI 结构用于调试 (Unity 2020 layout)
             if (strcmp(mname, "isUnlockRole") == 0 || strcmp(mname, "isUnlockByItem") == 0) {
-                LOGI("[dlc] MI-DUMP %s: f[0]mPtr=%p f[1]vPtr=%p f[2]inv=%p f[3]name=%p f[4]klass=%p",
-                     mname, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[3], (void*)f[4]);
-                LOGI("[dlc] MI-DUMP %s: f[9]tok+fl=%p f[10]slot+pc+bf=%p",
-                     mname, (void*)f[9], (void*)f[10]);
-                LOGI("[dlc] MI-DUMP %s: f[11]interpData=%p f[12]mPtrByInterp=%p f[13]vPtrByInterp=%p",
-                     mname, (void*)f[11], (void*)f[12], (void*)f[13]);
+                LOGI("[dlc] MI-DUMP %s: f[0]mPtr=%p f[1]inv=%p f[2]name=%p f[3]klass=%p",
+                     mname, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[3]);
+                LOGI("[dlc] MI-DUMP %s: f[8]tok+fl=%p f[9]slot+pc+bf=%p bf@0x4B=0x%02x",
+                     mname, (void*)f[8], (void*)f[9], *((uint8_t*)mi + 0x4B));
+                LOGI("[dlc] MI-DUMP %s: f[10]interpData=%p f[11]mPtrByInterp=%p f[12]vPtrByInterp=%p",
+                     mname, (void*)f[10], (void*)f[11], (void*)f[12]);
             }
             
             patched++;
@@ -1927,23 +1926,23 @@ static int do_unlock_all_dlc(void) {
                 continue;
             }
             int pc_found = fn_method_get_param_count ? fn_method_get_param_count(mi) : -1;
-            LOGI("[dlc] BEFORE ProtoLogin.%s(%d): ptr=%p virt=%p inv=%p interp=%p MI=%p",
-                 extra_proto_methods[ep], pc_found, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[11], mi);
+            LOGI("[dlc] BEFORE ProtoLogin.%s(%d): mPtr=%p inv=%p name=%p interpData=%p MI=%p",
+                 extra_proto_methods[ep], pc_found, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[10], mi);
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
-            uintptr_t page_end = ((uintptr_t)mi + 0x70) & ~(uintptr_t)0xFFF;  // MI=112 bytes
+            uintptr_t page_end = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;  // MI=104 bytes (Unity 2020)
             if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
-            // v6.12: 使用正确的 MethodInfo 字段偏移
-            f[0] = (uintptr_t)custom_return_true_method;   // methodPointer
-            f[1] = (uintptr_t)custom_return_true_method;   // virtualMethodPointer
-            f[2] = (uintptr_t)custom_bool_true_invoker;    // invoker_method
-            f[11] = 0;                                      // interpData = NULL
-            f[12] = (uintptr_t)custom_return_true_method;  // methodPointerCallByInterp
-            f[13] = (uintptr_t)custom_return_true_method;  // virtualMethodPointerCallByInterp
-            // 修改 bitfield: 清除 isInterpterImpl, 设置 initInterpCallMethodPointer
-            uint8_t *bf = (uint8_t *)mi + 0x53;
+            // v6.14: Unity 2020 MethodInfo 字段偏移 (无 virtualMethodPointer!)
+            f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
+            f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
+            // f[2] = name → 不动!
+            f[10] = 0;                                       // interpData = NULL (0x50)
+            f[11] = (uintptr_t)custom_return_true_method;   // methodPointerCallByInterp (0x58)
+            f[12] = (uintptr_t)custom_return_true_method;   // virtualMethodPointerCallByInterp (0x60)
+            // 修改 bitfield @ 0x4B: 清除 isInterpterImpl, 设置 initInterpCallMethodPointer
+            uint8_t *bf = (uint8_t *)mi + 0x4B;
             *bf = (*bf & ~(1 << 5)) | (1 << 4);
-            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (by name lookup) MI=%p", extra_proto_methods[ep], pc_found, mi);
+            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (by name lookup) MI=%p bf=0x%02x", extra_proto_methods[ep], pc_found, mi, *((uint8_t *)mi + 0x4B));
             patched++;
         }
         
@@ -1990,24 +1989,24 @@ static int do_unlock_all_dlc(void) {
             }
             
             uintptr_t *f = (uintptr_t *)mi;
-            LOGI("[dlc] BEFORE %s.%s: ptr=%p virt=%p inv=%p interp=%p",
+            LOGI("[dlc] BEFORE %s.%s: mPtr=%p inv=%p name=%p interpData=%p",
                  extra_patches[e].cls_name, extra_patches[e].method_name,
-                 (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[11]);
+                 (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[10]);
             
             uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
             mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
-            uintptr_t pe = ((uintptr_t)mi + 0x70) & ~(uintptr_t)0xFFF;  // MI=112 bytes
+            uintptr_t pe = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;  // MI=104 bytes (Unity 2020)
             if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
             
-            // v6.12: 使用正确的 MethodInfo 字段偏移
+            // v6.14: Unity 2020 MethodInfo 字段偏移 (无 virtualMethodPointer!)
             f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
-            f[1]  = (uintptr_t)custom_return_true_method;   // virtualMethodPointer
-            f[2]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method
-            f[11] = 0;                                       // interpData = NULL
-            f[12] = (uintptr_t)custom_return_true_method;   // methodPointerCallByInterp
-            f[13] = (uintptr_t)custom_return_true_method;   // virtualMethodPointerCallByInterp
-            // 修改 bitfield: 清除 isInterpterImpl, 设置 initInterpCallMethodPointer
-            uint8_t *bf2 = (uint8_t *)mi + 0x53;
+            f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
+            // f[2] = name → 不动!
+            f[10] = 0;                                       // interpData = NULL (0x50)
+            f[11] = (uintptr_t)custom_return_true_method;   // methodPointerCallByInterp (0x58)
+            f[12] = (uintptr_t)custom_return_true_method;   // virtualMethodPointerCallByInterp (0x60)
+            // 修改 bitfield @ 0x4B: 清除 isInterpterImpl, 设置 initInterpCallMethodPointer
+            uint8_t *bf2 = (uint8_t *)mi + 0x4B;
             *bf2 = (*bf2 & ~(1 << 5)) | (1 << 4);
             
             LOGI("[dlc] ★ %s.%s PATCHED", extra_patches[e].cls_name, extra_patches[e].method_name);

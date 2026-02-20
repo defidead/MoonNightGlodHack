@@ -1929,7 +1929,7 @@ static int do_unlock_all_dlc(void) {
             {"PurchaseShopConfig",        "", "IsUnlockByExtra",    1},
             {"PurchaseRedConfig",         "", "IsUnlockAll",        1},
             {"PackageSystem",             "", "IsUnlockAnyDlc",     1},
-            {"PackageSystem",             "", "get_IsAllComplete",  0},
+            // v6.9: 移除 get_IsAllComplete - 让未下载的包正确显示"需要下载"而非崩溃
             {"PurchasePocketPanel",       "", "isUnlock",            1},
         };
         int num_extra = sizeof(extra_patches) / sizeof(extra_patches[0]);
@@ -1980,100 +1980,10 @@ static int do_unlock_all_dlc(void) {
         // 这些不是 unlock 检查，返回 true 会导致游戏逻辑错误和崩溃
         LOGI("[dlc] v6.8.1: Skipping brute-force class patches (caused crash via IsDownloading/IsFilterItem/etc)");
         
-        // ===== 6b3) v6.8: PackageSystem 状态修复 =====
-        // 设置 PackageSystem.allComplete = true (offset 0x29)
-        // 并且设置所有 PackageData.stateEnum = Complete (7)
-        {
-            Il2CppClass pkg_sys_cls = fn_class_from_name(g_csharp_image, "", "PackageSystem");
-            if (pkg_sys_cls) {
-                Il2CppMethodInfo m_pkgInst = fn_class_get_method_from_name(pkg_sys_cls, "get_Instance", 0);
-                if (m_pkgInst) {
-                    void *exc3 = NULL;
-                    void *pkg_inst = NULL;
-                    install_sigsegv_handler();
-                    g_in_safe_access = 1;
-                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                        pkg_inst = fn_runtime_invoke(m_pkgInst, NULL, NULL, &exc3);
-                    }
-                    g_in_safe_access = 0;
-                    uninstall_sigsegv_handler();
-                    
-                    if (pkg_inst && !exc3) {
-                        // unbox if needed (静态属性返回的可能是对象引用)
-                        uintptr_t pkg_addr = (uintptr_t)pkg_inst;
-                        // 检查是否是 boxed object（有 klass 指针）
-                        install_sigsegv_handler();
-                        g_in_safe_access = 1;
-                        if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                            uint8_t *p = (uint8_t *)pkg_addr;
-                            uint8_t old_allComplete = p[0x29];
-                            uint8_t old_startUpdate = p[0x28];
-                            LOGI("[dlc] v6.8: PackageSystem instance=%p startUpdate=%d allComplete=%d",
-                                 pkg_inst, old_startUpdate, old_allComplete);
-                            
-                            // 设置 allComplete = true
-                            p[0x29] = 1;
-                            p[0x28] = 1;  // startUpdate also true
-                            LOGI("[dlc] v6.8: ★ PackageSystem.allComplete = 1, startUpdate = 1");
-                            
-                            // 读取 _packageDatas 字典
-                            uintptr_t pkg_datas = *(uintptr_t *)(p + 0x10);
-                            LOGI("[dlc] v6.8: PackageSystem._packageDatas = %p", (void*)pkg_datas);
-                            
-                            if (pkg_datas) {
-                                // Dictionary<int,PackageData> 内部结构:
-                                // [0x10]=buckets, [0x18]=entries, [0x20]=count, ...
-                                // entries 是 Entry[] 数组，每个 Entry: hashCode(4) + next(4) + key(4) + value(ptr)
-                                int32_t dict_count = *(int32_t *)((uint8_t *)pkg_datas + 0x20);
-                                uintptr_t entries = *(uintptr_t *)((uint8_t *)pkg_datas + 0x18);
-                                LOGI("[dlc] v6.8: _packageDatas count=%d entries=%p", dict_count, (void*)entries);
-                                
-                                if (entries && dict_count > 0 && dict_count < 50) {
-                                    // Il2CppArray header: [0x00]=klass, [0x08]=monitor, [0x10]=bounds, [0x18]=max_length, [0x20]=data start
-                                    uint8_t *entry_base = (uint8_t *)entries + 0x20;
-                                    // Each Entry in Dictionary<int,PackageData>:
-                                    // struct { int hashCode; int next; int key; PackageData* value; }
-                                    // 在 64 位上: hashCode(4) + next(4) + key(4) + padding(4) + value(8) = 24 bytes
-                                    int entry_size = 24;  // 4+4+4+4+8 = 24 on ARM64
-                                    
-                                    for (int di = 0; di < dict_count && di < 20; di++) {
-                                        uint8_t *e = entry_base + di * entry_size;
-                                        int32_t ekey = *(int32_t *)(e + 8);  // key offset after hashCode+next
-                                        uintptr_t eval = *(uintptr_t *)(e + 16);  // value offset
-                                        
-                                        if (!eval) continue;
-                                        
-                                        // PackageData fields:
-                                        // [0x10] PackageEnum, [0x14] stateEnum, [0x30] downloadState
-                                        int32_t pkg_enum = *(int32_t *)((uint8_t *)eval + 0x10);
-                                        int32_t state_enum = *(int32_t *)((uint8_t *)eval + 0x14);
-                                        int32_t dl_state = *(int32_t *)((uint8_t *)eval + 0x30);
-                                        
-                                        LOGI("[dlc] v6.8: PackageData[%d]: key=%d PackageEnum=%d stateEnum=%d downloadState=%d",
-                                             di, ekey, pkg_enum, state_enum, dl_state);
-                                        
-                                        // 设置 stateEnum = 7 (Complete)
-                                        if (state_enum != 7) {
-                                            *(int32_t *)((uint8_t *)eval + 0x14) = 7;  // Complete
-                                            LOGI("[dlc] v6.8: ★ PackageData[%d] stateEnum: %d → 7 (Complete)", di, state_enum);
-                                        }
-                                        // 设置 downloadState = 0 (ToBeDownload = idle/done)
-                                        if (dl_state != 0) {
-                                            *(int32_t *)((uint8_t *)eval + 0x30) = 0;
-                                            LOGI("[dlc] v6.8: ★ PackageData[%d] downloadState: %d → 0", di, dl_state);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        g_in_safe_access = 0;
-                        uninstall_sigsegv_handler();
-                    } else {
-                        LOGI("[dlc] v6.8: PackageSystem.get_Instance() returned NULL or exception");
-                    }
-                }
-            }
-        }
+        // ===== 6b3) v6.9: 移除 PackageSystem 状态修复 =====
+        // v6.8 把未下载包设为 Complete(7) 导致游戏加载不存在的资源崩溃
+        // 现在让包的真实下载状态保持不变，游戏会正确显示"需要下载"
+        LOGI("[dlc] v6.9: Skipping PackageSystem state fix (caused crash loading missing assets)");
         
         // ===== 6c) 直接设置 EditorSetting.isUnlockAll 字段 =====
         // EditorSettingExtension 有静态字段 mInstance，通过它获取 EditorSetting 实例

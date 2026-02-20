@@ -1652,6 +1652,29 @@ static int do_unlock_all_dlc(void) {
         }
         g_in_safe_access = 0;
         uninstall_sigsegv_handler();
+        
+        // 打印 hs_source 的实际类名
+        if (hashset_klass && fn_class_get_name) {
+            const char *hs_name = fn_class_get_name((Il2CppClass)hashset_klass);
+            const char *hs_ns = fn_class_get_namespace ? fn_class_get_namespace((Il2CppClass)hashset_klass) : "";
+            LOGI("[dlc] hs_source (%p) actual class: %s.%s (klass=%p)", 
+                 (void*)hs_source, hs_ns ? hs_ns : "", hs_name ? hs_name : "?", (void*)hashset_klass);
+        }
+        // 也打印 mDLCSet/packAll/baseRoles 的类名
+        if (fn_class_get_name && fn_object_get_class) {
+            if (mDLCSet) {
+                Il2CppClass k = fn_object_get_class((Il2CppObject)mDLCSet);
+                LOGI("[dlc] mDLCSet class: %s", k ? fn_class_get_name(k) : "?");
+            }
+            if (packAll && packAll != mDLCSet) {
+                Il2CppClass k = fn_object_get_class((Il2CppObject)packAll);
+                LOGI("[dlc] packAll class: %s", k ? fn_class_get_name(k) : "?");
+            }
+            if (baseRoles) {
+                Il2CppClass k = fn_object_get_class((Il2CppObject)baseRoles);
+                LOGI("[dlc] BaseRoles class: %s", k ? fn_class_get_name(k) : "?");
+            }
+        }
     }
     
     Il2CppMethodInfo m_hs_add = NULL, m_hs_contains = NULL, m_hs_count = NULL, m_hs_ctor = NULL;

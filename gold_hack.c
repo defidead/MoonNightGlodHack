@@ -1816,9 +1816,11 @@ static int do_unlock_all_dlc(void) {
         
         // v6.3: 用方法迭代 patch ProtoLogin 所有匹配方法（解决同名方法多个重载只 patch 第一个的问题）
         // 只 patch 返回 bool 的方法名
+        // v6.16: 只保留核心解锁方法，移除 IsDLCRole/IsUnlockByFirstGame/IsUnlockGuBao
+        // IsDLCRole: 标识角色是否为DLC角色，强制true会让免费角色也变成DLC角色
+        // IsUnlockByFirstGame/IsUnlockGuBao: 可能影响游戏内其他功能按钮
         const char *safe_method_names[] = {
-            "isUnlockRole", "IsDLCRole", "IsUnlockAllDLC",
-            "IsUnlockByFirstGame", "IsUnlockGuBao",
+            "isUnlockRole", "IsUnlockAllDLC",
         };
         int num_safe = sizeof(safe_method_names) / sizeof(safe_method_names[0]);
         int patched = 0;
@@ -1920,9 +1922,12 @@ static int do_unlock_all_dlc(void) {
         // v6.8 FIX: 之前只尝试 param_count=0,1，导致 2 参数方法(isUnlockByItem, 
         // IsUnlockByGameId, IsUnlockByGameIds) 未被找到！现在尝试 0-3 参数。
         // 新增 isUnlockByItem — 这是 UI 直接调用的关键方法！
-        const char *extra_proto_methods[] = {"IsDianCang", "IsOldPlayer", "isUnlockDLC", 
-                                              "IsBoughtAllItems", "IsUnlockByGameId", "IsUnlockByGameIds",
-                                              "isUnlockByItem"};
+        // v6.16: 精简列表 — 移除 IsOldPlayer/IsBoughtAllItems/IsUnlockByGameId/IsUnlockByGameIds/isUnlockByItem
+        // IsOldPlayer: 改变玩家身份标识，影响游戏行为
+        // IsBoughtAllItems: 让游戏认为所有物品已购买，隐藏购买按钮
+        // IsUnlockByGameId/s: 可能影响特定游戏功能判断
+        // isUnlockByItem: 物品解锁判断，强制true可能影响物品系统
+        const char *extra_proto_methods[] = {"IsDianCang", "isUnlockDLC"};
         int num_extra_proto = sizeof(extra_proto_methods) / sizeof(extra_proto_methods[0]);
         for (int ep = 0; ep < num_extra_proto; ep++) {
             // v6.8: 尝试 0-3 参数（修复之前只尝试 0,1 的 BUG）
@@ -1966,67 +1971,14 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6.8.1: Skipping brute-force ProtoLogin patch (caused crash via IsValidGameItem)");
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6.8.1 full MethodInfo patch complete! %d ProtoLogin methods patched", patched);
+        LOGI("[dlc] v6.16 MethodInfo patch complete! %d ProtoLogin methods patched (minimal safe set)", patched);
         
-        // ===== 6b) Patch 其他 DLC 检查类的方法 =====
-        // 添加回安全的 1-param/0-param bool 返回方法
-        struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } extra_patches[] = {
-            {"EditorSettingExtension",    "", "get_isUnlockAll",    0},
-            {"PurchaseUtils",             "", "IsUnlockDianCang",   1},
-            {"PurchaseRedPanel",          "", "IsUnlockAllDLC",     1},
-            {"PurchaseFriendHelpComponent","", "IsUnlockAll",       0},
-            {"PurchaseShopConfig",        "", "IsUnlockAll",        1},
-            {"PurchaseShopConfig",        "", "IsUnlockByExtra",    1},
-            {"PurchaseRedConfig",         "", "IsUnlockAll",        1},
-            {"PackageSystem",             "", "IsUnlockAnyDlc",     1},
-            // v6.9: 移除 get_IsAllComplete - 让未下载的包正确显示"需要下载"而非崩溃
-            {"PurchasePocketPanel",       "", "isUnlock",            1},
-        };
-        int num_extra = sizeof(extra_patches) / sizeof(extra_patches[0]);
-        int extra_patched = 0;
-        
-        LOGI("[dlc] ===== Patching extra unlock check classes =====");
-        for (int e = 0; e < num_extra; e++) {
-            Il2CppClass cls = fn_class_from_name(g_csharp_image, 
-                extra_patches[e].ns, extra_patches[e].cls_name);
-            if (!cls) {
-                LOGI("[dlc] Class %s not found, skip", extra_patches[e].cls_name);
-                continue;
-            }
-            Il2CppMethodInfo mi = fn_class_get_method_from_name(
-                cls, extra_patches[e].method_name, extra_patches[e].param_count);
-            if (!mi) {
-                LOGI("[dlc] %s.%s(%d) method not found, skip",
-                     extra_patches[e].cls_name, extra_patches[e].method_name,
-                     extra_patches[e].param_count);
-                continue;
-            }
-            
-            uintptr_t *f = (uintptr_t *)mi;
-            LOGI("[dlc] BEFORE %s.%s: mPtr=%p inv=%p name=%p interpData=%p",
-                 extra_patches[e].cls_name, extra_patches[e].method_name,
-                 (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[10]);
-            
-            uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
-            mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
-            uintptr_t pe = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;  // MI=104 bytes (Unity 2020)
-            if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
-            
-            // v6.14: Unity 2020 MethodInfo 字段偏移 (无 virtualMethodPointer!)
-            f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
-            f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
-            // f[2] = name → 不动!
-            f[10] = 0;                                       // interpData = NULL (0x50)
-            f[11] = 0;                                       // methodPointerCallByInterp = NULL (0x58) 必须0!
-            f[12] = 0;                                       // virtualMethodPointerCallByInterp = NULL (0x60)
-            // 修改 bitfield @ 0x4B: 清除 isInterpterImpl, 设置 initInterpCallMethodPointer
-            uint8_t *bf2 = (uint8_t *)mi + 0x4B;
-            *bf2 = (*bf2 & ~(1 << 5)) | (1 << 4);
-            
-            LOGI("[dlc] ★ %s.%s PATCHED", extra_patches[e].cls_name, extra_patches[e].method_name);
-            extra_patched++;
-        }
-        LOGI("[dlc] Extra class patches: %d/%d done", extra_patched, num_extra);
+        // ===== 6b) v6.16: 不再 Patch Purchase*/PackageSystem 类 =====
+        // v6.15 patch 了 PurchaseShopConfig.IsUnlockAll, PurchaseRedPanel.IsUnlockAllDLC,
+        // PurchasePocketPanel.isUnlock, PurchaseFriendHelpComponent.IsUnlockAll 等方法，
+        // 导致游戏商店/面板 UI 逻辑混乱，大部分功能按键无法使用。
+        // 正确做法：只 patch ProtoLogin 的核心解锁方法，让 UI 类用原始逻辑运行。
+        LOGI("[dlc] v6.16: Skipping Purchase*/PackageSystem class patches (caused button malfunction)");
         
         // ===== 6b2) v6.8.1: 不再暴力 patch 其他类 =====
         // v6.8 暴力 patch 了 IsDownloading, IsPreDownload, IsFilterItem, IsOnlyContainPvPShop 等
@@ -2392,7 +2344,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.8.1 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.16 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

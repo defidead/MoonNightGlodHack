@@ -1765,33 +1765,39 @@ static int do_unlock_all_dlc(void) {
     if (!g_mi_hooks_installed && g_boolean_class && fn_object_new) {
         init_dlc_stubs();
         
-        // 收集所有需要 patch 的方法（只保留确定返回 bool 的方法）
-        // 注意：不要 patch 2 参数方法（isUnlockByItem/IsUnlockByGameId/IsUnlockByGameIds）
-        // 它们的返回类型不确定，强行返回 1 可能被当作指针崩溃
-        struct { const char *name; int param_count; } patch_targets[] = {
-            {"isUnlockRole",       1},
-            {"IsDLCRole",          1},
-            {"IsUnlockAllDLC",     1},
-            {"IsUnlockByFirstGame",1},
-            {"IsUnlockGuBao",      0},
+        // v6.3: 用方法迭代 patch ProtoLogin 所有匹配方法（解决同名方法多个重载只 patch 第一个的问题）
+        // 只 patch 返回 bool 的方法名
+        const char *safe_method_names[] = {
+            "isUnlockRole", "IsDLCRole", "IsUnlockAllDLC",
+            "IsUnlockByFirstGame", "IsUnlockGuBao",
         };
-        int num_targets = sizeof(patch_targets) / sizeof(patch_targets[0]);
+        int num_safe = sizeof(safe_method_names) / sizeof(safe_method_names[0]);
         int patched = 0;
         
-        for (int t = 0; t < num_targets; t++) {
-            Il2CppMethodInfo mi = fn_class_get_method_from_name(
-                g_proto_login_cls, patch_targets[t].name, patch_targets[t].param_count);
-            if (!mi) {
-                LOGI("[dlc] %s(%d) not found, skip",
-                     patch_targets[t].name, patch_targets[t].param_count);
-                continue;
+        // 迭代 ProtoLogin 类的所有方法
+        void *iter = NULL;
+        Il2CppMethodInfo mi;
+        while ((mi = fn_class_get_methods(g_proto_login_cls, &iter)) != NULL) {
+            const char *mname = fn_method_get_name(mi);
+            if (!mname) continue;
+            
+            // 检查是否在安全方法列表中
+            int found = 0;
+            for (int s = 0; s < num_safe; s++) {
+                if (strcmp(mname, safe_method_names[s]) == 0) { found = 1; break; }
             }
+            if (!found) continue;
             
             uintptr_t *f = (uintptr_t *)mi;
             
-            LOGI("[dlc] BEFORE %s: ptr=%p inv=%p interp=%p flags=0x%x",
-                 patch_targets[t].name, (void*)f[0], (void*)f[1],
-                 (void*)f[10], (int)f[13]);
+            // 跳过已经 patch 过的方法
+            if (f[0] == (uintptr_t)custom_return_true_method) {
+                LOGI("[dlc] %s already patched, skip (MI=%p)", mname, mi);
+                continue;
+            }
+            
+            LOGI("[dlc] BEFORE %s: ptr=%p inv=%p interp=%p flags=0x%x MI=%p",
+                 mname, (void*)f[0], (void*)f[1], (void*)f[10], (int)f[13], mi);
             
             // 设置页面可写
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
@@ -1800,41 +1806,39 @@ static int do_unlock_all_dlc(void) {
             if (page_end != page)
                 mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
             
-            // 保存 isUnlockRole 的原始 methodPointer
-            if (t == 0) g_orig_isUnlockRole_ptr = f[0];
+            // 保存 isUnlockRole 的原始 methodPointer（第一次遇到）
+            if (strcmp(mname, "isUnlockRole") == 0 && g_orig_isUnlockRole_ptr == 0)
+                g_orig_isUnlockRole_ptr = f[0];
             
             // [0] methodPointer → 我们的 C 函数 (解释器内部调用走这里)
             f[0] = (uintptr_t)custom_return_true_method;
-            
             // [1] invoker → 自定义 invoker (il2cpp_runtime_invoke 走这里)
             f[1] = (uintptr_t)custom_bool_true_invoker;
-            
             // [10] interpData → NULL (让解释器不再解释 IL，回退到 methodPointer)
             f[10] = 0;
-            
             // [11],[12] methodPointer 副本也更新
             f[11] = (uintptr_t)custom_return_true_method;
             f[12] = (uintptr_t)custom_return_true_method;
-            
             // [13] 清除 HybridCLR 标志 (0x100)，保留其他 flags
             f[13] = f[13] & ~(uintptr_t)0x100;
-            
             // [15] invoker 副本
             f[15] = (uintptr_t)custom_bool_true_invoker;
             
-            LOGI("[dlc] ★ %s PATCHED: ptr=%p inv=%p interp=0 flags=0x%x",
-                 patch_targets[t].name, (void*)f[0], (void*)f[1], (int)f[13]);
+            LOGI("[dlc] ★ %s PATCHED: ptr=%p inv=%p interp=0 flags=0x%x MI=%p",
+                 mname, (void*)f[0], (void*)f[1], (int)f[13], mi);
             patched++;
         }
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] v6 full MethodInfo patch complete! %d/%d methods patched", patched, num_targets);
+        LOGI("[dlc] v6.3 full MethodInfo patch complete! %d methods patched (iteration)", patched);
         
         // ===== 6b) Patch 其他 DLC 检查类的方法 =====
-        // 只 patch 确定返回 bool 且安全的方法
-        // 不 patch PurchaseShopConfig/AchieveConfig 等 — 返回类型不确定，强行返回 1 会崩溃
+        // 添加回安全的 1-param/0-param bool 返回方法
         struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } extra_patches[] = {
-            {"EditorSettingExtension", "", "get_isUnlockAll",    0},
+            {"EditorSettingExtension",    "", "get_isUnlockAll",    0},
+            {"PurchaseUtils",             "", "IsUnlockDianCang",   1},
+            {"PurchaseRedPanel",          "", "IsUnlockAllDLC",     1},
+            {"PurchaseFriendHelpComponent","", "IsUnlockAll",       0},
         };
         int num_extra = sizeof(extra_patches) / sizeof(extra_patches[0]);
         int extra_patched = 0;

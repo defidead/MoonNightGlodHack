@@ -1877,10 +1877,13 @@ static int do_unlock_all_dlc(void) {
             // f[2] = name → 不动!
             // f[10] interpData → NULL (清除 IL 字节码，让解释器不再解释)
             f[10] = 0;
-            // f[11] methodPointerCallByInterp → 我们的 C 函数（HybridCLR 解释器调用原生方法走这里）
-            f[11] = (uintptr_t)custom_return_true_method;
-            // f[12] virtualMethodPointerCallByInterp → 同上
-            f[12] = (uintptr_t)custom_return_true_method;
+            // f[11] methodPointerCallByInterp → NULL!
+            //   必须为 0! 否则 HybridCLR Runtime::InvokeWithThrow 会走快速路径,
+            //   直接调用 methodPointer 返回 uint8_t=1, 然后作为 void* 返回 0x1,
+            //   不做 Object::Box, 导致 SIGSEGV!
+            f[11] = 0;
+            // f[12] virtualMethodPointerCallByInterp → NULL (同理)
+            f[12] = 0;
             
             // 修改 offset 0x4B 的 bitfield（Unity 2020 位于 f[9] 的第3字节）:
             //   清除 isInterpterImpl (bit 5) → 告诉 HybridCLR 这不再是解释器方法
@@ -1888,8 +1891,8 @@ static int do_unlock_all_dlc(void) {
             uint8_t *bitfield = (uint8_t *)mi + 0x4B;
             *bitfield = (*bitfield & ~(1 << 5)) | (1 << 4);
             
-            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p interpData=0 mPtrByInterp=%p MI=%p bf=0x%02x",
-                 mname, (void*)f[0], (void*)f[1], (void*)f[11], mi, *((uint8_t *)mi + 0x4B));
+            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p interpData=0 mPtrByInterp=0 MI=%p bf=0x%02x",
+                 mname, (void*)f[0], (void*)f[1], mi, *((uint8_t *)mi + 0x4B));
             
             // v6.14: dump 完整 MI 结构用于调试 (Unity 2020 layout)
             if (strcmp(mname, "isUnlockRole") == 0 || strcmp(mname, "isUnlockByItem") == 0) {
@@ -1939,8 +1942,8 @@ static int do_unlock_all_dlc(void) {
             f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
             // f[2] = name → 不动!
             f[10] = 0;                                       // interpData = NULL (0x50)
-            f[11] = (uintptr_t)custom_return_true_method;   // methodPointerCallByInterp (0x58)
-            f[12] = (uintptr_t)custom_return_true_method;   // virtualMethodPointerCallByInterp (0x60)
+            f[11] = 0;                                       // methodPointerCallByInterp = NULL (0x58) 必须0!
+            f[12] = 0;                                       // virtualMethodPointerCallByInterp = NULL (0x60)
             // 修改 bitfield @ 0x4B: 清除 isInterpterImpl, 设置 initInterpCallMethodPointer
             uint8_t *bf = (uint8_t *)mi + 0x4B;
             *bf = (*bf & ~(1 << 5)) | (1 << 4);
@@ -2005,8 +2008,8 @@ static int do_unlock_all_dlc(void) {
             f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
             // f[2] = name → 不动!
             f[10] = 0;                                       // interpData = NULL (0x50)
-            f[11] = (uintptr_t)custom_return_true_method;   // methodPointerCallByInterp (0x58)
-            f[12] = (uintptr_t)custom_return_true_method;   // virtualMethodPointerCallByInterp (0x60)
+            f[11] = 0;                                       // methodPointerCallByInterp = NULL (0x58) 必须0!
+            f[12] = 0;                                       // virtualMethodPointerCallByInterp = NULL (0x60)
             // 修改 bitfield @ 0x4B: 清除 isInterpterImpl, 设置 initInterpCallMethodPointer
             uint8_t *bf2 = (uint8_t *)mi + 0x4B;
             *bf2 = (*bf2 & ~(1 << 5)) | (1 << 4);

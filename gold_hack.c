@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.25"
+#define LOG_TAG "GoldHack v6.26"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -114,7 +114,7 @@ typedef Il2CppClass      (*il2cpp_method_get_class_t)(Il2CppMethodInfo method);
 typedef Il2CppClass      (*il2cpp_object_get_class_t)(Il2CppObject obj);
 typedef Il2CppImage      (*il2cpp_class_get_image_t)(Il2CppClass klass);
 typedef Il2CppClass      (*il2cpp_class_get_parent_t)(Il2CppClass klass);
-// v6.25: 新增 API 用于从字段类型创建 HashSet<int>
+// v6.26: 新增 API 用于从字段类型创建 HashSet<int>
 typedef void*            (*il2cpp_field_get_type_t)(Il2CppFieldInfo field);   // returns Il2CppType*
 typedef Il2CppClass      (*il2cpp_class_from_il2cpp_type_t)(void *type);      // Il2CppType* -> Il2CppClass*
 
@@ -150,7 +150,7 @@ static il2cpp_class_get_image_t            fn_class_get_image = NULL;
 static il2cpp_class_get_parent_t           fn_class_get_parent = NULL;
 static il2cpp_class_get_name_t             fn_class_get_name = NULL;
 static il2cpp_class_get_namespace_t        fn_class_get_namespace = NULL;
-// v6.25
+// v6.26
 static il2cpp_field_get_type_t             fn_field_get_type = NULL;
 static il2cpp_class_from_il2cpp_type_t     fn_class_from_type = NULL;
 
@@ -179,7 +179,7 @@ static ApiEntry g_api_table[] = {
     { "il2cpp_class_get_parent",           (void**)&fn_class_get_parent },
     { "il2cpp_class_get_name",             (void**)&fn_class_get_name },
     { "il2cpp_class_get_namespace",         (void**)&fn_class_get_namespace },
-    // v6.25: 新增 API
+    // v6.26: 新增 API
     { "il2cpp_field_get_type",               (void**)&fn_field_get_type },
     { "il2cpp_class_from_il2cpp_type",       (void**)&fn_class_from_type },
     { NULL, NULL }
@@ -2071,7 +2071,7 @@ static int do_unlock_all_dlc(void) {
         if (unlocked > 0) unlocked_count++;
     }
 
-    // ===== 8) v6.25: 直接操作 mDLCSet (HashSet<int>) =====
+    // ===== 8) v6.26: 直接操作 mDLCSet (HashSet<int>) =====
     // v6.22 的 AddDLC 调用因 SIGSEGV 失败：AddDLC 是 HybridCLR 解释器方法，
     // 其 interpData(f[10])=0 (延迟初始化)，调用时解释器蹦床读 NULL → 崩溃。
     //
@@ -2082,7 +2082,7 @@ static int do_unlock_all_dlc(void) {
     // 4. 通过 il2cpp_class_get_method_from_name 找到原生 Add 方法
     // 5. 调用 Add(dlcId) 填充 mDLCSet — 不经过 HybridCLR 解释器
     {
-        LOGI("[dlc] v6.25: ===== Direct mDLCSet manipulation =====");
+        LOGI("[dlc] v6.26: ===== Direct mDLCSet manipulation =====");
         
         // 读取 mDLCSet 指针 (offset 0x40 from ProtoLogin instance)
         void *dlc_set_obj = NULL;
@@ -2094,13 +2094,13 @@ static int do_unlock_all_dlc(void) {
         g_in_safe_access = 0;
         uninstall_sigsegv_handler();
         
-        LOGI("[dlc] v6.25: mDLCSet @ offset 0x40 = %p", dlc_set_obj);
+        LOGI("[dlc] v6.26: mDLCSet @ offset 0x40 = %p", dlc_set_obj);
 
         if (!dlc_set_obj) {
             // mDLCSet 为空，需要创建 HashSet<int> 实例
-            // v6.25: 通过字段类型信息获取 HashSet<int> 类，而不是从其他字段猜测
+            // v6.26: 通过字段类型信息获取 HashSet<int> 类，而不是从其他字段猜测
             // 策略: 枚举 ProtoLogin 字段 → 找 mDLCSet → 获取其 Il2CppType → 获取 Il2CppClass
-            LOGW("[dlc] v6.25: mDLCSet is NULL, creating via field type info...");
+            LOGW("[dlc] v6.26: mDLCSet is NULL, creating via field type info...");
             
             Il2CppClass hashset_int_cls = NULL;
             
@@ -2115,21 +2115,21 @@ static int do_unlock_all_dlc(void) {
                         if (ftype) {
                             hashset_int_cls = fn_class_from_type(ftype);
                             const char *cname = (hashset_int_cls && fn_class_get_name) ? fn_class_get_name(hashset_int_cls) : "(null)";
-                            LOGI("[dlc] v6.25: mDLCSet field type → class: %s @ %p", cname, hashset_int_cls);
+                            LOGI("[dlc] v6.26: mDLCSet field type → class: %s @ %p", cname, hashset_int_cls);
                         } else {
-                            LOGW("[dlc] v6.25: il2cpp_field_get_type returned NULL for mDLCSet");
+                            LOGW("[dlc] v6.26: il2cpp_field_get_type returned NULL for mDLCSet");
                         }
                         break;
                     }
                 }
             } else {
-                LOGW("[dlc] v6.25: Missing APIs: field_get_type=%p class_from_type=%p",
+                LOGW("[dlc] v6.26: Missing APIs: field_get_type=%p class_from_type=%p",
                      fn_field_get_type, fn_class_from_type);
             }
             
             // 方法2 (备选): 扫描所有 ProtoLogin 字段的非空实例寻找 HashSet
             if (!hashset_int_cls) {
-                LOGI("[dlc] v6.25: Fallback: scanning ProtoLogin fields for HashSet instance...");
+                LOGI("[dlc] v6.26: Fallback: scanning ProtoLogin fields for HashSet instance...");
                 const int scan_offsets[] = {0x58, 0x48, 0x60, 0x68, 0x70, 0x38, 0x50, 0x30};
                 const char *scan_names[] = {"BaseRoles", "mDLCSetInfo", "packAll", "packMagic",
                                             "packClassics", "mRestoreProducts", "mProduct2DLC", "mLoginData"};
@@ -2146,11 +2146,11 @@ static int do_unlock_all_dlc(void) {
                     if (fn_object_get_class) {
                         Il2CppClass fcls = fn_object_get_class(field_obj);
                         const char *cname = (fcls && fn_class_get_name) ? fn_class_get_name(fcls) : "(null)";
-                        LOGI("[dlc] v6.25:   [0x%02x] %s = %p → class: %s",
+                        LOGI("[dlc] v6.26:   [0x%02x] %s = %p → class: %s",
                              scan_offsets[si], scan_names[si], field_obj, cname);
                         if (fcls && strstr(cname, "HashSet")) {
                             hashset_int_cls = fcls;
-                            LOGI("[dlc] v6.25: ★ Found HashSet template from %s!", scan_names[si]);
+                            LOGI("[dlc] v6.26: ★ Found HashSet template from %s!", scan_names[si]);
                         }
                     }
                 }
@@ -2160,18 +2160,18 @@ static int do_unlock_all_dlc(void) {
             if (hashset_int_cls && fn_object_new) {
                 dlc_set_obj = fn_object_new(hashset_int_cls);
                 if (dlc_set_obj) {
-                    LOGI("[dlc] v6.25: Created HashSet<%s> instance @ %p",
+                    LOGI("[dlc] v6.26: Created HashSet<%s> instance @ %p",
                          fn_class_get_name ? fn_class_get_name(hashset_int_cls) : "?", dlc_set_obj);
                     // 调用 .ctor() 初始化
                     Il2CppMethodInfo ctor = fn_class_get_method_from_name(hashset_int_cls, ".ctor", 0);
                     if (ctor) {
                         uintptr_t *cf = (uintptr_t *)ctor;
-                        LOGI("[dlc] v6.25: .ctor MI: f[0]=%p f[10]=%p", (void*)cf[0], (void*)cf[10]);
+                        LOGI("[dlc] v6.26: .ctor MI: f[0]=%p f[10]=%p", (void*)cf[0], (void*)cf[10]);
                         exc = NULL;
                         void *r = NULL;
                         SAFE_INVOKE(r, ctor, dlc_set_obj, NULL, &exc);
                         if (!sigsegv_hit && !exc) {
-                            LOGI("[dlc] v6.25: ★ .ctor() OK, writing to mDLCSet field");
+                            LOGI("[dlc] v6.26: ★ .ctor() OK, writing to mDLCSet field");
                             install_sigsegv_handler();
                             g_in_safe_access = 1;
                             if (sigsetjmp(g_jmpbuf, 1) == 0) {
@@ -2180,11 +2180,11 @@ static int do_unlock_all_dlc(void) {
                             g_in_safe_access = 0;
                             uninstall_sigsegv_handler();
                         } else {
-                            LOGW("[dlc] v6.25: .ctor() FAILED (sigsegv=%d exc=%p)", sigsegv_hit, exc);
+                            LOGW("[dlc] v6.26: .ctor() FAILED (sigsegv=%d exc=%p)", sigsegv_hit, exc);
                             dlc_set_obj = NULL;
                         }
                     } else {
-                        LOGW("[dlc] v6.25: .ctor(0) not found, writing without init");
+                        LOGW("[dlc] v6.26: .ctor(0) not found, writing without init");
                         install_sigsegv_handler();
                         g_in_safe_access = 1;
                         if (sigsetjmp(g_jmpbuf, 1) == 0) {
@@ -2194,158 +2194,168 @@ static int do_unlock_all_dlc(void) {
                         uninstall_sigsegv_handler();
                     }
                 } else {
-                    LOGW("[dlc] v6.25: il2cpp_object_new failed");
+                    LOGW("[dlc] v6.26: il2cpp_object_new failed");
                 }
             } else if (!hashset_int_cls) {
-                LOGW("[dlc] v6.25: Could not determine mDLCSet class type");
+                LOGW("[dlc] v6.26: Could not determine mDLCSet class type");
             }
         }
 
+        // ===== v6.26: DLCSet 字段填充 =====
+        // DLCSet 不是集合类，而是包含 39 个字段的普通对象
+        // 每个字段代表一个具体 DLC (YouXiaDLC, XiuNvDLC, NvWuDLC 等)
+        // 为 NULL 的字段表示该 DLC 未购买
+        // 策略: 遍历所有字段，为每个 NULL 字段创建对应类型的实例
+        
         int direct_add_ok = 0;
-        if (dlc_set_obj && fn_object_get_class) {
-            Il2CppClass hashset_cls = fn_object_get_class(dlc_set_obj);
-            const char *cls_name = (hashset_cls && fn_class_get_name) ? fn_class_get_name(hashset_cls) : "(null)";
-            LOGI("[dlc] v6.25: mDLCSet class = %s @ %p", cls_name, dlc_set_obj);
+        int total_fields = 0, null_fields = 0, created_fields = 0;
+        int first_nonnull_examined = 0;
+        
+        if (dlc_set_obj && fn_object_get_class && fn_class_get_fields && fn_field_get_name
+            && fn_field_get_offset && fn_field_get_type && fn_class_from_type && fn_object_new) {
             
-            // 找 Add 方法 (HashSet<int>.Add(int) → bool)
-            Il2CppMethodInfo add_mi = hashset_cls ? fn_class_get_method_from_name(hashset_cls, "Add", 1) : NULL;
-            if (add_mi) {
-                uintptr_t *af = (uintptr_t *)add_mi;
-                LOGI("[dlc] v6.25: HashSet.Add MI: f[0]=%p f[1]=%p f[10]=%p f[11]=%p MI=%p",
-                     (void *)af[0], (void *)af[1], (void *)af[10], (void *)af[11], add_mi);
+            Il2CppClass dlcset_cls = fn_object_get_class(dlc_set_obj);
+            const char *cls_name = (dlcset_cls && fn_class_get_name) ? fn_class_get_name(dlcset_cls) : "(null)";
+            LOGI("[dlc] v6.26: DLCSet class = %s @ %p, populating all NULL fields...", cls_name, dlc_set_obj);
+            
+            void *fiter = NULL;
+            Il2CppFieldInfo fi;
+            
+            while ((fi = fn_class_get_fields(dlcset_cls, &fiter)) != NULL) {
+                const char *fname = fn_field_get_name(fi);
+                int foff = fn_field_get_offset ? fn_field_get_offset(fi) : -1;
+                if (foff < 16) continue; // skip object header
                 
-                // 检查 Add 是否是原生方法（interpData 应非零，或 f[0] 指向非 HybridCLR 蹦床）
-                int is_native = (af[10] != 0) || (af[0] != af[11]);
-                LOGI("[dlc] v6.25: HashSet.Add is %s (interpData=%p, mPtr==bridge? %s)",
-                     is_native ? "NATIVE ✓" : "HybridCLR ✗",
-                     (void *)af[10], (af[0] == af[11]) ? "yes" : "no");
+                // 获取字段类型
+                void *ftype = fn_field_get_type(fi);
+                if (!ftype) continue;
+                Il2CppClass *fcls = fn_class_from_type(ftype);
+                if (!fcls) continue;
+                const char *tname = fn_class_get_name ? fn_class_get_name(fcls) : "?";
                 
-                // 调用 Add 添加 DLC ID 0-50
-                for (int32_t dlcId = 0; dlcId <= 50; dlcId++) {
-                    void *params[1] = { &dlcId };
+                total_fields++;
+                
+                // 读取当前字段值
+                void *current_val = NULL;
+                install_sigsegv_handler();
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                    current_val = *(void **)((uintptr_t)dlc_set_obj + foff);
+                }
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
+                
+                if (current_val != NULL) {
+                    LOGI("[dlc] v6.26:   %s (off=%d, type=%s): EXISTING %p", fname, foff, tname, current_val);
+                    direct_add_ok++;
+                    
+                    // 检查第一个非空 DLC 子对象的内部结构
+                    if (!first_nonnull_examined && fn_class_get_fields && fn_object_get_class) {
+                        first_nonnull_examined = 1;
+                        Il2CppClass *sub_cls = fn_object_get_class(current_val);
+                        const char *sub_name = (sub_cls && fn_class_get_name) ? fn_class_get_name(sub_cls) : "?";
+                        LOGI("[dlc] v6.26: ===== Examining DLC sub-type: %s =====", sub_name);
+                        
+                        // 枚举子对象的字段
+                        void *siter = NULL;
+                        Il2CppFieldInfo sfi;
+                        while ((sfi = fn_class_get_fields(sub_cls, &siter)) != NULL) {
+                            const char *sfname = fn_field_get_name(sfi);
+                            int sfoff = fn_field_get_offset ? fn_field_get_offset(sfi) : -1;
+                            const char *sftype = "(unknown)";
+                            if (fn_field_get_type && fn_class_from_type) {
+                                void *sft = fn_field_get_type(sfi);
+                                if (sft) {
+                                    Il2CppClass *sfcls = fn_class_from_type(sft);
+                                    if (sfcls && fn_class_get_name) sftype = fn_class_get_name(sfcls);
+                                }
+                            }
+                            // 读取字段值
+                            void *sfval = NULL;
+                            int32_t sfval_int = 0;
+                            install_sigsegv_handler();
+                            g_in_safe_access = 1;
+                            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                                sfval = *(void **)((uintptr_t)current_val + sfoff);
+                                sfval_int = *(int32_t *)((uintptr_t)current_val + sfoff);
+                            }
+                            g_in_safe_access = 0;
+                            uninstall_sigsegv_handler();
+                            LOGI("[dlc] v6.26:     F: %s (off=%d, type=%s, val=%p / int=%d)",
+                                 sfname, sfoff, sftype, sfval, sfval_int);
+                        }
+                        
+                        // 枚举子对象的方法
+                        if (fn_class_get_methods && fn_method_get_name) {
+                            void *miter2 = NULL;
+                            Il2CppMethodInfo m;
+                            while ((m = fn_class_get_methods(sub_cls, &miter2)) != NULL) {
+                                const char *mname = fn_method_get_name(m);
+                                int pc = fn_method_get_param_count ? fn_method_get_param_count(m) : -1;
+                                LOGI("[dlc] v6.26:     M: %s(%d)", mname, pc);
+                            }
+                        }
+                        
+                        // 检查父类
+                        Il2CppClass *sub_parent = fn_class_get_parent ? fn_class_get_parent(sub_cls) : NULL;
+                        if (sub_parent) {
+                            const char *spn = fn_class_get_name ? fn_class_get_name(sub_parent) : "?";
+                            LOGI("[dlc] v6.26:     Parent: %s", spn);
+                        }
+                    }
+                    continue;
+                }
+                
+                null_fields++;
+                
+                // 为 NULL 字段创建实例
+                void *inst = fn_object_new(fcls);
+                if (!inst) {
+                    LOGW("[dlc] v6.26:   %s (off=%d, type=%s): object_new FAILED", fname, foff, tname);
+                    continue;
+                }
+                
+                // 调用 .ctor(0)
+                Il2CppMethodInfo ctor = fn_class_get_method_from_name(fcls, ".ctor", 0);
+                if (ctor) {
                     exc = NULL;
                     void *r = NULL;
-                    SAFE_INVOKE(r, add_mi, dlc_set_obj, params, &exc);
-                    if (sigsegv_hit) {
-                        LOGE("[dlc] v6.25: HashSet.Add(%d) SIGSEGV, stopping", dlcId);
-                        break;
+                    SAFE_INVOKE(r, ctor, inst, NULL, &exc);
+                    if (sigsegv_hit || exc) {
+                        LOGW("[dlc] v6.26:   %s (off=%d, type=%s): .ctor FAILED (segv=%d exc=%p)",
+                             fname, foff, tname, sigsegv_hit, exc);
+                        continue;
                     }
-                    if (!exc) direct_add_ok++;
                 }
-                LOGI("[dlc] v6.25: HashSet.Add(0-50): %d OK", direct_add_ok);
+                
+                // 写入 DLCSet 字段
+                install_sigsegv_handler();
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                    *(void **)((uintptr_t)dlc_set_obj + foff) = inst;
+                }
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
                 
                 if (!sigsegv_hit) {
-                    // 扩展 DLC ID
-                    int extra_dlc_ids[] = {100, 101, 102, 103, 104, 105, 110, 120, 150, 
-                                           200, 201, 202, 203, 204, 205, 210, 220, 250, 
-                                           300, 301, 302, 303, 400, 500, 1000, 1001, 1002,
-                                           2000, 2001, 2002, 3000, 3001, 5000, 10000};
-                    int add_ok2 = 0;
-                    for (int i = 0; i < (int)(sizeof(extra_dlc_ids)/sizeof(extra_dlc_ids[0])); i++) {
-                        int32_t dlcId = extra_dlc_ids[i];
-                        void *params[1] = { &dlcId };
-                        exc = NULL;
-                        void *r = NULL;
-                        SAFE_INVOKE(r, add_mi, dlc_set_obj, params, &exc);
-                        if (sigsegv_hit) break;
-                        if (!exc) add_ok2++;
-                    }
-                    LOGI("[dlc] v6.25: HashSet.Add(extra): %d OK", add_ok2);
-                    direct_add_ok += add_ok2;
-                }
-            } else {
-                LOGW("[dlc] v6.25: Add method not found on class %s", cls_name);
-                
-                // ===== DLCSet 结构分析 =====
-                // DLCSet 不是 HashSet<int>，是自定义游戏类，需要理解其结构
-                LOGI("[dlc] v6.25: ===== DLCSet class analysis =====");
-                
-                // 1) 枚举所有方法（包括继承）
-                if (hashset_cls && fn_class_get_methods && fn_method_get_name) {
-                    void *miter = NULL;
-                    Il2CppMethodInfo m;
-                    LOGI("[dlc] v6.25: Methods of %s:", cls_name);
-                    while ((m = fn_class_get_methods(hashset_cls, &miter)) != NULL) {
-                        const char *mname = fn_method_get_name(m);
-                        int pc = fn_method_get_param_count ? fn_method_get_param_count(m) : -1;
-                        LOGI("[dlc] v6.25:   M: %s(%d) MI=%p", mname, pc, m);
-                    }
-                }
-                
-                // 2) 枚举所有字段
-                if (hashset_cls && fn_class_get_fields && fn_field_get_name) {
-                    void *fiter = NULL;
-                    Il2CppFieldInfo fi;
-                    LOGI("[dlc] v6.25: Fields of %s:", cls_name);
-                    while ((fi = fn_class_get_fields(hashset_cls, &fiter)) != NULL) {
-                        const char *fname = fn_field_get_name(fi);
-                        int foff = fn_field_get_offset ? fn_field_get_offset(fi) : -1;
-                        // 获取字段类型名
-                        const char *type_name = "(unknown)";
-                        if (fn_field_get_type && fn_class_from_type) {
-                            void *ftype = fn_field_get_type(fi);
-                            if (ftype) {
-                                Il2CppClass fcls = fn_class_from_type(ftype);
-                                if (fcls && fn_class_get_name)
-                                    type_name = fn_class_get_name(fcls);
-                            }
-                        }
-                        LOGI("[dlc] v6.25:   F: %s (offset=%d, type=%s)", fname, foff, type_name);
-                    }
-                }
-                
-                // 3) 检查父类
-                Il2CppClass parent = (hashset_cls && fn_class_get_parent) ? fn_class_get_parent(hashset_cls) : NULL;
-                if (parent) {
-                    const char *pname = fn_class_get_name ? fn_class_get_name(parent) : "(null)";
-                    const char *pns = fn_class_get_namespace ? fn_class_get_namespace(parent) : "";
-                    LOGI("[dlc] v6.25: Parent class: %s.%s @ %p", pns, pname, parent);
-                    
-                    // 枚举父类方法（找 Add/Contains 等）
-                    if (fn_class_get_methods && fn_method_get_name) {
-                        void *miter = NULL;
-                        Il2CppMethodInfo m;
-                        LOGI("[dlc] v6.25: Parent methods:");
-                        while ((m = fn_class_get_methods(parent, &miter)) != NULL) {
-                            const char *mname = fn_method_get_name(m);
-                            int pc = fn_method_get_param_count ? fn_method_get_param_count(m) : -1;
-                            LOGI("[dlc] v6.25:   M: %s(%d) MI=%p", mname, pc, m);
-                        }
-                    }
-                    
-                    // 如果父类有 Add 方法，直接用
-                    Il2CppMethodInfo parent_add = fn_class_get_method_from_name(parent, "Add", 1);
-                    if (!parent_add) parent_add = fn_class_get_method_from_name(hashset_cls, "add_Item", 1);
-                    if (parent_add) {
-                        LOGI("[dlc] v6.25: ★ Found Add on parent/derived! Trying to add DLC IDs...");
-                        for (int32_t dlcId = 0; dlcId <= 50; dlcId++) {
-                            void *params[1] = { &dlcId };
-                            exc = NULL;
-                            void *r = NULL;
-                            SAFE_INVOKE(r, parent_add, dlc_set_obj, params, &exc);
-                            if (sigsegv_hit) {
-                                LOGE("[dlc] v6.25: parent.Add(%d) SIGSEGV", dlcId);
-                                break;
-                            }
-                            if (!exc) direct_add_ok++;
-                        }
-                        LOGI("[dlc] v6.25: parent.Add(0-50): %d OK", direct_add_ok);
-                    }
-                    
-                    // 再检查祖父类
-                    Il2CppClass grandparent = fn_class_get_parent(parent);
-                    if (grandparent) {
-                        const char *gpname = fn_class_get_name ? fn_class_get_name(grandparent) : "(null)";
-                        const char *gpns = fn_class_get_namespace ? fn_class_get_namespace(grandparent) : "";
-                        LOGI("[dlc] v6.25: Grandparent: %s.%s", gpns, gpname);
-                    }
+                    LOGI("[dlc] v6.26:   ★ %s (off=%d, type=%s): CREATED %p", fname, foff, tname, inst);
+                    direct_add_ok++;
+                    created_fields++;
+                } else {
+                    LOGW("[dlc] v6.26:   %s (off=%d): write SIGSEGV", fname, foff);
                 }
             }
+            
+            LOGI("[dlc] v6.26: DLCSet population: total=%d, existing=%d, null=%d, created=%d",
+                 total_fields, total_fields - null_fields, null_fields, created_fields);
+            
         } else if (!dlc_set_obj) {
-            LOGW("[dlc] v6.25: mDLCSet is NULL and could not be created");
+            LOGW("[dlc] v6.26: mDLCSet is NULL and could not be created");
+        } else {
+            LOGW("[dlc] v6.26: Missing APIs for DLCSet population");
         }
         
-        LOGI("[dlc] v6.25: Direct mDLCSet manipulation: %d items added", direct_add_ok);
+        LOGI("[dlc] v6.26: Direct mDLCSet manipulation: %d items populated", direct_add_ok);
     }
     
     // UpdateDLC 刷新缓存 (UpdateDLC 的 interpData 正常，不会 SIGSEGV)
@@ -2356,9 +2366,9 @@ static int do_unlock_all_dlc(void) {
             void *r = NULL;
             SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
             if (!sigsegv_hit && !exc) {
-                LOGI("[dlc] v6.25: ★ UpdateDLC() OK");
+                LOGI("[dlc] v6.26: ★ UpdateDLC() OK");
             } else {
-                LOGW("[dlc] v6.25: UpdateDLC() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
+                LOGW("[dlc] v6.26: UpdateDLC() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
             }
         }
     }
@@ -2371,7 +2381,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.25 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.26 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

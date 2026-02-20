@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.27"
+#define LOG_TAG "GoldHack v6.28"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1932,8 +1932,21 @@ static int do_unlock_all_dlc(void) {
             uint8_t *bitfield = (uint8_t *)mi + 0x4B;
             *bitfield = *bitfield | (1 << 4);  // 只设置 bit4，不清除任何其他 bit
             
-            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p bridge=%p bf=0x%02x MI=%p (v6.21)",
-                 mname, (void*)f[0], (void*)f[1], (void*)f[11], *((uint8_t *)mi + 0x4B), mi);
+            // v6.28: 恢复 v6.9 的 f[13]/f[15] 越界写入
+            // v6.9 使用 0xC0 布局（错误的大小），f[13]=flags清除HybridCLR标志，f[15]=invoker副本
+            // 虽然在 Unity 2020 中 MI 只有 0x68=104 字节，f[13]/f[15] 越界了，
+            // 但这个"意外"的写入可能修改了后续内存中的关键标志，v6.9 正是靠这个生效的！
+            // 先确保越界区域也可写
+            uintptr_t oob_page = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
+            uintptr_t mi_page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
+            if (oob_page != mi_page)
+                mprotect((void *)oob_page, 0x1000, PROT_READ | PROT_WRITE);
+            f[13] = f[13] & ~(uintptr_t)0x100;  // 清除 HybridCLR 标志
+            f[15] = (uintptr_t)custom_bool_true_invoker;  // invoker 副本
+            
+            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p bridge=%p bf=0x%02x f[13]=0x%lx f[15]=%p MI=%p (v6.28)",
+                 mname, (void*)f[0], (void*)f[1], (void*)f[11], *((uint8_t *)mi + 0x4B),
+                 (unsigned long)f[13], (void*)f[15], mi);
             
             if (strcmp(mname, "isUnlockRole") == 0) {
                 LOGI("[dlc] MI-DUMP %s: f[0]=%p f[1]=%p f[10]=%p f[11]=%p f[12]=%p MI=%p",
@@ -1972,7 +1985,7 @@ static int do_unlock_all_dlc(void) {
                  extra_proto_methods[ep], pc_found, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[10], mi);
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
-            uintptr_t page_end = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;  // MI=104 bytes (Unity 2020)
+            uintptr_t page_end = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;  // v6.28: 扩大到 0xC0 覆盖 f[15]
             if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
             // v6.20: 和 Step 6 一样的修补方式
             f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
@@ -1984,7 +1997,10 @@ static int do_unlock_all_dlc(void) {
             // v6.21: 设置 initInterpCallMethodPointer(bit4)=1 让解释器使用 f[11] 桥接
             uint8_t *bf = (uint8_t *)mi + 0x4B;
             *bf = *bf | (1 << 4);
-            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.21 bridge+bf) bf=0x%02x MI=%p", extra_proto_methods[ep], pc_found, *bf, mi);
+            // v6.28: 恢复 v6.9 的 f[13]/f[15] 越界写入（同主循环）
+            f[13] = f[13] & ~(uintptr_t)0x100;
+            f[15] = (uintptr_t)custom_bool_true_invoker;
+            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.28 full) bf=0x%02x MI=%p", extra_proto_methods[ep], pc_found, *bf, mi);
             patched++;
         }
         
@@ -2001,6 +2017,7 @@ static int do_unlock_all_dlc(void) {
         // （v6.18 已通过 FLAG_NOT_TOUCH_MODAL + collapsed 修复）。现在安全恢复。
         {
             struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } extra_patches[] = {
+                {"EditorSettingExtension",    "", "get_isUnlockAll",    0},  // v6.28: 恢复! v6.9 有这个
                 {"PurchaseUtils",             "", "IsUnlockDianCang",   1},
                 {"PurchaseRedPanel",          "", "IsUnlockAllDLC",     1},
                 {"PurchaseFriendHelpComponent","", "IsUnlockAll",       0},
@@ -2037,7 +2054,7 @@ static int do_unlock_all_dlc(void) {
                 
                 uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
                 mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
-                uintptr_t pe = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;
+                uintptr_t pe = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;  // v6.28: 扩大到 0xC0
                 if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
                 
                 f[0]  = (uintptr_t)custom_return_true_method;
@@ -2047,8 +2064,11 @@ static int do_unlock_all_dlc(void) {
                 f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
                 uint8_t *bf = (uint8_t *)mi + 0x4B;
                 *bf = *bf | (1 << 4);
+                // v6.28: 恢复 v6.9 的 f[13]/f[15] 越界写入
+                f[13] = f[13] & ~(uintptr_t)0x100;
+                f[15] = (uintptr_t)custom_bool_true_invoker;
                 
-                LOGI("[dlc] ★ %s.%s PATCHED (v6.27)", extra_patches[e].cls_name, extra_patches[e].method_name);
+                LOGI("[dlc] ★ %s.%s PATCHED (v6.28)", extra_patches[e].cls_name, extra_patches[e].method_name);
                 extra_patched++;
             }
             LOGI("[dlc] Extra class patches: %d installed", extra_patched);
@@ -2064,10 +2084,41 @@ static int do_unlock_all_dlc(void) {
         // 现在让包的真实下载状态保持不变，游戏会正确显示"需要下载"
         LOGI("[dlc] v6.9: Skipping PackageSystem state fix (caused crash loading missing assets)");
         
-        // ===== 6c) v6.17: 跳过 EditorSetting.isUnlockAll =====
-        // 这是编辑器模式标志，在生产环境设置可能导致游戏状态异常
-        // 而且每次 get_Instance() 都返回 NULL，完全没用
-        LOGI("[dlc] v6.17: Skipping EditorSetting (editor-mode flag, not needed)");
+        // ===== 6c) v6.28: 恢复 EditorSetting.isUnlockAll (v6.9 有此代码) =====
+        // EditorSettingExtension 有静态字段 mInstance，通过它获取 EditorSetting 实例
+        // 然后将 offset 0x19 处的 bool isUnlockAll 设为 true
+        {
+            Il2CppClass es_ext_cls = fn_class_from_name(g_csharp_image, "", "EditorSettingExtension");
+            if (es_ext_cls) {
+                Il2CppMethodInfo m_getInst = fn_class_get_method_from_name(es_ext_cls, "get_Instance", 0);
+                if (m_getInst) {
+                    void *exc2 = NULL;
+                    void *es_inst = NULL;
+                    install_sigsegv_handler();
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                        es_inst = fn_runtime_invoke(m_getInst, NULL, NULL, &exc2);
+                    }
+                    g_in_safe_access = 0;
+                    uninstall_sigsegv_handler();
+                    
+                    if (es_inst && !exc2) {
+                        LOGI("[dlc] EditorSetting instance: %p", es_inst);
+                        // 设置 [0x19] isUnlockAll = true
+                        uint8_t *p = (uint8_t *)es_inst;
+                        uint8_t old_val = p[0x19];
+                        p[0x19] = 1;
+                        LOGI("[dlc] ★ EditorSetting.isUnlockAll: %d -> 1", old_val);
+                    } else {
+                        LOGI("[dlc] EditorSetting.get_Instance() returned NULL or exception");
+                    }
+                } else {
+                    LOGI("[dlc] EditorSetting.get_Instance method not found");
+                }
+            } else {
+                LOGI("[dlc] EditorSettingExtension class not found");
+            }
+        }
 
         // ===== 6d) v6.6: 不再 NOP void 方法！让原始方法正常运行 =====
         // v6.5 中 NOP void 方法是错误的：
@@ -5135,19 +5186,16 @@ static void *hack_thread(void *arg) {
     // 5.7 安装 DLC/职业解锁绕过
     bypass_dlc_lock();
 
-    // 5.8 v6.18: 禁用自动 DLC 后台线程 — 避免干扰游戏 UI
-    // 用户通过 overlay 菜单的“解锁DLC”按钮手动触发
-    LOGI("[dlc-monitor] v6.18: Auto DLC monitor disabled - use overlay button to unlock");
-#if 0  // v6.18: disabled
+    // 5.8 v6.28: restore auto DLC monitor thread (v6.9 had this)
+    {
         pthread_t dlc_tid;
         if (pthread_create(&dlc_tid, NULL, dlc_monitor_thread, NULL) == 0) {
             pthread_detach(dlc_tid);
-            LOGI("[dlc-monitor] Background DLC unlock thread started");
+            LOGI("[dlc-monitor] Background DLC unlock thread started (v6.28 restored)");
         } else {
             LOGW("[dlc-monitor] Failed to create DLC monitor thread");
         }
     }
-#endif  // v6.18: disabled auto DLC monitor
 
     // 6. 启动游戏内悬浮菜单
 #ifdef OVERLAY_DEX

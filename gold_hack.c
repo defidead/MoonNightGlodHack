@@ -1332,6 +1332,8 @@ static void custom_bool_true_invoker(void* methodPtr, void* method, void* obj, v
     //   invoker(methodPointer, method, obj, params, returnValue);
     //   return Object::Box(returnType, returnValue);
     // 所以我们直接写入 ret 指向的内存即可
+    LOGI("[invoker] custom_bool_true_invoker called! methodPtr=%p method=%p obj=%p ret=%p",
+         methodPtr, method, obj, ret);
     if (ret) {
         *(uint8_t *)ret = 1;  // true (bool = 1 byte value type)
     }
@@ -2135,7 +2137,15 @@ static int do_unlock_all_dlc(void) {
         void *result = NULL;
         SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
         int unlocked = -1;
-        if (!sigsegv_hit && result) { SAFE_UNBOX_INT(unlocked, result, -1); }
+        if (sigsegv_hit) {
+            LOGE("[dlc]   isUnlockRole(%d) SIGSEGV!", rid);
+        } else if (exc) {
+            LOGE("[dlc]   isUnlockRole(%d) EXCEPTION exc=%p", rid, exc);
+        } else if (!result) {
+            LOGE("[dlc]   isUnlockRole(%d) result=NULL (no exc, no sigsegv)", rid);
+        } else {
+            SAFE_UNBOX_INT(unlocked, result, -1);
+        }
         LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
              unlocked > 0 ? " ✓" : " ✗");
         if (unlocked > 0) unlocked_count++;

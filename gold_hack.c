@@ -1842,44 +1842,60 @@ static int do_unlock_all_dlc(void) {
     if (unlocked_count == 0 && g_mi_hooks_installed) {
         LOGI("[dlc] Still 0 unlocked after interpData/flags patch. Trying invoker replacement...");
         
-        // 找 AOT invoker
-        uintptr_t aot_invoker = 0;
+        // 找 IsDLCRole(1) 的 invoker — 它是 bool(int) 签名的 AOT 方法
+        // IsDLCRole 的 invoker 和 isUnlockRole 签名完全匹配!
+        uintptr_t matching_invoker = 0;
+        const char *invoker_source = NULL;
         {
-            Il2CppClass obj_cls = NULL;
-            size_t asm_count = 0;
-            Il2CppAssembly *asms = fn_domain_get_assemblies(g_domain, &asm_count);
-            for (size_t a = 0; a < asm_count && !obj_cls; a++) {
-                Il2CppImage img = fn_assembly_get_image(asms[a]);
-                if (!img) continue;
-                const char *iname = fn_image_get_name(img);
-                if (iname && (strstr(iname, "mscorlib") || strstr(iname, "corlib"))) {
-                    obj_cls = fn_class_from_name(img, "System", "Object");
-                }
+            Il2CppMethodInfo m_isDLCRole = fn_class_get_method_from_name(g_proto_login_cls, "IsDLCRole", 1);
+            if (m_isDLCRole) {
+                uintptr_t *drmi = (uintptr_t *)m_isDLCRole;
+                matching_invoker = drmi[1];
+                invoker_source = "ProtoLogin.IsDLCRole";
+                LOGI("[dlc] IsDLCRole invoker: %p, methodPtr: %p, flags: 0x%x",
+                     (void*)drmi[1], (void*)drmi[0], (int)drmi[13]);
+                // dump IsDLCRole MethodInfo for comparison
+                LOGI("[dlc] IsDLCRole MI dump: [10]=%p [11]=%p [12]=%p",
+                     (void*)drmi[10], (void*)drmi[11], (void*)drmi[12]);
             }
-            if (obj_cls) {
-                Il2CppMethodInfo m_tostr = fn_class_get_method_from_name(obj_cls, "ToString", 0);
-                if (m_tostr) {
-                    uintptr_t *aot_mi = (uintptr_t *)m_tostr;
-                    aot_invoker = aot_mi[1];
+        }
+        
+        // 如果 IsDLCRole 不可用，搜索 UserInfo.IsDLCRole
+        if (!matching_invoker) {
+            Il2CppClass ui_cls = fn_class_from_name(g_csharp_image, "", "UserInfo");
+            if (ui_cls) {
+                Il2CppMethodInfo m_uidr = fn_class_get_method_from_name(ui_cls, "IsDLCRole", 1);
+                if (m_uidr) {
+                    uintptr_t *uiami = (uintptr_t *)m_uidr;
+                    matching_invoker = uiami[1];
+                    invoker_source = "UserInfo.IsDLCRole";
                 }
             }
         }
         
-        if (aot_invoker) {
+        // 如果还没找到，从 mscorlib 找任何 bool(int32) 方法
+        if (!matching_invoker) {
+            // 退而求其次: 用 Object.ToString 的 invoker (已知不匹配但测试用)
+            LOGI("[dlc] No matching invoker found for bool(int) signature");
+        }
+        
+        if (matching_invoker) {
+            LOGI("[dlc] Using invoker from %s: %p", invoker_source, (void*)matching_invoker);
             uintptr_t *mi_fields = (uintptr_t *)m_isUnlock;
             uintptr_t old_invoker = mi_fields[1];
             
             uintptr_t page = (uintptr_t)m_isUnlock & ~(uintptr_t)0xFFF;
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
-            mi_fields[1] = aot_invoker;
+            mi_fields[1] = matching_invoker;
             // 也更新 [15] 如果它是 invoker 的复制
-            mi_fields[15] = aot_invoker;
-            LOGI("[dlc] ★ invoker replaced: %p -> %p (AOT)", (void*)old_invoker, (void*)aot_invoker);
+            mi_fields[15] = matching_invoker;
+            LOGI("[dlc] ★ invoker replaced: %p -> %p (%s)", 
+                 (void*)old_invoker, (void*)matching_invoker, invoker_source);
             
             // 重新验证
             unlocked_count = 0;
             LOGI("[dlc] === Re-verification after invoker replacement ===");
-            for (int32_t rid = 0; rid <= 3; rid++) {
+            for (int32_t rid = 0; rid <= 15; rid++) {
                 void *params[1] = { &rid };
                 exc = NULL;
                 void *result = NULL;
@@ -1887,16 +1903,34 @@ static int do_unlock_all_dlc(void) {
                 int unlocked = -1;
                 if (sigsegv_hit) {
                     LOGE("[dlc]   isUnlockRole(%d) = SIGSEGV! Reverting invoker...", rid);
-                    // 恢复原始 invoker
                     mi_fields[1] = old_invoker;
                     mi_fields[15] = old_invoker;
                     LOGI("[dlc] Invoker reverted to %p", (void*)old_invoker);
+                    unlocked_count = 0;
                     break;
                 }
                 if (result) { SAFE_UNBOX_INT(unlocked, result, -1); }
                 LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
                      unlocked > 0 ? " ✓" : " ✗");
                 if (unlocked > 0) unlocked_count++;
+            }
+            
+            // 如果成功，也替换其他方法的 invoker
+            if (unlocked_count > 0) {
+                LOGI("[dlc] ★ invoker replacement works! Applying to other methods...");
+                Il2CppMethodInfo methods_to_fix[] = {
+                    fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockAllDLC", 1),
+                    fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockByFirstGame", 1),
+                    fn_class_get_method_from_name(g_proto_login_cls, "isUnlockDLC", 1),
+                };
+                for (int i = 0; i < 3; i++) {
+                    if (!methods_to_fix[i]) continue;
+                    uintptr_t *mf = (uintptr_t *)methods_to_fix[i];
+                    uintptr_t pf = (uintptr_t)methods_to_fix[i] & ~(uintptr_t)0xFFF;
+                    mprotect((void *)pf, 0x2000, PROT_READ | PROT_WRITE);
+                    mf[1] = matching_invoker;
+                    mf[15] = matching_invoker;
+                }
             }
         }
     }

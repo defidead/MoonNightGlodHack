@@ -1289,11 +1289,66 @@ static int bypass_dlc_lock(void) {
     return hooked;
 }
 
-// ========== DLC 解锁 - 数据修改方式（绕过 HybridCLR 方法拦截限制）==========
+// ========== DLC 解锁 - MethodInfo 改写方式（绕过 HybridCLR 解释器限制）==========
 // HybridCLR 解释器内部调用绕过 methodPointer，所以 replace_method_pointer 无效。
-// 新方案：找到 ProtoLogin 单例，直接通过 il2cpp_runtime_invoke 调用 AddDLC() 向数据集添加 DLC。
+// 新方案：分配 RWX 内存，写入 ARM64 stub 返回 true，然后修改 MethodInfo
+// 让 HybridCLR 认为 isUnlockRole 是 native 方法，从而走 methodPointer 路径。
 static Il2CppClass   g_proto_login_cls  = NULL;
 static uintptr_t     g_proto_login_inst = 0;
+
+// ===== ARM64 可执行 stub（分配后长期存活）=====
+// 用于替换 HybridCLR 方法的 methodPointer / invoker_method
+static void *g_stub_return_true = NULL;   // bool return true stub
+static void *g_stub_invoker_true = NULL;  // invoker wrapper stub
+
+// 分配 RWX 内存并写入 ARM64 代码
+static void* alloc_executable_stub(const uint32_t *code, size_t code_size) {
+    // 使用 mmap 分配可执行内存
+    void *mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED) {
+        LOGE("[stub] mmap RWX failed: %s", strerror(errno));
+        return NULL;
+    }
+    memcpy(mem, code, code_size);
+    __builtin___clear_cache((char*)mem, (char*)mem + code_size);
+    LOGI("[stub] Allocated executable stub @ %p (%zu bytes)", mem, code_size);
+    return mem;
+}
+
+// 初始化 ARM64 stubs
+static void init_dlc_stubs(void) {
+    if (g_stub_return_true) return; // 已初始化
+    
+    // Stub 1: methodPointer stub
+    // HybridCLR 调用约定: ret_type method(void* this, arg1, ..., MethodInfo* mi)
+    // 对于 bool isUnlockRole(int roleId):
+    //   X0=this, W1=roleId, X2=MethodInfo*
+    // 直接返回 1 (true)
+    static const uint32_t stub_ret_true[] = {
+        0x52800020,  // MOV W0, #1
+        0xD65F03C0,  // RET
+    };
+    g_stub_return_true = alloc_executable_stub(stub_ret_true, sizeof(stub_ret_true));
+    
+    // Stub 2: invoker stub
+    // il2cpp_runtime_invoke 调用的是 invoker_method:
+    //   void* invoker(Il2CppMethodPointer methodPtr, const MethodInfo* method,
+    //                 void* obj, void** args, void** exception)
+    // 对于 bool 返回值, invoker 需要:
+    //   1. 调用 methodPtr 获取结果
+    //   2. 将结果 box 成 Il2CppObject*
+    // 简单做法: 直接返回一个 boxed bool (跳过，直接让 methodPointer 返回)
+    // 但实际上 invoker 的返回值是 Il2CppObject*，不是 bool
+    // 所以我们不替换 invoker, 只替换 methodPointer
+    // invoker 会调用新的 methodPointer 获得 W0=1，然后正常 box 返回
+    
+    if (g_stub_return_true) {
+        LOGI("[stub] ARM64 stubs initialized: ret_true=%p", g_stub_return_true);
+    } else {
+        LOGE("[stub] Failed to initialize ARM64 stubs");
+    }
+}
 
 // 扫描内存查找 ProtoLogin 实例（与 RoleInfo 扫描相同原理）
 static int find_proto_login_instance(void) {
@@ -1437,11 +1492,18 @@ static int find_proto_login_instance(void) {
 static volatile int g_dlc_verbose_logged = 0;
 // DLC 后台持续解锁标记
 static volatile int g_dlc_unlocked = 0;
+// MethodInfo hook 是否已安装
+static volatile int g_mi_hooks_installed = 0;
+// 保存的原始 methodPointer 值
+static uintptr_t g_orig_isUnlockRole_ptr = 0;
 
-// 主 DLC 解锁函数 (v3: 直接修改 DLCSet 对象内角色字段)
-// 核心发现: mDLCSet 类型是 DLCSet (非 HashSet<int>)
-// DLCSet 有角色字段: youxia, xiunv, nvwu, moshushi, yoajishi, langren 等
-// 这些可能是 bool/DLCSet 引用字段，设为 true 即可解锁
+// 主 DLC 解锁函数 (v4: MethodInfo 改写 + 诊断)
+// 核心策略: 
+// 1. 找到 isUnlockRole 的 MethodInfo
+// 2. Dump MethodInfo 内存来理解 HybridCLR 的判定标志
+// 3. 分配 ARM64 stub (返回 true)
+// 4. 修改 MethodInfo 让解释器走 native 路径
+// 5. 同时对比 AOT 方法的 MethodInfo 来找差异
 static int do_unlock_all_dlc(void) {
     if (init_il2cpp_context() != 0) return -1;
 
@@ -1452,7 +1514,6 @@ static int do_unlock_all_dlc(void) {
 
     if (fn_thread_attach && g_domain) {
         fn_thread_attach(g_domain);
-        LOGI("[dlc] Thread attached OK");
     }
 
     if (!g_proto_login_cls) {
@@ -1464,33 +1525,7 @@ static int do_unlock_all_dlc(void) {
     }
 
     int verbose = !g_dlc_verbose_logged;
-    if (verbose) {
-        g_dlc_verbose_logged = 1;
-        LOGI("[dlc] ===== ProtoLogin class diagnostics =====");
-        if (fn_class_get_methods && fn_method_get_name && fn_method_get_param_count) {
-            void *iter = NULL;
-            Il2CppMethodInfo m;
-            int method_count = 0;
-            while ((m = fn_class_get_methods(g_proto_login_cls, &iter)) != NULL) {
-                const char *name = fn_method_get_name(m);
-                int params = fn_method_get_param_count(m);
-                uintptr_t methodPtr = *(uintptr_t *)m;
-                LOGI("[dlc-enum] Method: %s(%d params) ptr=%p MI=%p", 
-                     name ? name : "?", params, (void*)methodPtr, m);
-                method_count++;
-            }
-            LOGI("[dlc-enum] Total methods: %d", method_count);
-        }
-        if (fn_class_get_fields && fn_field_get_name && fn_field_get_offset) {
-            void *iter = NULL;
-            Il2CppFieldInfo f;
-            while ((f = fn_class_get_fields(g_proto_login_cls, &iter)) != NULL) {
-                const char *name = fn_field_get_name(f);
-                int offset = fn_field_get_offset(f);
-                LOGI("[dlc-enum] Field: %s @ offset 0x%x", name ? name : "?", offset);
-            }
-        }
-    }
+    if (verbose) g_dlc_verbose_logged = 1;
 
     // ===== 1) 找 ProtoLogin 实例 =====
     if (!find_proto_login_instance()) {
@@ -1556,251 +1591,228 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] Instance validation: isUnlockRole(0) = %d", val);
     }
 
-    // ===== 4) 读取关键字段指针 =====
-    uintptr_t mDLCSet = 0, mDLCSetInfo = 0, mProduct2DLC = 0;
-    uintptr_t baseRoles = 0, packAll = 0;
-    install_sigsegv_handler();
-    g_in_safe_access = 1;
-    if (sigsetjmp(g_jmpbuf, 1) == 0) {
-        mDLCSet      = *(volatile uintptr_t *)(g_proto_login_inst + 0x40);
-        mDLCSetInfo  = *(volatile uintptr_t *)(g_proto_login_inst + 0x48);
-        mProduct2DLC = *(volatile uintptr_t *)(g_proto_login_inst + 0x50);
-        baseRoles    = *(volatile uintptr_t *)(g_proto_login_inst + 0x58);
-        packAll      = *(volatile uintptr_t *)(g_proto_login_inst + 0x60);
-    }
-    g_in_safe_access = 0;
-    uninstall_sigsegv_handler();
-    LOGI("[dlc] mDLCSet=%p mDLCSetInfo=%p mProduct2DLC=%p packAll=%p",
-         (void*)mDLCSet, (void*)mDLCSetInfo, (void*)mProduct2DLC, (void*)packAll);
-
-    // ===== 5) 检查 mDLCSet 类型 - 核心逻辑 =====
-    // mDLCSet 为 NULL 说明游戏还没完成 UpdateDLC()，需要等待
-    if (mDLCSet == 0) {
-        LOGI("[dlc] mDLCSet is NULL - game hasn't called UpdateDLC yet, waiting...");
-        return -2;  // 返回 -2 让轮询继续
-    }
-
-    // 获取 mDLCSet 的类型
-    const char *dlcset_class_name = "?";
-    Il2CppClass dlcset_klass = NULL;
-    if (fn_object_get_class && fn_class_get_name) {
-        dlcset_klass = fn_object_get_class((Il2CppObject)mDLCSet);
-        dlcset_class_name = dlcset_klass ? fn_class_get_name(dlcset_klass) : "?";
-    }
-    LOGI("[dlc] mDLCSet class: %s (expected DLCSet)", dlcset_class_name);
-
-    // ===== 5a) 读取 mDLCSetInfo 的类型 =====
-    if (mDLCSetInfo && fn_object_get_class && fn_class_get_name) {
-        Il2CppClass info_k = fn_object_get_class((Il2CppObject)mDLCSetInfo);
-        const char *info_name = info_k ? fn_class_get_name(info_k) : "?";
-        LOGI("[dlc] mDLCSetInfo class: %s", info_name);
-        // 枚举 mDLCSetInfo 的字段
-        if (verbose && info_k && fn_class_get_fields && fn_field_get_name && fn_field_get_offset) {
-            void *fi = NULL;
-            Il2CppFieldInfo ff;
-            while ((ff = fn_class_get_fields(info_k, &fi)) != NULL) {
-                const char *fn = fn_field_get_name(ff);
-                int fo = fn_field_get_offset(ff);
-                LOGI("[dlc-info] mDLCSetInfo field: %s @ 0x%x", fn ? fn : "?", fo);
+    // ===== 4) Dump MethodInfo 内存 (诊断 HybridCLR 结构) =====
+    // MethodInfo 结构 (il2cpp + HybridCLR):
+    // [0]  +0x00: methodPointer (函数指针)
+    // [1]  +0x08: invoker_method (il2cpp_runtime_invoke 使用)
+    // [2]  +0x10: name (const char*)
+    // [3]  +0x18: klass (Il2CppClass*)
+    // [4]  +0x20: return_type (Il2CppType*)
+    // [5]  +0x28: parameters (ParameterInfo*)
+    // [6]  +0x30: 通常是 genericContainerHandle 或其他
+    // [7]  +0x38: token
+    // [8]  +0x40: flags / iflags 等
+    // [9]  +0x48: slot
+    // [10] +0x50: parameters_count
+    // [11] +0x58: 标志位 (is_generic, is_inflated, wrapper_type, is_marshaled_from_native, ...)
+    //            HybridCLR 可能在这里标记 isInterpreterMethod
+    // +0x60...: HybridCLR 扩展字段
+    if (verbose) {
+        LOGI("[dlc] ===== MethodInfo dump: isUnlockRole =====");
+        uintptr_t *mi = (uintptr_t *)m_isUnlock;
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+            for (int i = 0; i < 24; i++) {
+                uintptr_t val = mi[i];
+                // 尝试判断是否是字符串
+                const char *str_hint = "";
+                if (i == 2 && val > 0x10000) {
+                    // name 字段
+                    str_hint = (const char*)val;
+                }
+                LOGI("[dlc-mi] isUnlockRole [%2d] +0x%02x = 0x%016" PRIxPTR " (%ld) %s",
+                     i, i*8, val, (long)val, 
+                     (i == 2 && val > 0x10000) ? str_hint : "");
             }
         }
-        // 枚举 mDLCSetInfo 的方法
-        if (verbose && info_k && fn_class_get_methods && fn_method_get_name) {
-            void *mi = NULL;
-            Il2CppMethodInfo mm;
-            while ((mm = fn_class_get_methods(info_k, &mi)) != NULL) {
-                const char *mn = fn_method_get_name(mm);
-                int pc = fn_method_get_param_count(mm);
-                LOGI("[dlc-info] mDLCSetInfo method: %s(%d)", mn ? mn : "?", pc);
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+
+        // 同时 dump 一个 AOT 方法的 MethodInfo 做对比
+        // 用 AddDLC 或一个不太可能是 HybridCLR 的方法
+        // 尝试从 System.Object 找一个 AOT 方法
+        Il2CppClass obj_cls = fn_class_from_name(g_csharp_image, "System", "Object");
+        if (!obj_cls) {
+            // 从 mscorlib 查找
+            // 遍历 assemblies 找 mscorlib
+            size_t asm_count = 0;
+            Il2CppAssembly *asms = fn_domain_get_assemblies(g_domain, &asm_count);
+            for (size_t a = 0; a < asm_count && !obj_cls; a++) {
+                Il2CppImage img = fn_assembly_get_image(asms[a]);
+                if (!img) continue;
+                const char *iname = fn_image_get_name(img);
+                if (iname && (strstr(iname, "mscorlib") || strstr(iname, "corlib"))) {
+                    obj_cls = fn_class_from_name(img, "System", "Object");
+                    LOGI("[dlc] Found System.Object in %s", iname);
+                }
             }
         }
-    } else {
-        LOGI("[dlc] mDLCSetInfo is NULL");
-    }
-
-    // ===== 6) 核心策略: 修改 DLCSet 对象内部的角色字段 =====
-    int fields_modified = 0;
-    if (dlcset_klass && fn_class_get_fields && fn_field_get_name && fn_field_get_offset) {
-        LOGI("[dlc] === DLCSet fields (reading + modifying) ===");
-        void *fi = NULL;
-        Il2CppFieldInfo ff;
-        while ((ff = fn_class_get_fields(dlcset_klass, &fi)) != NULL) {
-            const char *fn_name = fn_field_get_name(ff);
-            int foffset = fn_field_get_offset(ff);
-            if (!fn_name) continue;
-            
-            // 跳过非角色字段（Discount, dlcs, startTime, overTime 是 PackAll/DLCSet 的基础字段）
-            if (strcmp(fn_name, "Discount") == 0 || strcmp(fn_name, "dlcs") == 0 ||
-                strcmp(fn_name, "startTime") == 0 || strcmp(fn_name, "overTime") == 0) {
-                LOGI("[dlc-ds] Skip base field: %s @ 0x%x", fn_name, foffset);
-                continue;
-            }
-            
-            // 读取当前值
-            install_sigsegv_handler();
-            g_in_safe_access = 1;
-            uintptr_t cur_val = 0;
-            if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                cur_val = *(volatile uintptr_t *)(mDLCSet + foffset);
-            }
-            g_in_safe_access = 0;
-            uninstall_sigsegv_handler();
-            
-            // 检查字段值类型：
-            // 如果是 NULL(0) 或 对象引用(大指针), 说明这是个对象引用字段
-            // 如果是小值(0或1), 可能是 bool
-            // DLCSet 的角色字段（youxia, xiunv 等）从 offset 0x10 开始
-            // 它们很可能是 DLCSet 或 PackInfo 或 bool 类型
-            
-            LOGI("[dlc-ds] Field: %s @ 0x%x = 0x%" PRIxPTR " (%ld)", 
-                 fn_name, foffset, cur_val, (long)cur_val);
-            
-            // 如果值是 NULL (0) — 这个 DLC 项目未购买
-            // 尝试写入: 如果是 bool 字段，写 1; 如果是对象引用字段，需要提供有效对象
-            if (cur_val == 0) {
-                // 尝试将字段设为 1（适用于 bool/int 字段）
+        if (obj_cls) {
+            Il2CppMethodInfo m_tostr = fn_class_get_method_from_name(obj_cls, "ToString", 0);
+            if (m_tostr) {
+                LOGI("[dlc] ===== MethodInfo dump: Object.ToString (AOT reference) =====");
+                uintptr_t *mi2 = (uintptr_t *)m_tostr;
                 install_sigsegv_handler();
                 g_in_safe_access = 1;
                 if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                    // 对于小偏移的字段可能是 bool（1字节），但直接写 uintptr_t(1) 也安全
-                    // 因为高位本来就是 0
-                    *(volatile uintptr_t *)(mDLCSet + foffset) = 1;
-                    fields_modified++;
-                    LOGI("[dlc-ds] >>> Set %s = 1 (was NULL)", fn_name);
+                    for (int i = 0; i < 24; i++) {
+                        uintptr_t val = mi2[i];
+                        const char *str_hint = "";
+                        if (i == 2 && val > 0x10000) str_hint = (const char*)val;
+                        LOGI("[dlc-mi] Object.ToString  [%2d] +0x%02x = 0x%016" PRIxPTR " (%ld) %s",
+                             i, i*8, val, (long)val,
+                             (i == 2 && val > 0x10000) ? str_hint : "");
+                    }
                 }
                 g_in_safe_access = 0;
                 uninstall_sigsegv_handler();
-            } else if (cur_val == 1) {
-                LOGI("[dlc-ds] %s already = 1 (unlocked)", fn_name);
-            } else {
-                // 非空且非1 — 可能是对象引用（已有 DLCSet 子对象）
-                // 检查是否本身也是 DLCSet 对象
-                if (fn_object_get_class && fn_class_get_name && cur_val > 0x10000) {
-                    Il2CppClass fk = fn_object_get_class((Il2CppObject)cur_val);
-                    const char *fcn = fk ? fn_class_get_name(fk) : "?";
-                    LOGI("[dlc-ds] %s is object: class=%s", fn_name, fcn);
-                }
             }
         }
-        LOGI("[dlc] DLCSet fields modified: %d", fields_modified);
+
+        // 也 dump AddDLC 的 MethodInfo (也是 HybridCLR 方法)
+        if (m_addDLC) {
+            LOGI("[dlc] ===== MethodInfo dump: AddDLC =====");
+            uintptr_t *mi3 = (uintptr_t *)m_addDLC;
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                for (int i = 0; i < 24; i++) {
+                    uintptr_t val = mi3[i];
+                    const char *str_hint = "";
+                    if (i == 2 && val > 0x10000) str_hint = (const char*)val;
+                    LOGI("[dlc-mi] AddDLC          [%2d] +0x%02x = 0x%016" PRIxPTR " (%ld) %s",
+                         i, i*8, val, (long)val,
+                         (i == 2 && val > 0x10000) ? str_hint : "");
+                }
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+        }
+
+        // dump IsUnlockAllDLC 的 MethodInfo
+        Il2CppMethodInfo m_isUnlockAll = fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockAllDLC", 1);
+        if (m_isUnlockAll) {
+            LOGI("[dlc] ===== MethodInfo dump: IsUnlockAllDLC =====");
+            uintptr_t *mi4 = (uintptr_t *)m_isUnlockAll;
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                for (int i = 0; i < 24; i++) {
+                    uintptr_t val = mi4[i];
+                    const char *str_hint = "";
+                    if (i == 2 && val > 0x10000) str_hint = (const char*)val;
+                    LOGI("[dlc-mi] IsUnlockAllDLC  [%2d] +0x%02x = 0x%016" PRIxPTR " (%ld) %s",
+                         i, i*8, val, (long)val,
+                         (i == 2 && val > 0x10000) ? str_hint : "");
+                }
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+        }
     }
 
-    // ===== 6b) 如果 DLCSet 字段是对象引用(非bool)，需要不同策略 =====
-    // 检查是否有 mDLCSetInfo（Dictionary<int, DLCSet>），读取其中的 DLCSet 对象
-    if (mDLCSetInfo && dlcset_klass) {
-        Il2CppClass info_k = fn_object_get_class((Il2CppObject)mDLCSetInfo);
-        const char *info_name = info_k ? fn_class_get_name(info_k) : "?";
-        LOGI("[dlc] mDLCSetInfo class for dict check: %s", info_name);
+    // ===== 5) 安装 MethodInfo 改写 hook =====
+    if (!g_mi_hooks_installed) {
+        init_dlc_stubs();
+        if (!g_stub_return_true) {
+            LOGE("[dlc] Failed to create ARM64 stub!");
+            goto skip_mi_hook;
+        }
+
+        uintptr_t *mi_fields = (uintptr_t *)m_isUnlock;
+        g_orig_isUnlockRole_ptr = mi_fields[0];
+        LOGI("[dlc] Original isUnlockRole methodPointer: %p", (void*)g_orig_isUnlockRole_ptr);
+        LOGI("[dlc] Original isUnlockRole invoker:       %p", (void*)mi_fields[1]);
+
+        // 替换 methodPointer (字段[0]) 为我们的 stub
+        uintptr_t page = (uintptr_t)m_isUnlock & ~(uintptr_t)0xFFF;
+        mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
+        mi_fields[0] = (uintptr_t)g_stub_return_true;
+        LOGI("[dlc] ★ isUnlockRole.methodPointer replaced: %p -> %p",
+             (void*)g_orig_isUnlockRole_ptr, g_stub_return_true);
+
+        // 同时修改相关方法
+        // Hook IsUnlockAllDLC (也返回 true)
+        Il2CppMethodInfo m_isUnlockAll = fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockAllDLC", 1);
+        if (m_isUnlockAll) {
+            uintptr_t *mi2 = (uintptr_t *)m_isUnlockAll;
+            uintptr_t p2 = (uintptr_t)m_isUnlockAll & ~(uintptr_t)0xFFF;
+            mprotect((void *)p2, 0x2000, PROT_READ | PROT_WRITE);
+            mi2[0] = (uintptr_t)g_stub_return_true;
+            LOGI("[dlc] ★ IsUnlockAllDLC.methodPointer replaced -> %p", g_stub_return_true);
+        }
+
+        // Hook IsUnlockByFirstGame (也返回 true)
+        Il2CppMethodInfo m_iubfg = fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockByFirstGame", 1);
+        if (m_iubfg) {
+            uintptr_t *mi3 = (uintptr_t *)m_iubfg;
+            uintptr_t p3 = (uintptr_t)m_iubfg & ~(uintptr_t)0xFFF;
+            mprotect((void *)p3, 0x2000, PROT_READ | PROT_WRITE);
+            mi3[0] = (uintptr_t)g_stub_return_true;
+            LOGI("[dlc] ★ IsUnlockByFirstGame.methodPointer replaced -> %p", g_stub_return_true);
+        }
+
+        // 尝试找并 hook isUnlockDLC (如果有)
+        Il2CppMethodInfo m_iud = fn_class_get_method_from_name(g_proto_login_cls, "isUnlockDLC", 1);
+        if (m_iud) {
+            uintptr_t *mi4 = (uintptr_t *)m_iud;
+            uintptr_t p4 = (uintptr_t)m_iud & ~(uintptr_t)0xFFF;
+            mprotect((void *)p4, 0x2000, PROT_READ | PROT_WRITE);
+            mi4[0] = (uintptr_t)g_stub_return_true;
+            LOGI("[dlc] ★ isUnlockDLC.methodPointer replaced -> %p", g_stub_return_true);
+        }
+
+        g_mi_hooks_installed = 1;
+        LOGI("[dlc] MethodInfo hooks installed!");
+    }
+    skip_mi_hook:
+
+    // ===== 6) 验证 hook 效果 =====
+    // il2cpp_runtime_invoke 会走 invoker_method, invoker 内部走 methodPointer
+    // 所以替换 methodPointer 应该对 il2cpp_runtime_invoke 有效
+    int unlocked_count = 0;
+    LOGI("[dlc] === Verification: isUnlockRole via il2cpp_runtime_invoke ===");
+    for (int32_t rid = 0; rid <= 15; rid++) {
+        void *params[1] = { &rid };
+        exc = NULL;
+        void *result = NULL;
+        SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
+        int unlocked = -1;
+        if (!sigsegv_hit && result) { SAFE_UNBOX_INT(unlocked, result, -1); }
+        LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
+             unlocked > 0 ? " ✓" : " ✗");
+        if (unlocked > 0) unlocked_count++;
+    }
+
+    // ===== 7) 如果 il2cpp_runtime_invoke 方式有效但游戏 UI 没变化 =====
+    // 说明游戏 UI 不走 il2cpp_runtime_invoke，而是 HybridCLR 解释器内部调用
+    // 这种情况需要另一个方案: inline hook 蹦床函数
+    if (unlocked_count > 0) {
+        LOGI("[dlc] ★ il2cpp_runtime_invoke path works! %d/16 unlocked", unlocked_count);
+        LOGI("[dlc] Note: If game UI still locked, need inline hook of interpreter trampoline");
         
-        // 如果 mDLCSetInfo 是 Dictionary 类型, 尝试修改其中的每个 DLCSet
-        // Dictionary<TKey,TValue> 内部布局:
-        // +0x10: buckets (int[])
-        // +0x18: entries (Entry[]) -- Entry { hashCode, next, key, value }
-        // +0x20: count (int)
-        // +0x24: version (int)
-        if (info_k && fn_class_get_fields && fn_field_get_name && fn_field_get_offset) {
-            int dict_count = 0;
-            uintptr_t dict_entries = 0;
-            void *fi2 = NULL;
-            Il2CppFieldInfo ff2;
-            while ((ff2 = fn_class_get_fields(info_k, &fi2)) != NULL) {
-                const char *fn2 = fn_field_get_name(ff2);
-                int fo2 = fn_field_get_offset(ff2);
-                if (fn2 && strcmp(fn2, "count") == 0) {
-                    install_sigsegv_handler();
-                    g_in_safe_access = 1;
-                    if (sigsetjmp(g_jmpbuf, 1) == 0)
-                        dict_count = *(volatile int32_t *)(mDLCSetInfo + fo2);
-                    g_in_safe_access = 0;
-                    uninstall_sigsegv_handler();
-                }
-                if (fn2 && strcmp(fn2, "entries") == 0) {
-                    install_sigsegv_handler();
-                    g_in_safe_access = 1;
-                    if (sigsetjmp(g_jmpbuf, 1) == 0)
-                        dict_entries = *(volatile uintptr_t *)(mDLCSetInfo + fo2);
-                    g_in_safe_access = 0;
-                    uninstall_sigsegv_handler();
-                }
-            }
-            LOGI("[dlc] mDLCSetInfo dict: count=%d entries=%p", dict_count, (void*)dict_entries);
-            
-            // 遍历 Dictionary 的 entries，找到每个 value（应该是 DLCSet 对象）
-            // Entry 布局: int hashCode(4), int next(4), TKey key(varies), TValue value(varies)
-            // 对于 Dictionary<int, DLCSet>: 
-            //   Entry = hashCode(4) + next(4) + key(int, 4) + padding(4) + value(ptr, 8) = 24 bytes
-            // 但实际布局取决于 il2cpp 的对齐。Array header = 0x20 (klass+monitor+bounds+max_length)
-            if (dict_entries && dict_count > 0 && dict_count < 100) {
-                // 先读 entries 数组的类型来确定 Entry 大小
-                if (fn_object_get_class && fn_class_get_name) {
-                    Il2CppClass ek = fn_object_get_class((Il2CppObject)dict_entries);
-                    const char *en = ek ? fn_class_get_name(ek) : "?";
-                    LOGI("[dlc] entries array class: %s", en);
-                }
-                
-                // 尝试不同的 Entry 大小来解析
-                // Entry for Dict<int, DLCSet>: hashCode(4) + next(4) + key(4) + pad(4) + value(8) = 24
-                int entry_size = 24; // 假设 24 字节每个 entry
-                LOGI("[dlc] === Scanning mDLCSetInfo entries (count=%d, entry_size=%d) ===", dict_count, entry_size);
-                for (int i = 0; i < dict_count && i < 50; i++) {
-                    uintptr_t entry_base = dict_entries + 0x20 + (uintptr_t)(i * entry_size);
-                    install_sigsegv_handler();
-                    g_in_safe_access = 1;
-                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                        int32_t hash = *(volatile int32_t *)(entry_base + 0);
-                        int32_t next = *(volatile int32_t *)(entry_base + 4);
-                        int32_t key  = *(volatile int32_t *)(entry_base + 8);
-                        uintptr_t val = *(volatile uintptr_t *)(entry_base + 16);
-                        LOGI("[dlc-dict] entry[%d]: hash=%d next=%d key=%d val=%p",
-                             i, hash, next, key, (void*)val);
-                        
-                        // 如果 val 是有效对象引用，读取其类型
-                        if (val > 0x10000 && fn_object_get_class && fn_class_get_name) {
-                            g_in_safe_access = 0;
-                            uninstall_sigsegv_handler();
-                            Il2CppClass vk = fn_object_get_class((Il2CppObject)val);
-                            const char *vn = vk ? fn_class_get_name(vk) : "?";
-                            LOGI("[dlc-dict]   val class: %s", vn);
-                            
-                            // 如果 value 是 DLCSet, 修改其内部角色字段
-                            if (vn && strcmp(vn, "DLCSet") == 0 && fn_class_get_fields) {
-                                void *fi3 = NULL;
-                                Il2CppFieldInfo ff3;
-                                int modified = 0;
-                                while ((ff3 = fn_class_get_fields(vk, &fi3)) != NULL) {
-                                    const char *fn3 = fn_field_get_name(ff3);
-                                    int fo3 = fn_field_get_offset(ff3);
-                                    if (!fn3) continue;
-                                    if (strcmp(fn3, "Discount") == 0 || strcmp(fn3, "dlcs") == 0 ||
-                                        strcmp(fn3, "startTime") == 0 || strcmp(fn3, "overTime") == 0)
-                                        continue;
-                                    
-                                    install_sigsegv_handler();
-                                    g_in_safe_access = 1;
-                                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                                        uintptr_t fv = *(volatile uintptr_t *)(val + fo3);
-                                        if (fv == 0) {
-                                            *(volatile uintptr_t *)(val + fo3) = 1;
-                                            modified++;
-                                            LOGI("[dlc-dict]   Set %s = 1 in DLCSet entry[%d]", fn3, i);
-                                        }
-                                    }
-                                    g_in_safe_access = 0;
-                                    uninstall_sigsegv_handler();
-                                }
-                                LOGI("[dlc-dict] Modified %d fields in DLCSet entry[%d]", modified, i);
-                            }
-                            continue; // 已处理完这个 entry
-                        }
-                    }
-                    g_in_safe_access = 0;
-                    uninstall_sigsegv_handler();
-                }
-            }
+        // 尝试 inline hook 原始蹦床
+        // 蹦床是 HybridCLR 的解释器入口：
+        // void* trampoline(void* thisptr, ..., MethodInfo* method)
+        // 对于 isUnlockRole(int): X0=this, W1=roleId, X2=MethodInfo*
+        // 我们把 isUnlockRole MI 的 methodPointer 已改为 stub
+        // 但是 HybridCLR 内部不走 methodPointer
+        // 
+        // 解决方案: 尝试修改 MethodInfo 的其他字段
+        // HybridCLR 用什么判断方法是否是解释器方法?
+        // 通常检查: method->isInterpterMethod 标志
+        // 或者检查 methodPointer 是否指向某个已知的解释器蹦床范围
+        
+        // 让我们试试: 不修改 methodPointer, 而是 inline hook 原始蹦床
+        if (g_orig_isUnlockRole_ptr != 0 && g_orig_isUnlockRole_ptr != (uintptr_t)g_stub_return_true) {
+            LOGI("[dlc] Original trampoline address: %p", (void*)g_orig_isUnlockRole_ptr);
+            LOGI("[dlc] Note: inline hooking shared trampoline is risky (affects ALL methods using it)");
+            // 不在这里做 inline hook，太危险。在下面尝试其他方法。
         }
     }
 
-    // ===== 7) 同时也调用 AddDLC(1-50) 确保 mLoginData.DLC 列表有值 =====
+    // ===== 8) 尝试通过 AddDLC 添加所有 DLC ID =====
     if (m_addDLC) {
         int add_ok = 0;
         for (int32_t dlcId = 1; dlcId <= 50; dlcId++) {
@@ -1814,31 +1826,58 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] AddDLC(1-50): %d OK", add_ok);
     }
 
-    // ===== 8) 验证最终解锁状态 =====
-    int unlocked_count = 0;
-    LOGI("[dlc] === Final unlock status ===");
-    for (int32_t rid = 0; rid <= 15; rid++) {
-        void *params[1] = { &rid };
-        exc = NULL;
-        void *result = NULL;
-        SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
-        int unlocked = -1;
-        if (!sigsegv_hit && result) { SAFE_UNBOX_INT(unlocked, result, -1); }
-        LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
-             unlocked > 0 ? " ✓" : " ✗");
-        if (unlocked > 0) unlocked_count++;
+    // ===== 9) 尝试找 get_DLCSetInfo 方法并调用（触发缓存更新）=====
+    {
+        Il2CppMethodInfo m_getDSI = fn_class_get_method_from_name(g_proto_login_cls, "get_DLCSetInfo", 0);
+        if (m_getDSI) {
+            exc = NULL;
+            void *dsi_result = NULL;
+            SAFE_INVOKE(dsi_result, m_getDSI, (void*)g_proto_login_inst, NULL, &exc);
+            if (!sigsegv_hit && dsi_result) {
+                // dsi_result 是 boxed 结果或直接对象引用
+                LOGI("[dlc] get_DLCSetInfo() returned %p", dsi_result);
+            } else {
+                LOGI("[dlc] get_DLCSetInfo() returned NULL or SIGSEGV");
+            }
+        } else {
+            LOGI("[dlc] get_DLCSetInfo method not found");
+        }
+    }
+
+    // ===== 10) 枚举 ProtoLogin 所有方法，找与 unlock/role/dlc 相关的 =====
+    if (verbose && fn_class_get_methods && fn_method_get_name && fn_method_get_param_count) {
+        LOGI("[dlc] ===== ProtoLogin methods scan =====");
+        void *iter = NULL;
+        Il2CppMethodInfo m;
+        while ((m = fn_class_get_methods(g_proto_login_cls, &iter)) != NULL) {
+            const char *name = fn_method_get_name(m);
+            if (!name) continue;
+            int params = fn_method_get_param_count(m);
+            
+            // 过滤: 只输出与 unlock/role/dlc/purchase/buy 相关的方法
+            if (strstr(name, "nlock") || strstr(name, "ock") ||
+                strstr(name, "role") || strstr(name, "Role") ||
+                strstr(name, "dlc") || strstr(name, "DLC") ||
+                strstr(name, "urchase") || strstr(name, "uy") ||
+                strstr(name, "set_") || strstr(name, "get_") ||
+                strstr(name, "Update") || strstr(name, "Login") ||
+                strstr(name, "Init") || strstr(name, "Base")) {
+                uintptr_t mptr = *(uintptr_t *)m;
+                LOGI("[dlc-methods] %s(%d) ptr=%p MI=%p", name, params, (void*)mptr, m);
+            }
+        }
     }
 
     if (unlocked_count >= 10) {
         g_dlc_unlocked = 1;
-        LOGI("[dlc] ★ DLC unlock SUCCESS!");
+        LOGI("[dlc] ★ DLC unlock SUCCESS via methodPointer replacement!");
     }
 
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock complete (unlocked=%d/16, fields_mod=%d) =====",
-         unlocked_count, fields_modified);
+    LOGI("[dlc] ===== DLC unlock v4 complete (unlocked=%d/16, mi_hooks=%d) =====",
+         unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }
 

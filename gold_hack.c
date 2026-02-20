@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.21"
+#define LOG_TAG "GoldHack v6.23"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -2062,50 +2062,159 @@ static int do_unlock_all_dlc(void) {
         if (unlocked > 0) unlocked_count++;
     }
 
-    // ===== 8) v6.22: 重新启用 AddDLC + UpdateDLC =====
-    // v6.17-v6.21 跳过了 AddDLC，导致 mDLCSet 数据为空，
-    // 游戏 UI 读取 mDLCSet 发现没有 DLC 数据 → 角色不显示为已解锁。
-    // isUnlockRole 通过 il2cpp_runtime_invoke 返回 true，但游戏内部
-    // HybridCLR 解释器直接读 mDLCSet，不调用 isUnlockRole！
-    // 必须通过 AddDLC 填充 mDLCSet 才能让 UI 显示解锁。
+    // ===== 8) v6.23: 直接操作 mDLCSet (HashSet<int>) =====
+    // v6.22 的 AddDLC 调用因 SIGSEGV 失败：AddDLC 是 HybridCLR 解释器方法，
+    // 其 interpData(f[10])=0 (延迟初始化)，调用时解释器蹦床读 NULL → 崩溃。
     //
-    // v6.17 按键失灵的原因是 DLC monitor 线程反复(30次+)调用 AddDLC/SaveLoginData，
-    // 现在只调用一次，不调用 SaveLoginData。
-    if (m_addDLC) {
-        LOGI("[dlc] v6.22: ===== Calling AddDLC to populate mDLCSet =====");
-        int add_ok = 0;
-        for (int32_t dlcId = 1; dlcId <= 50; dlcId++) {
-            void *params[1] = { &dlcId };
-            exc = NULL;
-            void *r = NULL;
-            SAFE_INVOKE(r, m_addDLC, (void *)g_proto_login_inst, params, &exc);
-            if (sigsegv_hit) {
-                LOGE("[dlc] AddDLC(%d) SIGSEGV, stopping", dlcId);
-                break;
+    // 新策略: 绕过 HybridCLR 的 AddDLC 方法，直接操作底层数据结构：
+    // 1. 从 ProtoLogin 实例读取 mDLCSet 字段（offset 0x40）
+    // 2. mDLCSet 是 HashSet<int>，这是 mscorlib 的 BCL 类，编译为原生 il2cpp 代码
+    // 3. 通过 il2cpp_object_get_class 获取 HashSet 类
+    // 4. 通过 il2cpp_class_get_method_from_name 找到原生 Add 方法
+    // 5. 调用 Add(dlcId) 填充 mDLCSet — 不经过 HybridCLR 解释器
+    {
+        LOGI("[dlc] v6.23: ===== Direct mDLCSet manipulation =====");
+        
+        // 读取 mDLCSet 指针 (offset 0x40 from ProtoLogin instance)
+        void *dlc_set_obj = NULL;
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+            dlc_set_obj = *(void **)(g_proto_login_inst + 0x40);
+        }
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        
+        LOGI("[dlc] v6.23: mDLCSet @ offset 0x40 = %p", dlc_set_obj);
+
+        if (!dlc_set_obj) {
+            // mDLCSet 为空，尝试通过字段枚举找到 mDLCSet 的类型信息来创建
+            LOGW("[dlc] v6.23: mDLCSet is NULL, trying to create HashSet<int>...");
+            
+            // 方法1: 从 mDLCSetInfo (offset 0x48) 获取类型参考
+            void *dlc_set_info_obj = NULL;
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                dlc_set_info_obj = *(void **)(g_proto_login_inst + 0x48);
             }
-            if (!exc) add_ok++;
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+            
+            // 如果 mDLCSetInfo 非空且也是 HashSet，用它的类创建新实例
+            if (dlc_set_info_obj && fn_object_get_class) {
+                Il2CppClass set_info_cls = fn_object_get_class(dlc_set_info_obj);
+                if (set_info_cls) {
+                    const char *cls_name = fn_class_get_name ? fn_class_get_name(set_info_cls) : "?";
+                    LOGI("[dlc] v6.23: mDLCSetInfo class = %s, using as template", cls_name);
+                    
+                    // 创建新 HashSet 实例
+                    if (fn_object_new) {
+                        dlc_set_obj = fn_object_new(set_info_cls);
+                        if (dlc_set_obj) {
+                            // 调用 .ctor() 初始化
+                            Il2CppMethodInfo ctor = fn_class_get_method_from_name(set_info_cls, ".ctor", 0);
+                            if (ctor) {
+                                exc = NULL;
+                                void *r = NULL;
+                                SAFE_INVOKE(r, ctor, dlc_set_obj, NULL, &exc);
+                                if (!sigsegv_hit && !exc) {
+                                    LOGI("[dlc] v6.23: Created new HashSet instance @ %p", dlc_set_obj);
+                                    // 写回 mDLCSet 字段
+                                    install_sigsegv_handler();
+                                    g_in_safe_access = 1;
+                                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                                        *(void **)(g_proto_login_inst + 0x40) = dlc_set_obj;
+                                    }
+                                    g_in_safe_access = 0;
+                                    uninstall_sigsegv_handler();
+                                } else {
+                                    LOGW("[dlc] v6.23: HashSet .ctor() failed");
+                                    dlc_set_obj = NULL;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
-        LOGI("[dlc] v6.22: AddDLC(1-50): %d OK", add_ok);
 
-        // 扩展 DLC ID
-        int extra_dlc_ids[] = {100, 101, 102, 103, 104, 105, 110, 120, 150, 
-                               200, 201, 202, 203, 204, 205, 210, 220, 250, 
-                               300, 301, 302, 303, 400, 500, 1000, 1001, 1002,
-                               2000, 2001, 2002, 3000, 3001, 5000, 10000};
-        int add_ok2 = 0;
-        for (int i = 0; i < (int)(sizeof(extra_dlc_ids)/sizeof(extra_dlc_ids[0])); i++) {
-            int32_t dlcId = extra_dlc_ids[i];
-            void *params[1] = { &dlcId };
-            exc = NULL;
-            void *r = NULL;
-            SAFE_INVOKE(r, m_addDLC, (void *)g_proto_login_inst, params, &exc);
-            if (sigsegv_hit) break;
-            if (!exc) add_ok2++;
+        int direct_add_ok = 0;
+        if (dlc_set_obj && fn_object_get_class) {
+            Il2CppClass hashset_cls = fn_object_get_class(dlc_set_obj);
+            const char *cls_name = (hashset_cls && fn_class_get_name) ? fn_class_get_name(hashset_cls) : "(null)";
+            LOGI("[dlc] v6.23: mDLCSet class = %s @ %p", cls_name, dlc_set_obj);
+            
+            // 找 Add 方法 (HashSet<int>.Add(int) → bool)
+            Il2CppMethodInfo add_mi = hashset_cls ? fn_class_get_method_from_name(hashset_cls, "Add", 1) : NULL;
+            if (add_mi) {
+                uintptr_t *af = (uintptr_t *)add_mi;
+                LOGI("[dlc] v6.23: HashSet.Add MI: f[0]=%p f[1]=%p f[10]=%p f[11]=%p MI=%p",
+                     (void *)af[0], (void *)af[1], (void *)af[10], (void *)af[11], add_mi);
+                
+                // 检查 Add 是否是原生方法（interpData 应非零，或 f[0] 指向非 HybridCLR 蹦床）
+                // 如果 f[10] == 0 且 f[0] == f[11] → 也是 HybridCLR 方法，可能也会崩溃
+                int is_native = (af[10] != 0) || (af[0] != af[11]);
+                LOGI("[dlc] v6.23: HashSet.Add is %s (interpData=%p, mPtr==bridge? %s)",
+                     is_native ? "NATIVE ✓" : "HybridCLR ✗",
+                     (void *)af[10], (af[0] == af[11]) ? "yes" : "no");
+                
+                // 调用 Add 添加 DLC ID 0-50
+                for (int32_t dlcId = 0; dlcId <= 50; dlcId++) {
+                    void *params[1] = { &dlcId };
+                    exc = NULL;
+                    void *r = NULL;
+                    SAFE_INVOKE(r, add_mi, dlc_set_obj, params, &exc);
+                    if (sigsegv_hit) {
+                        LOGE("[dlc] v6.23: HashSet.Add(%d) SIGSEGV, stopping", dlcId);
+                        break;
+                    }
+                    if (!exc) direct_add_ok++;
+                }
+                LOGI("[dlc] v6.23: HashSet.Add(0-50): %d OK", direct_add_ok);
+                
+                if (!sigsegv_hit) {
+                    // 扩展 DLC ID
+                    int extra_dlc_ids[] = {100, 101, 102, 103, 104, 105, 110, 120, 150, 
+                                           200, 201, 202, 203, 204, 205, 210, 220, 250, 
+                                           300, 301, 302, 303, 400, 500, 1000, 1001, 1002,
+                                           2000, 2001, 2002, 3000, 3001, 5000, 10000};
+                    int add_ok2 = 0;
+                    for (int i = 0; i < (int)(sizeof(extra_dlc_ids)/sizeof(extra_dlc_ids[0])); i++) {
+                        int32_t dlcId = extra_dlc_ids[i];
+                        void *params[1] = { &dlcId };
+                        exc = NULL;
+                        void *r = NULL;
+                        SAFE_INVOKE(r, add_mi, dlc_set_obj, params, &exc);
+                        if (sigsegv_hit) break;
+                        if (!exc) add_ok2++;
+                    }
+                    LOGI("[dlc] v6.23: HashSet.Add(extra): %d OK", add_ok2);
+                    direct_add_ok += add_ok2;
+                }
+            } else {
+                LOGW("[dlc] v6.23: HashSet.Add method not found on class %s", cls_name);
+                
+                // 备选: 枚举所有方法找 Add
+                if (hashset_cls && fn_class_get_methods && fn_method_get_name) {
+                    void *miter = NULL;
+                    Il2CppMethodInfo m;
+                    LOGI("[dlc] v6.23: Enumerating methods of %s:", cls_name);
+                    while ((m = fn_class_get_methods(hashset_cls, &miter)) != NULL) {
+                        const char *mname = fn_method_get_name(m);
+                        int pc = fn_method_get_param_count ? fn_method_get_param_count(m) : -1;
+                        LOGI("[dlc] v6.23:   %s(%d) MI=%p", mname, pc, m);
+                    }
+                }
+            }
+        } else if (!dlc_set_obj) {
+            LOGW("[dlc] v6.23: mDLCSet is NULL and could not be created");
         }
-        LOGI("[dlc] v6.22: AddDLC(extra): %d OK", add_ok2);
+        
+        LOGI("[dlc] v6.23: Direct mDLCSet manipulation: %d items added", direct_add_ok);
     }
-
-    // UpdateDLC 刷新缓存
+    
+    // UpdateDLC 刷新缓存 (UpdateDLC 的 interpData 正常，不会 SIGSEGV)
     {
         Il2CppMethodInfo m_updateDLC = fn_class_get_method_from_name(g_proto_login_cls, "UpdateDLC", 0);
         if (m_updateDLC) {
@@ -2113,15 +2222,12 @@ static int do_unlock_all_dlc(void) {
             void *r = NULL;
             SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
             if (!sigsegv_hit && !exc) {
-                LOGI("[dlc] v6.22: ★ UpdateDLC() OK");
+                LOGI("[dlc] v6.23: ★ UpdateDLC() OK");
             } else {
-                LOGW("[dlc] v6.22: UpdateDLC() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
+                LOGW("[dlc] v6.23: UpdateDLC() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
             }
         }
     }
-
-    // v6.22: 不调用 SaveLoginData — 避免写入持久数据导致问题
-    LOGI("[dlc] v6.22: Skipping SaveLoginData (not needed, AddDLC already populates mDLCSet)");
 
     if (unlocked_count >= 10) {
         g_dlc_unlocked = 1;
@@ -2131,7 +2237,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.22 complete (unlocked=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.23 complete (unlocked=%d/16, mi_hooks=%d) =====",
          unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

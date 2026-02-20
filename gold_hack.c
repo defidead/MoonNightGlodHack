@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.30b"
+#define LOG_TAG "GoldHack v6.31"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1928,71 +1928,90 @@ static int do_unlock_all_dlc(void) {
             // 保留 interpData 让真实 IL 逻辑在正确的 DLCSet 数据上运行。
             // --- f[10] 保持原样 ---
             
-            // v6.30b: 完整 interpData dump + interpData=NULL 方案
-            // 发现: interpData+0x08 处所有方法内容相同, 说明 +0x08 不是 codes!
-            // 需要 dump 完整 interpData 来找到真正的 codes 偏移.
-            // 同时: PREPARE_NEW_FRAME_FROM_INTERPRETER 有 NULL 检查!
-            //   imi = method->interpData ? (InterpMethodInfo*)method->interpData
-            //       : InterpreterModule::GetInterpMethodInfo(method);
-            // 如果 interpData=NULL, 会重新 Transform. 但我们修改了:
-            //   - f[0] = custom_return_true_method (不是解释器蹦床)
-            //   - bit5=0 (isInterpterImpl=false)
-            // Transform 会看到 isInterpterImpl=false, 将方法当作 native 编译
-            // 生成 CallCommonNativeInstance 指令调用 f[11] (我们的 bridge)
-            // 这就是关键: 重新 Transform 后调用者会用 bridge 路径!
+            // v6.31: 全新策略 — 修改 resolveDatas 中引用的方法
+            // 发现: codes(在 interpData+0x08)所有方法相同 = 它们都执行同一模板
+            // 行为差异来自 resolveDatas(在 interpData+0x18)
+            // IR 指令使用 resolveDatas 中的 MethodInfo* 来调用子方法
+            // 策略: 保留 interpData 不变, 修改 resolveDatas 中的每个 MethodInfo 的 f[11]
+            //   这样当 IR 指令执行 CallCommonNativeInstance 时
+            //   会调用我们的 bridge 返回 true
+            //
+            // 但更简单的方法: 直接修改 codes 内容!
+            // IR codes (8 bytes): 0x0004 0x0001 | 0x0001 0x0004
+            //   如果指令1 (opcode=4) 是某种调用指令
+            //   指令2 (opcode=1) 是 RetVar_ret_1 返回
+            //   我们可以把指令1 替换为 LdcVarConst_1 (opcode=?)
+            //
+            // 策略: 分配新的 codes 内存, 只包含 RetVar_ret_1
+            //   但返回值槽未初始化... 不安全.
+            //
+            // 最终策略: 分配新 codes, 复制原始 codes,
+            //   修改 resolveDatas 里引用的 MI 的 f[0]/f[11]
             if (f[10]) {
                 uint8_t *imi_raw = (uint8_t*)f[10];
+                uintptr_t resolve_ptr = *(uintptr_t*)(imi_raw + 0x18);
                 
-                // 完整 dump interpData (96 字节 = 12 qwords)
-                LOGI("[dlc] v6.30b %s interpData=%p FULL DUMP:", mname, (void*)f[10]);
-                for (int di = 0; di < 12; di++) {
-                    uintptr_t val = *(uintptr_t*)(imi_raw + di * 8);
-                    LOGI("[dlc]   +0x%02x: 0x%016lx", di * 8, (unsigned long)val);
-                }
-                // 对每个看起来像指针的值, dump 其指向的前 16 字节
-                for (int di = 0; di < 12; di++) {
-                    uintptr_t val = *(uintptr_t*)(imi_raw + di * 8);
-                    if (val > 0x700000000000ULL && val < 0xc000000000000000ULL) {
-                        uint8_t *p = (uint8_t *)val;
-                        LOGI("[dlc]   +0x%02x→ %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
-                             di * 8, p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
-                             p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15]);
+                LOGI("[dlc] v6.31 %s: interpData=%p resolveDatas=%p", mname, (void*)f[10], (void*)resolve_ptr);
+                
+                if (resolve_ptr && resolve_ptr > 0x1000) {
+                    // dump resolveDatas 前 64 字节 (8 qwords)
+                    uintptr_t *rd = (uintptr_t *)resolve_ptr;
+                    LOGI("[dlc] v6.31 %s resolveDatas:", mname);
+                    for (int ri = 0; ri < 8; ri++) {
+                        uintptr_t rval = rd[ri];
+                        LOGI("[dlc]   rd[%d] = 0x%016lx", ri, (unsigned long)rval);
+                        // 如果看起来像指针, 检查是否是 MethodInfo
+                        if (rval > 0x700000000000ULL && rval < 0xc000000000000000ULL) {
+                            uintptr_t *candidate_mi = (uintptr_t *)rval;
+                            // MethodInfo 的 f[0] 应该是一个代码指针 (0x72... 范围)
+                            uintptr_t cf0 = candidate_mi[0];
+                            uintptr_t cf1 = candidate_mi[1];
+                            if (cf0 > 0x700000000000ULL && cf0 < 0x800000000000ULL) {
+                                // 看起来像 MethodInfo! f[2] 应该是名字字符串
+                                const char *rd_name = "(unknown)";
+                                uintptr_t name_ptr = candidate_mi[2];
+                                if (name_ptr > 0x700000000000ULL) {
+                                    // Il2CppString: len at +0x10, chars at +0x14
+                                    // 但 MethodInfo 的 name 是 const char* (C 字符串)
+                                    // 实际上 name_ptr 是 MHP 加密后的字符串指针
+                                    // 用 fn_method_get_name 获取名字更安全
+                                    rd_name = fn_method_get_name ? 
+                                              fn_method_get_name((void*)rval) : "(no API)";
+                                }
+                                uintptr_t cf10 = candidate_mi[10]; // interpData
+                                uintptr_t cf11 = candidate_mi[11]; // methodPointerCallByInterp
+                                LOGI("[dlc]     → MethodInfo '%s' f[0]=%p f[11]=%p interpData=%p",
+                                     rd_name, (void*)cf0, (void*)cf11, (void*)cf10);
+                                
+                                // ★ 核心: 修改这个子方法的 f[0] 和 f[11]
+                                // 这样当 IR 执行 CallCommonNativeInstance 时
+                                // 会调用我们的 bridge 返回 true
+                                candidate_mi[0] = (uintptr_t)custom_return_true_method;
+                                candidate_mi[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
+                                candidate_mi[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
+                                LOGI("[dlc]     ★ rd[%d] MI '%s' PATCHED f[0]+f[11]+f[12]", ri, rd_name);
+                            }
+                        }
                     }
                 }
                 
-                // === v6.30b 核心: 将 interpData 设为 NULL ===
-                // 这样 PREPARE_NEW_FRAME_FROM_INTERPRETER 会调用
-                // InterpreterModule::GetInterpMethodInfo(method) 重新 Transform.
-                // 由于我们已经设了:
-                //   bit5=0 (isInterpterImpl=false)
-                //   f[0]=custom_return_true_method
-                //   f[11]=custom_hybridclr_bridge_bool_true
-                // Transform 会看到 !IsInterpreterImplement(), 生成:
-                //   CallCommonNativeInstance_u1_i4 → 调用 f[11]
-                // 或者如果不重新 Transform (因为调用者已缓存), 至少
-                // GetInterpMethodInfo 会重新计算 interpData.
-                //
-                // 风险: 如果其他地方也引用了这个 interpData, 设 NULL 不影响它们.
-                // 风险: 如果 GetInterpMethodInfo 断言 isInterpterImpl==true, 会崩溃.
-                //       标准 HybridCLR: GetInterpMethodInfo 不检查 isInterpterImpl.
-                //       它直接调用 InterpreterModule::GetInterpMethodInfo → Transform.
-                //       Transform 中: if (!method->isInterpterImpl) → 走 native 路径.
-                //
-                // 先试一下, 如果崩溃就回退.
-                f[10] = 0;  // interpData = NULL
-                LOGI("[dlc] ★ v6.30b %s: interpData set to NULL (was %p)", mname, imi_raw);
+                // ★ 不设 interpData=NULL, 保留原始 interpData
+                // 不清除 bit5, 保留 isInterpterImpl=true
+                // 这样解释器仍然执行原始 IR codes
+                // 但 IR codes 中引用的子方法已被 patch
             } else {
-                LOGI("[dlc] v6.30b %s: interpData already NULL", mname);
+                LOGI("[dlc] v6.31 %s: no interpData", mname);
             }
             
             // v6.29: f[11]/f[12] 指向桥接函数 (供 CallNativeStatic 路径使用)
             f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
             f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
-            // v6.29: 设置 bit4 (initInterpCallMethodPointer) + 清除 bit5 (isInterpterImpl)
-            // 清除 bit5 让 FUTURE Transform 走 CallNativeStatic → 桥接 → 我们的函数
-            // 已变换的调用者仍用 CallInterp_void → 原始 interpData → 原始 IL
+            // v6.31: 保留 bit5 (isInterpterImpl=true)! 不清除!
+            // 让解释器继续执行原始 IR codes
+            // 但 IR codes 中调用的子方法已被我们 patch
+            // 只设 bit4 (initInterpCallMethodPointer)
             uint8_t *bitfield = (uint8_t *)mi + 0x4B;
-            *bitfield = (*bitfield | (1 << 4)) & ~(1 << 5);
+            *bitfield = *bitfield | (1 << 4);  // 不清 bit5!
             
             LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p bridge=%p bf=0x%02x interpData=%p MI=%p (v6.29)",
                  mname, (void*)f[0], (void*)f[1], (void*)f[11], *((uint8_t *)mi + 0x4B), (void*)f[10], mi);
@@ -2040,16 +2059,32 @@ static int do_unlock_all_dlc(void) {
             f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
             f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
             // f[2] = name → 不动!
-            // v6.30b: 同样将 interpData 设为 NULL
+            // v6.31: 同样修改 resolveDatas 中引用的 MI
             if (f[10]) {
-                LOGI("[dlc] ★ v6.30b extra %s: interpData set to NULL (was %p)", extra_proto_methods[ep], (void*)f[10]);
-                f[10] = 0;
+                uint8_t *imi_raw = (uint8_t*)f[10];
+                uintptr_t resolve_ptr = *(uintptr_t*)(imi_raw + 0x18);
+                if (resolve_ptr && resolve_ptr > 0x1000) {
+                    uintptr_t *rd = (uintptr_t *)resolve_ptr;
+                    for (int ri = 0; ri < 8; ri++) {
+                        uintptr_t rval = rd[ri];
+                        if (rval > 0x700000000000ULL && rval < 0xc000000000000000ULL) {
+                            uintptr_t *cmi = (uintptr_t *)rval;
+                            uintptr_t cf0 = cmi[0];
+                            if (cf0 > 0x700000000000ULL && cf0 < 0x800000000000ULL) {
+                                cmi[0] = (uintptr_t)custom_return_true_method;
+                                cmi[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
+                                cmi[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
+                                LOGI("[dlc] ★ v6.31 extra %s rd[%d] MI PATCHED", extra_proto_methods[ep], ri);
+                            }
+                        }
+                    }
+                }
             }
             f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // methodPointerCallByInterp
             f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // virtualMethodPointerCallByInterp
-            // v6.29: set bit4 + clear bit5
+            // v6.31: 保留 bit5, 只设 bit4
             uint8_t *bf = (uint8_t *)mi + 0x4B;
-            *bf = (*bf | (1 << 4)) & ~(1 << 5);
+            *bf = *bf | (1 << 4);
             LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.30) bf=0x%02x interpData=%p MI=%p",
                  extra_proto_methods[ep], pc_found, *bf, (void*)f[10], mi);
             patched++;
@@ -2571,7 +2606,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.30b complete (patched=%d/16, real=%d/16, mi_hooks=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.31 complete (patched=%d/16, real=%d/16, mi_hooks=%d) =====",
          unlocked_count, real_unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }

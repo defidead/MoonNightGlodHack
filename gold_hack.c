@@ -4765,8 +4765,10 @@ static void *hack_thread(void *arg) {
     // 5.7 安装 DLC/职业解锁绕过
     bypass_dlc_lock();
 
-    // 5.8 启动后台 DLC 持续解锁线程
-    {
+    // 5.8 v6.18: 禁用自动 DLC 后台线程 — 避免干扰游戏 UI
+    // 用户通过 overlay 菜单的“解锁DLC”按钮手动触发
+    LOGI("[dlc-monitor] v6.18: Auto DLC monitor disabled - use overlay button to unlock");
+#if 0  // v6.18: disabled
         pthread_t dlc_tid;
         if (pthread_create(&dlc_tid, NULL, dlc_monitor_thread, NULL) == 0) {
             pthread_detach(dlc_tid);
@@ -4775,6 +4777,7 @@ static void *hack_thread(void *arg) {
             LOGW("[dlc-monitor] Failed to create DLC monitor thread");
         }
     }
+#endif  // v6.18: disabled auto DLC monitor
 
     // 6. 启动游戏内悬浮菜单
 #ifdef OVERLAY_DEX

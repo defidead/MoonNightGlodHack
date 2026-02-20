@@ -38,7 +38,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
     private EditText lostthingInput, cardInput, cardCountInput, equipSlotsInput;
     private Button toggleBtn;
     private Button autoSkillBtn;
-    private boolean collapsed = false;
+    private boolean collapsed = true; // v6.18: 默认折叠，避免遮挡游戏按键
     private boolean autoSkillReset = false;
     private Handler autoResetHandler;
     private float density;
@@ -162,7 +162,7 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         verLabel.setLayoutParams(vlp);
         titleBar.addView(verLabel);
 
-        toggleBtn = makeBtn("\u2014", 0x33FFFFFF, BTN_TOGGLE);
+        toggleBtn = makeBtn("+", 0x33FFFFFF, BTN_TOGGLE); // v6.18: 默认折叠状态显示 '+'
         toggleBtn.setTextColor(0xFFA5B4FC);
         toggleBtn.setLayoutParams(new LinearLayout.LayoutParams(dp(28), dp(28)));
         titleBar.addView(toggleBtn);
@@ -363,18 +363,24 @@ public class OverlayMenu implements View.OnClickListener, View.OnTouchListener {
         container.addView(scrollView);
 
         // ===== WindowManager 参数 =====
+        // v6.18: 添加 FLAG_NOT_TOUCH_MODAL 确保触摸事件穿透到游戏
         wmParams = new WindowManager.LayoutParams(
-                dp(250),
+                ViewGroup.LayoutParams.WRAP_CONTENT,  // v6.18: 默认折叠状态用 WRAP_CONTENT
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 2,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT);
         wmParams.gravity = Gravity.TOP | Gravity.LEFT;
         wmParams.x = dp(10);
         wmParams.y = dp(80);
 
         wm.addView(container, wmParams);
-        android.util.Log.i("GoldHack", "Overlay menu created (v2.0)");
+        
+        // v6.18: 默认折叠 - scrollView 隐藏
+        scrollView.setVisibility(View.GONE);
+        
+        android.util.Log.i("GoldHack", "Overlay menu created (v2.0 - collapsed by default)");
     }
 
     // ===== 辅助: 创建区段卡片 =====

@@ -5055,10 +5055,9 @@ static void *dlc_monitor_thread(void *arg) {
             sleep(3);
             continue;
         } else if (result > 0) {
-            LOGI("[dlc-monitor] ★ %d/16 roles unlocked! Will keep monitoring...", result);
-            // v6.28: 恢复 v6.9 行为 — 成功后放慢频率，持续监控（防止游戏重置）
-            sleep(10);
-            continue;
+            LOGI("[dlc-monitor] ★ %d/16 roles unlocked! Monitor done.", result);
+            // v6.28b: 成功后退出 — 持续调用 il2cpp API 从后台线程会导致崩溃
+            break;
         } else {
             // result == 0: 所有策略都无效，可能游戏未完全加载
             LOGW("[dlc-monitor] 0 roles unlocked, retrying in 5s...", result);

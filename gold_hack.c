@@ -1608,6 +1608,18 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] Instance validation: isUnlockRole(0) = %d (valid!)", val);
     }
 
+    // ===== 3.5) 枚举 ProtoLogin 所有字段（确认偏移量） =====
+    if (verbose && fn_class_get_fields && fn_field_get_name && fn_field_get_offset) {
+        void *fiter = NULL;
+        Il2CppFieldInfo f;
+        LOGI("[dlc] === ProtoLogin fields ===");
+        while ((f = fn_class_get_fields(g_proto_login_cls, &fiter)) != NULL) {
+            const char *fname = fn_field_get_name(f);
+            int foffset = fn_field_get_offset(f);
+            LOGI("[dlc-pf] Field: %s @ 0x%x", fname ? fname : "?", foffset);
+        }
+    }
+
     // ===== 4) 读取所有 HashSet 指针 =====
     uintptr_t mDLCSet = 0, baseRoles = 0, packAll = 0;
     uintptr_t mDLCSetInfo = 0, mProduct2DLC = 0;
@@ -1854,6 +1866,56 @@ static int do_unlock_all_dlc(void) {
         if (sigsetjmp(g_jmpbuf, 1) == 0) {
             *(volatile uintptr_t *)(g_proto_login_inst + 0x40) = packAll;
             mDLCSet = packAll;
+        }
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        
+        // 读取 packAll 的 HashSet<int> 内部字段来验证内容
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+            // HashSet<T> 内部布局 (il2cpp): klass+0x00, monitor+0x08
+            // _buckets+0x10, _slots+0x18, _count+0x20, _lastIndex+0x24
+            // _freeList+0x28, _freeCount+0x2C, _comparer+0x30, _version+0x38
+            int32_t hs_count = *(volatile int32_t *)(packAll + 0x20);
+            int32_t hs_lastIndex = *(volatile int32_t *)(packAll + 0x24);
+            int32_t hs_freeList = *(volatile int32_t *)(packAll + 0x28);
+            int32_t hs_freeCount = *(volatile int32_t *)(packAll + 0x2C);
+            uintptr_t hs_slots = *(volatile uintptr_t *)(packAll + 0x18);
+            LOGI("[dlc] packAll internals: count=%d lastIdx=%d freeList=%d freeCnt=%d slots=%p",
+                 hs_count, hs_lastIndex, hs_freeList, hs_freeCount, (void*)hs_slots);
+            
+            // 也读 BaseRoles 的内部信息
+            if (baseRoles) {
+                int32_t br_count = *(volatile int32_t *)(baseRoles + 0x20);
+                LOGI("[dlc] BaseRoles internals: count=%d", br_count);
+            }
+            // 读 packMagic, packClassics
+            uintptr_t pm = *(volatile uintptr_t *)(g_proto_login_inst + 0x68);
+            uintptr_t pc = *(volatile uintptr_t *)(g_proto_login_inst + 0x70);
+            if (pm) {
+                int32_t pm_count = *(volatile int32_t *)(pm + 0x20);
+                LOGI("[dlc] packMagic count=%d", pm_count);
+            }
+            if (pc) {
+                int32_t pc_count = *(volatile int32_t *)(pc + 0x20);
+                LOGI("[dlc] packClassics count=%d", pc_count);
+            }
+            
+            // 如果 packAll 有 slots，读几个 slot 值 
+            // Slot 结构: { int hashCode, int next, T value } = 12 bytes per slot
+            if (hs_slots && hs_count > 0) {
+                LOGI("[dlc] packAll first items (from slots):");
+                int to_show = hs_count > 10 ? 10 : hs_count;
+                for (int i = 0; i < to_show; i++) {
+                    // Each slot: hashCode(4) + next(4) + value(4) = 12 bytes
+                    uintptr_t slot_base = hs_slots + 0x20 + (uintptr_t)(i * 12); // Array header is 0x20
+                    int32_t hash_code = *(volatile int32_t *)(slot_base + 0);
+                    int32_t next_idx = *(volatile int32_t *)(slot_base + 4);
+                    int32_t value = *(volatile int32_t *)(slot_base + 8);
+                    LOGI("[dlc]   slot[%d]: hash=%d next=%d value=%d", i, hash_code, next_idx, value);
+                }
+            }
         }
         g_in_safe_access = 0;
         uninstall_sigsegv_handler();

@@ -1851,15 +1851,18 @@ static int do_unlock_all_dlc(void) {
             if (strcmp(mname, "isUnlockRole") == 0 && g_orig_isUnlockRole_ptr == 0)
                 g_orig_isUnlockRole_ptr = f[0];
             
-            // [0] methodPointer → 我们的 C 函数 (解释器内部调用走这里)
+            // [0] methodPointer → 我们的 C 函数
             f[0] = (uintptr_t)custom_return_true_method;
             // [1] invoker → 自定义 invoker (il2cpp_runtime_invoke 走这里)
             f[1] = (uintptr_t)custom_bool_true_invoker;
             // [10] interpData → NULL (让解释器不再解释 IL，回退到 methodPointer)
             f[10] = 0;
-            // v6.10: MI struct 只有 14 个 fields (112 bytes)，不写 f[11]/f[12]/f[15] 避免越界
+            // [11],[12] HybridCLR 解释器实际读取的 methodPointer 副本
+            f[11] = (uintptr_t)custom_return_true_method;
+            f[12] = (uintptr_t)custom_return_true_method;
             // [13] 清除 HybridCLR 标志 (0x100)，保留其他 flags
             f[13] = f[13] & ~(uintptr_t)0x100;
+            // v6.11: 不写 f[15] — 它越界到相邻 MI 的 f[1]
             
             LOGI("[dlc] ★ %s PATCHED: ptr=%p inv=%p interp=0 flags=0x%x MI=%p",
                  mname, (void*)f[0], (void*)f[1], (int)f[13], mi);
@@ -1899,8 +1902,10 @@ static int do_unlock_all_dlc(void) {
             f[0] = (uintptr_t)custom_return_true_method;
             f[1] = (uintptr_t)custom_bool_true_invoker;
             f[10] = 0;
-            // v6.10: MI struct 只有 14 个 fields, 不写 f[11]/f[12]/f[15]
+            f[11] = (uintptr_t)custom_return_true_method;
+            f[12] = (uintptr_t)custom_return_true_method;
             f[13] = f[13] & ~(uintptr_t)0x100;
+            // v6.11: 不写 f[15] (越界)
             LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (by name lookup) MI=%p", extra_proto_methods[ep], pc_found, mi);
             patched++;
         }
@@ -1960,8 +1965,10 @@ static int do_unlock_all_dlc(void) {
             f[0]  = (uintptr_t)custom_return_true_method;
             f[1]  = (uintptr_t)custom_bool_true_invoker;
             f[10] = 0;
-            // v6.10: MI struct 只有 14 个 fields, 不写 f[11]/f[12]/f[15]
+            f[11] = (uintptr_t)custom_return_true_method;
+            f[12] = (uintptr_t)custom_return_true_method;
             f[13] = f[13] & ~(uintptr_t)0x100;
+            // v6.11: 不写 f[15] (越界)
             
             LOGI("[dlc] ★ %s.%s PATCHED", extra_patches[e].cls_name, extra_patches[e].method_name);
             extra_patched++;

@@ -1843,7 +1843,7 @@ static int do_unlock_all_dlc(void) {
             // 设置页面可写
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
-            uintptr_t page_end = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
+            uintptr_t page_end = ((uintptr_t)mi + 0x70) & ~(uintptr_t)0xFFF;  // MI=112 bytes=0x70
             if (page_end != page)
                 mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
             
@@ -1857,13 +1857,9 @@ static int do_unlock_all_dlc(void) {
             f[1] = (uintptr_t)custom_bool_true_invoker;
             // [10] interpData → NULL (让解释器不再解释 IL，回退到 methodPointer)
             f[10] = 0;
-            // [11],[12] methodPointer 副本也更新
-            f[11] = (uintptr_t)custom_return_true_method;
-            f[12] = (uintptr_t)custom_return_true_method;
+            // v6.10: MI struct 只有 14 个 fields (112 bytes)，不写 f[11]/f[12]/f[15] 避免越界
             // [13] 清除 HybridCLR 标志 (0x100)，保留其他 flags
             f[13] = f[13] & ~(uintptr_t)0x100;
-            // [15] invoker 副本
-            f[15] = (uintptr_t)custom_bool_true_invoker;
             
             LOGI("[dlc] ★ %s PATCHED: ptr=%p inv=%p interp=0 flags=0x%x MI=%p",
                  mname, (void*)f[0], (void*)f[1], (int)f[13], mi);
@@ -1898,14 +1894,13 @@ static int do_unlock_all_dlc(void) {
                  extra_proto_methods[ep], pc_found, (void*)f[0], (void*)f[1], (void*)f[10], (int)f[13], mi);
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
             mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
-            uintptr_t page_end = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
+            uintptr_t page_end = ((uintptr_t)mi + 0x70) & ~(uintptr_t)0xFFF;  // MI=112 bytes
             if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
             f[0] = (uintptr_t)custom_return_true_method;
             f[1] = (uintptr_t)custom_bool_true_invoker;
-            f[10] = 0; f[11] = (uintptr_t)custom_return_true_method;
-            f[12] = (uintptr_t)custom_return_true_method;
+            f[10] = 0;
+            // v6.10: MI struct 只有 14 个 fields, 不写 f[11]/f[12]/f[15]
             f[13] = f[13] & ~(uintptr_t)0x100;
-            f[15] = (uintptr_t)custom_bool_true_invoker;
             LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (by name lookup) MI=%p", extra_proto_methods[ep], pc_found, mi);
             patched++;
         }
@@ -1959,16 +1954,14 @@ static int do_unlock_all_dlc(void) {
             
             uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
             mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
-            uintptr_t pe = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
+            uintptr_t pe = ((uintptr_t)mi + 0x70) & ~(uintptr_t)0xFFF;  // MI=112 bytes
             if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
             
             f[0]  = (uintptr_t)custom_return_true_method;
             f[1]  = (uintptr_t)custom_bool_true_invoker;
             f[10] = 0;
-            f[11] = (uintptr_t)custom_return_true_method;
-            f[12] = (uintptr_t)custom_return_true_method;
+            // v6.10: MI struct 只有 14 个 fields, 不写 f[11]/f[12]/f[15]
             f[13] = f[13] & ~(uintptr_t)0x100;
-            f[15] = (uintptr_t)custom_bool_true_invoker;
             
             LOGI("[dlc] ★ %s.%s PATCHED", extra_patches[e].cls_name, extra_patches[e].method_name);
             extra_patched++;

@@ -1928,22 +1928,39 @@ static int do_unlock_all_dlc(void) {
             // 保留 interpData 让真实 IL 逻辑在正确的 DLCSet 数据上运行。
             // --- f[10] 保持原样 ---
             
-            // v6.29: dump interpData 结构 (仅 isUnlockRole)
+            // v6.29.1: 完整 dump interpData 原始字节 (仅 isUnlockRole)
+            // 发现: +0x00 不是 codes, 指向 MI 地址! 说明 MHP HybridCLR 的 InterpMethodInfo 布局不同
             if (strcmp(mname, "isUnlockRole") == 0 && f[10]) {
                 uint8_t *imi = (uint8_t*)f[10];
-                LOGI("[dlc] v6.29 interpData=%p: codes=%p args=%p resolveData=%p",
-                     (void*)f[10], (void*)*(uintptr_t*)(imi),
-                     (void*)*(uintptr_t*)(imi+8), (void*)*(uintptr_t*)(imi+16));
-                LOGI("[dlc] v6.29  argStackObj=%d maxStack=%d argCnt/codeLen=0x%08x evalStackBase=%d",
-                     *(uint32_t*)(imi+0x20), *(uint32_t*)(imi+0x2C),
-                     *(uint32_t*)(imi+0x30), *(uint32_t*)(imi+0x38));
-                void *codes = (void*)*(uintptr_t*)(imi);
-                if (codes) {
-                    uint8_t *c = (uint8_t*)codes;
-                    LOGI("[dlc] v6.29 IR[0-15]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
+                // 原始字节 dump (64 bytes = 8 qwords)
+                LOGI("[dlc] v6.29.1 interpData=%p RAW DUMP:", (void*)f[10]);
+                for (int di = 0; di < 8; di++) {
+                    uintptr_t val = *(uintptr_t*)(imi + di * 8);
+                    LOGI("[dlc]   +0x%02x: 0x%016lx  (%lu)", di * 8, (unsigned long)val, (unsigned long)val);
+                }
+                // 额外 dump +0x40 到 +0x58 (可能的扩展字段)
+                for (int di = 8; di < 12; di++) {
+                    uintptr_t val = *(uintptr_t*)(imi + di * 8);
+                    LOGI("[dlc]   +0x%02x: 0x%016lx", di * 8, (unsigned long)val);
+                }
+                // 尝试 +0x08 作为 codes (MHP 可能在 +0x00 放了 method 回指)
+                void *maybe_codes = (void*)*(uintptr_t*)(imi + 0x08);
+                if (maybe_codes && (uintptr_t)maybe_codes > 0x1000) {
+                    uint8_t *c = (uint8_t*)maybe_codes;
+                    LOGI("[dlc] v6.29.1 possible codes@+0x08=%p:", maybe_codes);
+                    LOGI("[dlc]   [0-15]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
                          c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],c[14],c[15]);
-                    LOGI("[dlc] v6.29 IR[16-31]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
+                    LOGI("[dlc]   [16-31]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
                          c[16],c[17],c[18],c[19],c[20],c[21],c[22],c[23],c[24],c[25],c[26],c[27],c[28],c[29],c[30],c[31]);
+                }
+                // 也试 +0x18 作为 codes
+                void *maybe_codes2 = (void*)*(uintptr_t*)(imi + 0x18);
+                if (maybe_codes2 && (uintptr_t)maybe_codes2 > 0x1000 
+                    && maybe_codes2 != (void*)f[10] && maybe_codes2 != mi) {
+                    uint8_t *c = (uint8_t*)maybe_codes2;
+                    LOGI("[dlc] v6.29.1 possible codes@+0x18=%p:", maybe_codes2);
+                    LOGI("[dlc]   [0-15]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
+                         c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],c[14],c[15]);
                 }
             }
             

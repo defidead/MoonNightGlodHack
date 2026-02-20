@@ -2198,7 +2198,11 @@ static int do_unlock_all_dlc(void) {
             Il2CppMethodInfo tmp_mi = fn_class_get_method_from_name(g_proto_login_cls, "isUnlockRole", 1);
             if (tmp_mi) {
                 uintptr_t *tf = (uintptr_t *)tmp_mi;
-                if (tf[0] != (uintptr_t)custom_return_true_method && tf[0] > 0x700000000000ULL) {
+                LOGI("[dlc] v6.32: isUnlockRole tmp_mi=%p f[0]=%p custom_ret_true=%p",
+                     tmp_mi, (void*)tf[0], (void*)(uintptr_t)custom_return_true_method);
+                // f[0] 是代码指针 (libil2cpp.so 范围), 值如 0x7209a46cb4
+                // 注意: 地址只有 39 位, 不要用 0x700000000000ULL 比较
+                if (tf[0] != (uintptr_t)custom_return_true_method && tf[0] > 0x10000) {
                     bridge_for_exec = tf[0];
                 }
             }
@@ -2209,7 +2213,7 @@ static int do_unlock_all_dlc(void) {
             // 备选: 从 AddDLC 的 f[0] 获取
             if (!bridge_for_exec && m_addDLC) {
                 uintptr_t *af = (uintptr_t *)m_addDLC;
-                if (af[0] > 0x700000000000ULL && af[0] != (uintptr_t)custom_return_true_method) {
+                if (af[0] > 0x10000 && af[0] != (uintptr_t)custom_return_true_method) {
                     bridge_for_exec = af[0];
                 }
             }

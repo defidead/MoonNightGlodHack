@@ -1831,6 +1831,95 @@ static int do_unlock_all_dlc(void) {
 
         g_mi_hooks_installed = 1;
         LOGI("[dlc] v6 full MethodInfo patch complete! %d/%d methods patched", patched, num_targets);
+        
+        // ===== 6b) Patch 其他 DLC 检查类的方法 =====
+        // 这些类不在 ProtoLogin，但也有 unlock 检查方法
+        struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } extra_patches[] = {
+            {"EditorSettingExtension", "", "get_isUnlockAll",    0},
+            {"PurchaseUtils",         "", "IsUnlockDianCang",    1},
+            {"PurchaseShopConfig",    "", "IsUnlockAll",         1},
+            {"PurchaseShopConfig",    "", "IsUnlockByExtra",     1},
+            {"PurchaseRedConfig",     "", "IsUnlockAll",         1},
+            {"PurchaseRedPanel",      "", "IsUnlockAllDLC",      1},
+            {"AchieveConfig",         "", "IsDlcAchieve",        1},
+            {"AchieveConfig",         "", "IsUnlockForGameItemId",1},
+            {"AchieveConfig",         "", "IsUnLockCard",        2},
+            {"PurchaseFriendHelpComponent","","IsUnlockAll",     0},
+        };
+        int num_extra = sizeof(extra_patches) / sizeof(extra_patches[0]);
+        int extra_patched = 0;
+        
+        LOGI("[dlc] ===== Patching extra unlock check classes =====");
+        for (int e = 0; e < num_extra; e++) {
+            Il2CppClass cls = fn_class_from_name(g_csharp_image, 
+                extra_patches[e].ns, extra_patches[e].cls_name);
+            if (!cls) {
+                LOGI("[dlc] Class %s not found, skip", extra_patches[e].cls_name);
+                continue;
+            }
+            Il2CppMethodInfo mi = fn_class_get_method_from_name(
+                cls, extra_patches[e].method_name, extra_patches[e].param_count);
+            if (!mi) {
+                LOGI("[dlc] %s.%s(%d) method not found, skip",
+                     extra_patches[e].cls_name, extra_patches[e].method_name,
+                     extra_patches[e].param_count);
+                continue;
+            }
+            
+            uintptr_t *f = (uintptr_t *)mi;
+            LOGI("[dlc] BEFORE %s.%s: ptr=%p inv=%p flags=0x%x",
+                 extra_patches[e].cls_name, extra_patches[e].method_name,
+                 (void*)f[0], (void*)f[1], (int)f[13]);
+            
+            uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
+            mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
+            uintptr_t pe = ((uintptr_t)mi + 0xC0) & ~(uintptr_t)0xFFF;
+            if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
+            
+            f[0]  = (uintptr_t)custom_return_true_method;
+            f[1]  = (uintptr_t)custom_bool_true_invoker;
+            f[10] = 0;
+            f[11] = (uintptr_t)custom_return_true_method;
+            f[12] = (uintptr_t)custom_return_true_method;
+            f[13] = f[13] & ~(uintptr_t)0x100;
+            f[15] = (uintptr_t)custom_bool_true_invoker;
+            
+            LOGI("[dlc] ★ %s.%s PATCHED", extra_patches[e].cls_name, extra_patches[e].method_name);
+            extra_patched++;
+        }
+        LOGI("[dlc] Extra class patches: %d/%d done", extra_patched, num_extra);
+        
+        // ===== 6c) 直接设置 EditorSetting.isUnlockAll 字段 =====
+        // EditorSettingExtension 有静态字段 mInstance，通过它获取 EditorSetting 实例
+        // 然后将 offset 0x19 处的 bool isUnlockAll 设为 true
+        {
+            Il2CppClass es_ext_cls = fn_class_from_name(g_csharp_image, "", "EditorSettingExtension");
+            if (es_ext_cls) {
+                Il2CppMethodInfo m_getInst = fn_class_get_method_from_name(es_ext_cls, "get_Instance", 0);
+                if (m_getInst) {
+                    void *exc2 = NULL;
+                    void *es_inst = NULL;
+                    install_sigsegv_handler();
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                        es_inst = fn_runtime_invoke(m_getInst, NULL, NULL, &exc2);
+                    }
+                    g_in_safe_access = 0;
+                    uninstall_sigsegv_handler();
+                    
+                    if (es_inst && !exc2) {
+                        LOGI("[dlc] EditorSetting instance: %p", es_inst);
+                        // 设置 [0x19] isUnlockAll = true
+                        uint8_t *p = (uint8_t *)es_inst;
+                        uint8_t old_val = p[0x19];
+                        p[0x19] = 1;
+                        LOGI("[dlc] ★ EditorSetting.isUnlockAll: %d -> 1", old_val);
+                    } else {
+                        LOGI("[dlc] EditorSetting.get_Instance() returned NULL or exception");
+                    }
+                }
+            }
+        }
     }
     skip_mi_hook:
 

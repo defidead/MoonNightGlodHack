@@ -1322,23 +1322,27 @@ static uint8_t custom_return_true_method(void* __this, int32_t arg1, void* arg2,
 }
 
 // ===== 自定义 C invoker =====
-// invoker 签名: void invoker(Il2CppMethodPointer methodPtr, const MethodInfo* method, void* obj, void** params, void* ret)
-// 注意: invoker 返回 void! 返回值通过 ret 参数写入!
-// 对于值类型 (bool): ret 指向 alloca 的缓冲区, 写入原始值
-// 对于引用类型: ret 指向 void* 指针, 写入对象指针
-static void custom_bool_true_invoker(void* methodPtr, void* method, void* obj, void** params, void* ret) {
-    // System.Boolean 是值类型, Runtime::InvokeWithThrow 会:
-    //   void* returnValue = alloca(instance_size - sizeof(Il2CppObject));  // = 1 byte for bool
-    //   invoker(methodPointer, method, obj, params, returnValue);
-    //   return Object::Box(returnType, returnValue);
-    // 所以我们直接写入 ret 指向的内存即可
-    LOGI("[invoker] custom_bool_true_invoker called! methodPtr=%p method=%p obj=%p ret=%p",
-         methodPtr, method, obj, ret);
-    if (ret) {
-        uint8_t before = *(uint8_t *)ret;
-        *(uint8_t *)ret = 1;  // true (bool = 1 byte value type)
-        LOGI("[invoker] wrote ret: before=0x%02x after=0x%02x @%p", before, *(uint8_t*)ret, ret);
+// ===== Unity 2020 invoker 签名 (4 参数!) =====
+// Unity 2020 invoker: Il2CppObject* invoker(Il2CppMethodPointer methodPtr, const MethodInfo* method, void* obj, void** params)
+// 注意: Unity 2020 invoker 返回 Il2CppObject*! 不是 void!
+// 与 Unity 2021+ 不同, Unity 2020 没有 ret 参数!
+// invoker 负责调用 methodPtr, Box 返回值, 并返回 boxed 对象.
+static void* custom_bool_true_invoker(void* methodPtr, void* method, void* obj, void** params) {
+    // 创建 boxed Boolean(true)
+    // Il2CppObject = [klass(8)][monitor(8)][data...], bool 数据在 +0x10
+    LOGI("[invoker] custom_bool_true_invoker called! methodPtr=%p method=%p obj=%p", methodPtr, method, obj);
+    if (fn_object_new && g_boolean_class) {
+        void* boxed = fn_object_new(g_boolean_class);
+        if (boxed) {
+            *(uint8_t *)((uint8_t *)boxed + 0x10) = 1;  // true
+            LOGI("[invoker] created boxed Boolean(true) @ %p", boxed);
+            return boxed;
+        }
     }
+    // fallback: 如果无法创建 boxed 对象, 直接返回 (void*)1
+    // 这在 il2cpp_runtime_invoke 中会 SIGSEGV, 但至少不会 NULL
+    LOGW("[invoker] WARNING: Cannot create boxed Boolean! fn_object_new=%p g_boolean_class=%p", fn_object_new, g_boolean_class);
+    return (void*)(uintptr_t)1;
 }
 
 // ===== v6.5: void NOP method — 替换 void 方法让其什么都不做 =====
@@ -1349,10 +1353,10 @@ static void custom_void_nop_method(void* __this, void* method) {
     // do nothing — NOP
 }
 
-// ===== v6.5: void NOP invoker — void 方法的 invoker, ret=NULL =====
-static void custom_void_nop_invoker(void* methodPtr, void* method, void* obj, void** params, void* ret) {
-    (void)methodPtr; (void)method; (void)obj; (void)params; (void)ret;
-    // void 方法不需要写入 ret (ret=NULL from Runtime::InvokeWithThrow)
+// ===== v6.5: void NOP invoker — Unity 2020: 4 params, return NULL =====
+static void* custom_void_nop_invoker(void* methodPtr, void* method, void* obj, void** params) {
+    (void)methodPtr; (void)method; (void)obj; (void)params;
+    return NULL;  // void 方法返回 NULL
 }
 
 // ===== v6.5: bool return false method — 返回 false =====
@@ -1361,11 +1365,16 @@ static uint8_t custom_return_false_method(void* __this, int32_t arg1, void* arg2
     return 0;
 }
 
-// ===== v6.5: bool false invoker — 通过 ret 参数写入 false =====
-static void custom_bool_false_invoker(void* methodPtr, void* method, void* obj, void** params, void* ret) {
-    if (ret) {
-        *(uint8_t *)ret = 0;  // false
+// ===== v6.5: bool false invoker — Unity 2020: 4 params, return boxed false =====
+static void* custom_bool_false_invoker(void* methodPtr, void* method, void* obj, void** params) {
+    if (fn_object_new && g_boolean_class) {
+        void* boxed = fn_object_new(g_boolean_class);
+        if (boxed) {
+            *(uint8_t *)((uint8_t *)boxed + 0x10) = 0;  // false
+            return boxed;
+        }
     }
+    return NULL;
 }
 
 // 分配 RWX 内存并写入 ARM64 代码

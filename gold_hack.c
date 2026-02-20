@@ -1712,7 +1712,9 @@ static int do_unlock_all_dlc(void) {
         }
     }
 
-    // ===== 5) 安装 MethodInfo 改写 hook =====
+    // ===== 5) 安装 MethodInfo 全面改写 =====
+    // 策略: 不只替换 methodPointer, 还要修改 invoker / interpData / flags
+    // 让 HybridCLR 认为这是 AOT 方法, 从而走 methodPointer 路径
     if (!g_mi_hooks_installed) {
         init_dlc_stubs();
         if (!g_stub_return_true) {
@@ -1720,57 +1722,108 @@ static int do_unlock_all_dlc(void) {
             goto skip_mi_hook;
         }
 
+        // 先找一个 AOT 方法作为参考（获取 AOT invoker 地址）
+        uintptr_t aot_invoker = 0;
+        {
+            Il2CppClass obj_cls = NULL;
+            size_t asm_count = 0;
+            Il2CppAssembly *asms = fn_domain_get_assemblies(g_domain, &asm_count);
+            for (size_t a = 0; a < asm_count && !obj_cls; a++) {
+                Il2CppImage img = fn_assembly_get_image(asms[a]);
+                if (!img) continue;
+                const char *iname = fn_image_get_name(img);
+                if (iname && (strstr(iname, "mscorlib") || strstr(iname, "corlib"))) {
+                    obj_cls = fn_class_from_name(img, "System", "Object");
+                }
+            }
+            if (obj_cls) {
+                Il2CppMethodInfo m_tostr = fn_class_get_method_from_name(obj_cls, "ToString", 0);
+                if (m_tostr) {
+                    uintptr_t *aot_mi = (uintptr_t *)m_tostr;
+                    aot_invoker = aot_mi[1];
+                    LOGI("[dlc] AOT invoker (Object.ToString): %p", (void*)aot_invoker);
+                    LOGI("[dlc] AOT flags byte +0x68: 0x%x", (int)aot_mi[13]);
+                }
+            }
+        }
+
+        // 修改 isUnlockRole 的 MethodInfo
         uintptr_t *mi_fields = (uintptr_t *)m_isUnlock;
         g_orig_isUnlockRole_ptr = mi_fields[0];
-        LOGI("[dlc] Original isUnlockRole methodPointer: %p", (void*)g_orig_isUnlockRole_ptr);
-        LOGI("[dlc] Original isUnlockRole invoker:       %p", (void*)mi_fields[1]);
+        uintptr_t orig_invoker = mi_fields[1];
+        uintptr_t orig_interp_data = mi_fields[10];
+        uintptr_t orig_flags = mi_fields[13];
+        
+        LOGI("[dlc] isUnlockRole BEFORE modification:");
+        LOGI("[dlc]   [0] methodPointer: %p", (void*)g_orig_isUnlockRole_ptr);
+        LOGI("[dlc]   [1] invoker:       %p", (void*)orig_invoker);
+        LOGI("[dlc]   [10] interpData:   %p", (void*)orig_interp_data);
+        LOGI("[dlc]   [11] virtCallPtr:  %p", (void*)mi_fields[11]);
+        LOGI("[dlc]   [12] dup ptr:      %p", (void*)mi_fields[12]);
+        LOGI("[dlc]   [13] flags:        0x%x", (int)orig_flags);
 
-        // 替换 methodPointer (字段[0]) 为我们的 stub
         uintptr_t page = (uintptr_t)m_isUnlock & ~(uintptr_t)0xFFF;
         mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
+        // 如果 MethodInfo 跨页了
+        uintptr_t page_end = ((uintptr_t)m_isUnlock + 0xC0) & ~(uintptr_t)0xFFF;
+        if (page_end != page) mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
+
+        // [0] methodPointer → 我们的 stub (MOV W0,1; RET)
         mi_fields[0] = (uintptr_t)g_stub_return_true;
-        LOGI("[dlc] ★ isUnlockRole.methodPointer replaced: %p -> %p",
+        
+        // [1] invoker_method → 尝试用 AOT invoker
+        // 注意: AOT invoker 签名可能不匹配 (ToString 返回 string, isUnlockRole 返回 bool)
+        // 如果 AOT invoker 内部调用 methodPointer 并 box 返回值, 签名不匹配会有问题
+        // 所以先不替换 invoker, 只替换其他字段, 看 HybridCLR invoker 是否会走 methodPointer
+        // mi_fields[1] = aot_invoker; // 暂不替换
+
+        // [10] interpData → NULL (去掉解释器数据)
+        mi_fields[10] = 0;
+        LOGI("[dlc] ★ isUnlockRole [10] interpData: %p -> NULL", (void*)orig_interp_data);
+        
+        // [11,12] 也更新为新的 methodPointer
+        mi_fields[11] = (uintptr_t)g_stub_return_true;
+        mi_fields[12] = (uintptr_t)g_stub_return_true;
+        LOGI("[dlc] ★ isUnlockRole [11,12] updated to stub");
+        
+        // [13] flags → 0x001 (去掉 HybridCLR 标志 0x100)
+        mi_fields[13] = orig_flags & ~0x100;
+        LOGI("[dlc] ★ isUnlockRole [13] flags: 0x%x -> 0x%x", 
+             (int)orig_flags, (int)mi_fields[13]);
+        
+        LOGI("[dlc] ★ isUnlockRole.methodPointer: %p -> %p",
              (void*)g_orig_isUnlockRole_ptr, g_stub_return_true);
 
-        // 同时修改相关方法
-        // Hook IsUnlockAllDLC (也返回 true)
-        Il2CppMethodInfo m_isUnlockAll = fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockAllDLC", 1);
-        if (m_isUnlockAll) {
-            uintptr_t *mi2 = (uintptr_t *)m_isUnlockAll;
-            uintptr_t p2 = (uintptr_t)m_isUnlockAll & ~(uintptr_t)0xFFF;
+        // 对其他方法做同样的修改
+        Il2CppMethodInfo methods_to_patch[] = {
+            fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockAllDLC", 1),
+            fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockByFirstGame", 1),
+            fn_class_get_method_from_name(g_proto_login_cls, "isUnlockDLC", 1),
+        };
+        const char *method_names[] = {"IsUnlockAllDLC", "IsUnlockByFirstGame", "isUnlockDLC"};
+        
+        for (int i = 0; i < 3; i++) {
+            if (!methods_to_patch[i]) continue;
+            uintptr_t *mi2 = (uintptr_t *)methods_to_patch[i];
+            uintptr_t p2 = (uintptr_t)methods_to_patch[i] & ~(uintptr_t)0xFFF;
             mprotect((void *)p2, 0x2000, PROT_READ | PROT_WRITE);
-            mi2[0] = (uintptr_t)g_stub_return_true;
-            LOGI("[dlc] ★ IsUnlockAllDLC.methodPointer replaced -> %p", g_stub_return_true);
-        }
-
-        // Hook IsUnlockByFirstGame (也返回 true)
-        Il2CppMethodInfo m_iubfg = fn_class_get_method_from_name(g_proto_login_cls, "IsUnlockByFirstGame", 1);
-        if (m_iubfg) {
-            uintptr_t *mi3 = (uintptr_t *)m_iubfg;
-            uintptr_t p3 = (uintptr_t)m_iubfg & ~(uintptr_t)0xFFF;
-            mprotect((void *)p3, 0x2000, PROT_READ | PROT_WRITE);
-            mi3[0] = (uintptr_t)g_stub_return_true;
-            LOGI("[dlc] ★ IsUnlockByFirstGame.methodPointer replaced -> %p", g_stub_return_true);
-        }
-
-        // 尝试找并 hook isUnlockDLC (如果有)
-        Il2CppMethodInfo m_iud = fn_class_get_method_from_name(g_proto_login_cls, "isUnlockDLC", 1);
-        if (m_iud) {
-            uintptr_t *mi4 = (uintptr_t *)m_iud;
-            uintptr_t p4 = (uintptr_t)m_iud & ~(uintptr_t)0xFFF;
-            mprotect((void *)p4, 0x2000, PROT_READ | PROT_WRITE);
-            mi4[0] = (uintptr_t)g_stub_return_true;
-            LOGI("[dlc] ★ isUnlockDLC.methodPointer replaced -> %p", g_stub_return_true);
+            uintptr_t pe2 = ((uintptr_t)methods_to_patch[i] + 0xC0) & ~(uintptr_t)0xFFF;
+            if (pe2 != p2) mprotect((void *)pe2, 0x1000, PROT_READ | PROT_WRITE);
+            
+            mi2[0] = (uintptr_t)g_stub_return_true;  // methodPointer
+            mi2[10] = 0;                               // interpData
+            mi2[11] = (uintptr_t)g_stub_return_true;  // virtCallPtr
+            mi2[12] = (uintptr_t)g_stub_return_true;  // dup ptr
+            mi2[13] = mi2[13] & ~0x100;               // flags
+            LOGI("[dlc] ★ %s MethodInfo fully patched", method_names[i]);
         }
 
         g_mi_hooks_installed = 1;
-        LOGI("[dlc] MethodInfo hooks installed!");
+        LOGI("[dlc] MethodInfo full patches installed!");
     }
     skip_mi_hook:
 
     // ===== 6) 验证 hook 效果 =====
-    // il2cpp_runtime_invoke 会走 invoker_method, invoker 内部走 methodPointer
-    // 所以替换 methodPointer 应该对 il2cpp_runtime_invoke 有效
     int unlocked_count = 0;
     LOGI("[dlc] === Verification: isUnlockRole via il2cpp_runtime_invoke ===");
     for (int32_t rid = 0; rid <= 15; rid++) {
@@ -1785,30 +1838,66 @@ static int do_unlock_all_dlc(void) {
         if (unlocked > 0) unlocked_count++;
     }
 
-    // ===== 7) 如果 il2cpp_runtime_invoke 方式有效但游戏 UI 没变化 =====
-    // 说明游戏 UI 不走 il2cpp_runtime_invoke，而是 HybridCLR 解释器内部调用
-    // 这种情况需要另一个方案: inline hook 蹦床函数
-    if (unlocked_count > 0) {
-        LOGI("[dlc] ★ il2cpp_runtime_invoke path works! %d/16 unlocked", unlocked_count);
-        LOGI("[dlc] Note: If game UI still locked, need inline hook of interpreter trampoline");
+    // ===== 7) 如果仍然返回 0，尝试替换 invoker_method =====
+    if (unlocked_count == 0 && g_mi_hooks_installed) {
+        LOGI("[dlc] Still 0 unlocked after interpData/flags patch. Trying invoker replacement...");
         
-        // 尝试 inline hook 原始蹦床
-        // 蹦床是 HybridCLR 的解释器入口：
-        // void* trampoline(void* thisptr, ..., MethodInfo* method)
-        // 对于 isUnlockRole(int): X0=this, W1=roleId, X2=MethodInfo*
-        // 我们把 isUnlockRole MI 的 methodPointer 已改为 stub
-        // 但是 HybridCLR 内部不走 methodPointer
-        // 
-        // 解决方案: 尝试修改 MethodInfo 的其他字段
-        // HybridCLR 用什么判断方法是否是解释器方法?
-        // 通常检查: method->isInterpterMethod 标志
-        // 或者检查 methodPointer 是否指向某个已知的解释器蹦床范围
+        // 找 AOT invoker
+        uintptr_t aot_invoker = 0;
+        {
+            Il2CppClass obj_cls = NULL;
+            size_t asm_count = 0;
+            Il2CppAssembly *asms = fn_domain_get_assemblies(g_domain, &asm_count);
+            for (size_t a = 0; a < asm_count && !obj_cls; a++) {
+                Il2CppImage img = fn_assembly_get_image(asms[a]);
+                if (!img) continue;
+                const char *iname = fn_image_get_name(img);
+                if (iname && (strstr(iname, "mscorlib") || strstr(iname, "corlib"))) {
+                    obj_cls = fn_class_from_name(img, "System", "Object");
+                }
+            }
+            if (obj_cls) {
+                Il2CppMethodInfo m_tostr = fn_class_get_method_from_name(obj_cls, "ToString", 0);
+                if (m_tostr) {
+                    uintptr_t *aot_mi = (uintptr_t *)m_tostr;
+                    aot_invoker = aot_mi[1];
+                }
+            }
+        }
         
-        // 让我们试试: 不修改 methodPointer, 而是 inline hook 原始蹦床
-        if (g_orig_isUnlockRole_ptr != 0 && g_orig_isUnlockRole_ptr != (uintptr_t)g_stub_return_true) {
-            LOGI("[dlc] Original trampoline address: %p", (void*)g_orig_isUnlockRole_ptr);
-            LOGI("[dlc] Note: inline hooking shared trampoline is risky (affects ALL methods using it)");
-            // 不在这里做 inline hook，太危险。在下面尝试其他方法。
+        if (aot_invoker) {
+            uintptr_t *mi_fields = (uintptr_t *)m_isUnlock;
+            uintptr_t old_invoker = mi_fields[1];
+            
+            uintptr_t page = (uintptr_t)m_isUnlock & ~(uintptr_t)0xFFF;
+            mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE);
+            mi_fields[1] = aot_invoker;
+            // 也更新 [15] 如果它是 invoker 的复制
+            mi_fields[15] = aot_invoker;
+            LOGI("[dlc] ★ invoker replaced: %p -> %p (AOT)", (void*)old_invoker, (void*)aot_invoker);
+            
+            // 重新验证
+            unlocked_count = 0;
+            LOGI("[dlc] === Re-verification after invoker replacement ===");
+            for (int32_t rid = 0; rid <= 3; rid++) {
+                void *params[1] = { &rid };
+                exc = NULL;
+                void *result = NULL;
+                SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
+                int unlocked = -1;
+                if (sigsegv_hit) {
+                    LOGE("[dlc]   isUnlockRole(%d) = SIGSEGV! Reverting invoker...", rid);
+                    // 恢复原始 invoker
+                    mi_fields[1] = old_invoker;
+                    mi_fields[15] = old_invoker;
+                    LOGI("[dlc] Invoker reverted to %p", (void*)old_invoker);
+                    break;
+                }
+                if (result) { SAFE_UNBOX_INT(unlocked, result, -1); }
+                LOGI("[dlc]   isUnlockRole(%d) = %d%s", rid, unlocked,
+                     unlocked > 0 ? " ✓" : " ✗");
+                if (unlocked > 0) unlocked_count++;
+            }
         }
     }
 

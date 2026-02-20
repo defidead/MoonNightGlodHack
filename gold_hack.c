@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.28"
+#define LOG_TAG "GoldHack v6.29"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1597,8 +1597,9 @@ static volatile int g_dlc_verbose_logged = 0;
 static volatile int g_dlc_unlocked = 0;
 // MethodInfo hook 是否已安装
 static volatile int g_mi_hooks_installed = 0;
-// 保存的原始 methodPointer 值
+// 保存的原始 methodPointer / invoker 值
 static uintptr_t g_orig_isUnlockRole_ptr = 0;
+static uintptr_t g_orig_isUnlockRole_invoker = 0;
 
 // 主 DLC 解锁函数 (v4: MethodInfo 改写 + 诊断)
 // 核心策略: 
@@ -1885,9 +1886,13 @@ static int do_unlock_all_dlc(void) {
             if (page_end != page)
                 mprotect((void *)page_end, 0x1000, PROT_READ | PROT_WRITE);
             
-            // 保存 isUnlockRole 的原始 methodPointer（第一次遇到）
-            if (strcmp(mname, "isUnlockRole") == 0 && g_orig_isUnlockRole_ptr == 0)
+            // 保存 isUnlockRole 的原始 methodPointer + invoker（第一次遇到）
+            if (strcmp(mname, "isUnlockRole") == 0 && g_orig_isUnlockRole_ptr == 0) {
                 g_orig_isUnlockRole_ptr = f[0];
+                g_orig_isUnlockRole_invoker = f[1];
+                LOGI("[dlc] v6.29: Saved original isUnlockRole: mPtr=%p invoker=%p interpData=%p",
+                     (void*)f[0], (void*)f[1], (void*)f[10]);
+            }
             
             // ===== v6.14: Unity 2020 MethodInfo 字段偏移 (无 virtualMethodPointer!) =====
             // Unity 2020.3.49f1c1 MethodInfo layout (ARM64, 104 bytes = 0x68, 13 qwords):
@@ -1914,26 +1919,45 @@ static int do_unlock_all_dlc(void) {
             // f[1] invoker_method → 自定义 invoker (il2cpp_runtime_invoke 走这里)
             f[1] = (uintptr_t)custom_bool_true_invoker;
             // f[2] = name → 不动!
-            // f[10] interpData → NULL (清除 IL 字节码，让解释器不再解释)
-            f[10] = 0;
-            // v6.20: 设置 f[11]/f[12] 到自定义 HybridCLR 桥接函数
-            // 问题分析:
-            //   v6.10/v6.19: 只改 f[0]+f[1]+f[10]，按键正常但 DLC 不生效
-            //     → HybridCLR 解释器内部调用走 f[11](旧蹦床) 读 interpData(=0) 返回 false
-            //   v6.14-v6.18: 清零 f[11]+f[12]+改 bitfield，DLC 生效但按键坏
-            //     → bitfield initInterpCallMethodPointer=1 + f[11]=NULL → 解释器调用 NULL 崩溃
-            // v6.21 修复: f[11]/f[12] 指向有效桥接 + 设置 initInterpCallMethodPointer=1
-            // 解释器优先级: initInterpCallMethodPointer(bit4)=1 → 使用 f[11] 桥接
-            //   跟 isInterpterImpl(bit5) 无关，只要 bit4=1 就走 f[11]
+            // v6.29: 不再清除 interpData! 保留原始 InterpMethodInfo,
+            // 让解释器的 CallInterp_void 路径能执行原始 IL 代码。
+            // 原始 IL 代码会读取 DLCSet 数据来判断 DLC 是否解锁。
+            // 之前设 f[10]=0 是错误的: 已变换的调用者使用 CallInterp_void
+            // 直接读 interpData, 设为 NULL 不会触发 re-Transform,
+            // 只会让解释器读到 NULL 然后 SIGSEGV 或者根本不被调用。
+            // 保留 interpData 让真实 IL 逻辑在正确的 DLCSet 数据上运行。
+            // --- f[10] 保持原样 ---
+            
+            // v6.29: dump interpData 结构 (仅 isUnlockRole)
+            if (strcmp(mname, "isUnlockRole") == 0 && f[10]) {
+                uint8_t *imi = (uint8_t*)f[10];
+                LOGI("[dlc] v6.29 interpData=%p: codes=%p args=%p resolveData=%p",
+                     (void*)f[10], (void*)*(uintptr_t*)(imi),
+                     (void*)*(uintptr_t*)(imi+8), (void*)*(uintptr_t*)(imi+16));
+                LOGI("[dlc] v6.29  argStackObj=%d maxStack=%d argCnt/codeLen=0x%08x evalStackBase=%d",
+                     *(uint32_t*)(imi+0x20), *(uint32_t*)(imi+0x2C),
+                     *(uint32_t*)(imi+0x30), *(uint32_t*)(imi+0x38));
+                void *codes = (void*)*(uintptr_t*)(imi);
+                if (codes) {
+                    uint8_t *c = (uint8_t*)codes;
+                    LOGI("[dlc] v6.29 IR[0-15]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
+                         c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],c[14],c[15]);
+                    LOGI("[dlc] v6.29 IR[16-31]: %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x %02x%02x",
+                         c[16],c[17],c[18],c[19],c[20],c[21],c[22],c[23],c[24],c[25],c[26],c[27],c[28],c[29],c[30],c[31]);
+                }
+            }
+            
+            // v6.29: f[11]/f[12] 指向桥接函数 (供 CallNativeStatic 路径使用)
             f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
             f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
-            // 设置 bitfield: initInterpCallMethodPointer(bit4)=1
-            // 不清 isInterpterImpl(bit5)，保留其他标志
+            // v6.29: 设置 bit4 (initInterpCallMethodPointer) + 清除 bit5 (isInterpterImpl)
+            // 清除 bit5 让 FUTURE Transform 走 CallNativeStatic → 桥接 → 我们的函数
+            // 已变换的调用者仍用 CallInterp_void → 原始 interpData → 原始 IL
             uint8_t *bitfield = (uint8_t *)mi + 0x4B;
-            *bitfield = *bitfield | (1 << 4);  // 只设置 bit4，不清除任何其他 bit
+            *bitfield = (*bitfield | (1 << 4)) & ~(1 << 5);
             
-            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p bridge=%p bf=0x%02x MI=%p (v6.28b)",
-                 mname, (void*)f[0], (void*)f[1], (void*)f[11], *((uint8_t *)mi + 0x4B), mi);
+            LOGI("[dlc] ★ %s PATCHED: mPtr=%p inv=%p bridge=%p bf=0x%02x interpData=%p MI=%p (v6.29)",
+                 mname, (void*)f[0], (void*)f[1], (void*)f[11], *((uint8_t *)mi + 0x4B), (void*)f[10], mi);
             
             if (strcmp(mname, "isUnlockRole") == 0) {
                 LOGI("[dlc] MI-DUMP %s: f[0]=%p f[1]=%p f[10]=%p f[11]=%p f[12]=%p MI=%p",
@@ -1978,13 +2002,14 @@ static int do_unlock_all_dlc(void) {
             f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
             f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
             // f[2] = name → 不动!
-            f[10] = 0;                                       // interpData = NULL (0x50)
+            // v6.29: 保留 interpData (不清 f[10]), 让解释器执行原始 IL
             f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // methodPointerCallByInterp
             f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // virtualMethodPointerCallByInterp
-            // v6.21: 设置 initInterpCallMethodPointer(bit4)=1 让解释器使用 f[11] 桥接
+            // v6.29: set bit4 + clear bit5
             uint8_t *bf = (uint8_t *)mi + 0x4B;
-            *bf = *bf | (1 << 4);
-            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.28b) bf=0x%02x MI=%p", extra_proto_methods[ep], pc_found, *bf, mi);
+            *bf = (*bf | (1 << 4)) & ~(1 << 5);
+            LOGI("[dlc] ★ ProtoLogin.%s(%d) PATCHED (v6.29) bf=0x%02x interpData=%p MI=%p",
+                 extra_proto_methods[ep], pc_found, *bf, (void*)f[10], mi);
             patched++;
         }
         
@@ -2043,13 +2068,14 @@ static int do_unlock_all_dlc(void) {
                 
                 f[0]  = (uintptr_t)custom_return_true_method;
                 f[1]  = (uintptr_t)custom_bool_true_invoker;
-                f[10] = 0;
+                // v6.29: 保留 interpData (不清 f[10])
                 f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
                 f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
                 uint8_t *bf = (uint8_t *)mi + 0x4B;
-                *bf = *bf | (1 << 4);
+                *bf = (*bf | (1 << 4)) & ~(1 << 5);  // v6.29: set bit4, clear bit5
                 
-                LOGI("[dlc] ★ %s.%s PATCHED (v6.28b)", extra_patches[e].cls_name, extra_patches[e].method_name);
+                LOGI("[dlc] ★ %s.%s PATCHED (v6.29) interpData=%p",
+                     extra_patches[e].cls_name, extra_patches[e].method_name, (void*)f[10]);
                 extra_patched++;
             }
             LOGI("[dlc] Extra class patches: %d installed", extra_patched);
@@ -2455,16 +2481,56 @@ static int do_unlock_all_dlc(void) {
         }
     }
 
+    // ===== v6.29: REAL verification with original invoker =====
+    // 上面的 verification (step 7) 用的是 custom_bool_true_invoker, 始终返回 true.
+    // 这里临时恢复原始 invoker, 让 fn_runtime_invoke 走原始的 InterpreterInvoke 路径,
+    // 执行真实的 IL 代码检查 DLCSet 数据. 这告诉我们 DLCSet 填充是否正确.
+    int real_unlocked_count = 0;
+    if (g_orig_isUnlockRole_invoker && m_isUnlock) {
+        LOGI("[dlc] v6.29: ===== REAL isUnlockRole verification (original invoker) =====");
+        uintptr_t *unlock_f = (uintptr_t *)m_isUnlock;
+        uintptr_t saved_custom_invoker = unlock_f[1];
+        
+        // 临时恢复原始 invoker (InterpreterInvoke)
+        unlock_f[1] = g_orig_isUnlockRole_invoker;
+        
+        for (int32_t rid = 0; rid <= 15; rid++) {
+            void *params[1] = { &rid };
+            exc = NULL;
+            void *result = NULL;
+            SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
+            int val = -1;
+            if (sigsegv_hit) {
+                LOGE("[dlc] v6.29:   REAL isUnlockRole(%d) SIGSEGV!", rid);
+            } else if (exc) {
+                LOGE("[dlc] v6.29:   REAL isUnlockRole(%d) EXCEPTION", rid);
+            } else if (result) {
+                SAFE_UNBOX_INT(val, result, -1);
+                LOGI("[dlc] v6.29:   REAL isUnlockRole(%d) = %d%s", rid, val, val > 0 ? " ✓" : " ✗");
+                if (val > 0) real_unlocked_count++;
+            } else {
+                LOGI("[dlc] v6.29:   REAL isUnlockRole(%d) result=NULL", rid);
+            }
+        }
+        LOGI("[dlc] v6.29: ★ REAL verification: %d/16 roles (with original invoker, checks DLCSet data)", real_unlocked_count);
+        
+        // 恢复自定义 invoker
+        unlock_f[1] = saved_custom_invoker;
+    } else {
+        LOGW("[dlc] v6.29: Cannot do REAL verification - original invoker not saved");
+    }
+
     if (unlocked_count >= 10) {
         g_dlc_unlocked = 1;
-        LOGI("[dlc] ★ DLC unlock SUCCESS!");
+        LOGI("[dlc] ★ DLC unlock SUCCESS (patched invoker: %d/16, REAL: %d/16)!",
+             unlocked_count, real_unlocked_count);
     }
 
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.26 complete (unlocked=%d/16, mi_hooks=%d) =====",
-         unlocked_count, g_mi_hooks_installed);
+    LOGI("[dlc] ===== DLC unlock v6.29 complete (patched=%d/16, real=%d/16, mi_hooks=%d) =====",
+         unlocked_count, real_unlocked_count, g_mi_hooks_installed);
     return unlocked_count;
 }
 /* v6.17: 以下旧的诊断代码已禁用 */

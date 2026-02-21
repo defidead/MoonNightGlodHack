@@ -3097,65 +3097,9 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6.26: Direct mDLCSet manipulation: %d items populated", direct_add_ok);
     }
     
-    // ===== v6.35: 通过 Execute 直接调用 AddDLC =====
-    // v6.22 尝试 il2cpp_runtime_invoke(AddDLC) 失败: bridge 读取 NULL interpData → SIGSEGV
-    // 核心发现: Execute 函数内部会处理 NULL interpData (调用 Transform 懒初始化)
-    // 所以直接调用 g_orig_execute(AddDLC_MI, stackArgs, NULL) 可以绕过 bridge
-    // StackObject 布局: args[0]=this(ptr), args[1]=dlcId(i64)
-    if (m_addDLC && g_orig_execute) {
-        LOGI("[dlc] v6.35: ===== Calling AddDLC via Execute (bypasses bridge) =====");
-        
-        // 设置 bypass 防止 AddDLC 被 Execute hook 拦截
-        __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
-        
-        int add_ok = 0;
-        int add_fail = 0;
-        for (int32_t dlcId = 1; dlcId <= 50; dlcId++) {
-            // HybridCLR StackObject: 8 bytes per slot (union { int64_t i64; void* ptr; })
-            // Instance method: args[0] = this, args[1] = param0
-            int64_t stack_args[2];
-            stack_args[0] = (int64_t)(uintptr_t)g_proto_login_inst;  // this
-            stack_args[1] = (int64_t)dlcId;                           // dlcId
-            
-            install_sigsegv_handler();
-            g_in_safe_access = 1;
-            if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                g_orig_execute(m_addDLC, (void*)stack_args, NULL);
-                add_ok++;
-            } else {
-                add_fail++;
-                g_in_safe_access = 0;
-                uninstall_sigsegv_handler();
-                if (add_fail >= 3) {
-                    LOGW("[dlc] v6.35: AddDLC SIGSEGV x%d, aborting", add_fail);
-                    break;
-                }
-                continue;
-            }
-            g_in_safe_access = 0;
-            uninstall_sigsegv_handler();
-        }
-        
-        __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
-        LOGI("[dlc] v6.35: ★ AddDLC via Execute: %d/50 OK, %d SIGSEGV", add_ok, add_fail);
-        
-        // 读取 mDLCSet 确认 AddDLC 是否生效
-        {
-            void *dlc_set_after = NULL;
-            install_sigsegv_handler();
-            g_in_safe_access = 1;
-            if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                dlc_set_after = *(void **)(g_proto_login_inst + 0x40);
-            }
-            g_in_safe_access = 0;
-            uninstall_sigsegv_handler();
-            LOGI("[dlc] v6.35: POST-AddDLC: mDLCSet=%p",
-                 dlc_set_after);
-        }
-    } else {
-        LOGW("[dlc] v6.35: Cannot call AddDLC via Execute (addDLC=%p, orig_execute=%p)",
-             m_addDLC, g_orig_execute);
-    }
+    // v6.35.1: AddDLC via Execute 已移除 (始终 SIGSEGV, interpData=NULL 的方法
+    // 即使通过 Execute 也无法正确处理 — HybridCLR Execute 期望 args 已由 bridge 设置)
+    // 改用 mLoginData.DLC 列表注入作为唯一数据修改路径
     
     // ===== v6.35: 注入 mLoginData.DLC 列表 =====
     // 核心发现: DLC 状态来自服务器登录响应 → PlayerPrefs JSON "DLC":[]
@@ -3362,22 +3306,9 @@ static int do_unlock_all_dlc(void) {
         }
     }
     
-    // ===== v6.35: 调用 SaveLoginData 持久化修改后的 DLC 数据 =====
-    {
-        Il2CppMethodInfo m_save = fn_class_get_method_from_name(g_proto_login_cls, "SaveLoginData", 0);
-        if (m_save) {
-            __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
-            exc = NULL;
-            void *r = NULL;
-            SAFE_INVOKE(r, m_save, (void*)g_proto_login_inst, NULL, &exc);
-            __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
-            if (!sigsegv_hit && !exc) {
-                LOGI("[dlc] v6.35: ★ SaveLoginData() OK (persisted DLC data)");
-            } else {
-                LOGW("[dlc] v6.35: SaveLoginData() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
-            }
-        }
-    }
+    // v6.35.1: SaveLoginData 已移除 — 保存修改后的 DLC 数据到 PlayerPrefs
+    // 会触发 CrashSight 检测 (SIGTRAP 杀进程), 且服务器会在下次登录时覆盖
+    // 改为只修改内存中的数据, 不持久化
     
     // UpdateDLC 刷新缓存 — v6.35: 使用 bypass 防止 Execute hook 拦截
     {
@@ -6231,9 +6162,11 @@ static int hook_kill_func(pid_t pid, int sig) {
 }
 
 // v6.33: hook tgkill — 反篡改使用 tgkill(pid, tid, SIGSEGV) 攻击我们的线程
+// v6.35.1: 加入 SIGTRAP (CrashSight 用 SIGTRAP 杀进程) 和 SIGBUS
 static int hook_tgkill_func(pid_t tgid, pid_t tid, int sig) {
     pid_t self = getpid();
-    if (tgid == self && (sig == SIGSEGV || sig == SIGABRT || sig == SIGKILL || sig == SIGTERM)) {
+    if (tgid == self && (sig == SIGSEGV || sig == SIGABRT || sig == SIGKILL || sig == SIGTERM
+                         || sig == SIGTRAP || sig == SIGBUS)) {
         LOGW("[anti-kill] Blocked tgkill(tgid=%d, tid=%d, sig=%d) from anti-tamper", tgid, tid, sig);
         return 0;
     }
@@ -6283,6 +6216,13 @@ static void install_signal_defense(void) {
     }
     if (sigaction(SIGABRT, &sa, &g_old_sigabrt_action) == 0) {
         LOGI("[anti-kill] SIGABRT handler installed (defense against tgkill)");
+    }
+    // v6.35.1: CrashSight 用 SIGTRAP 杀进程, 也需要防御
+    {
+        static struct sigaction g_old_sigtrap_action;
+        if (sigaction(SIGTRAP, &sa, &g_old_sigtrap_action) == 0) {
+            LOGI("[anti-kill] SIGTRAP handler installed (defense against CrashSight)");
+        }
     }
 }
 

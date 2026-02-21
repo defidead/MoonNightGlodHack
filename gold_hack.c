@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.39"
+#define LOG_TAG "GoldHack v6.40"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1444,6 +1444,7 @@ static volatile int g_execute_hook_bypass = 0;
 // v6.34: 方法名匹配列表 (用于早期拦截, 在 MI 目标注册前生效)
 // 这些是 DLC 相关的方法名, 在 Execute hook 中按名称匹配
 // v6.38: 增加 IsUnlockCurRole, HasFreeGetRole, IsUnlockCard, checkDLCUnlock
+// v6.40: 增加 IsValidPlayDLCX, IsUnlockForGameItemId
 static const char *g_early_match_names[] = {
     "isUnlockRole", "IsDLCRole", "IsUnlockAllDLC",
     "IsUnlockByFirstGame", "IsUnlockGuBao",
@@ -1454,8 +1455,19 @@ static const char *g_early_match_names[] = {
     "IsUnlockAll", "IsUnlockByExtra", "IsUnlockAnyDlc", "isUnlock",
     "IsUnlockCurRole", "HasFreeGetRole", "IsUnlockCard",
     "checkDLCUnlock", "IsUnlockNormalAchieve",
+    "IsValidPlayDLCX", "IsUnlockForGameItemId",
     NULL
 };
+
+// v6.40: 方法名匹配列表 (需要返回 false/0 的方法)
+// IsHidePig/IsHideSlavePig 返回 true 表示隐藏, 我们需要返回 false 以显示
+static const char *g_early_match_names_false[] = {
+    "IsHidePig", "IsHideSlavePig", "IsHideBefore",
+    NULL
+};
+
+// v6.40: 统计 false 拦截次数
+static volatile int g_execute_false_intercepts = 0;
 
 // v6.38: 收集需要 inline hook 的原始 AOT 函数地址
 #define MAX_INLINE_HOOK_ADDRS 32
@@ -1677,13 +1689,19 @@ static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
         if (name && (uintptr_t)name > 0x10000) {
             // 快速前缀检查: DLC 方法名以 i/I/g/c/H 开头
             // v6.39: 修复! checkDLCUnlock='c', HasFreeGetRole='H' 之前被遗漏
-            char c0 = name[0];
-            if (c0 == 'i' || c0 == 'I' || c0 == 'g' || c0 == 'c' || c0 == 'H') {
-                for (int n = 0; g_early_match_names[n]; n++) {
-                    if (strcmp(name, g_early_match_names[n]) == 0) {
-                        __atomic_add_fetch(&g_execute_early_intercepts, 1, __ATOMIC_RELAXED);
-                        goto intercepted;
-                    }
+            // v6.40: 无前缀过滤! 直接遍历所有列表, 避免再遗漏
+            // return-true 列表
+            for (int n = 0; g_early_match_names[n]; n++) {
+                if (strcmp(name, g_early_match_names[n]) == 0) {
+                    __atomic_add_fetch(&g_execute_early_intercepts, 1, __ATOMIC_RELAXED);
+                    goto intercepted;
+                }
+            }
+            // v6.40: return-false 列表 (IsHide* 方法)
+            for (int n = 0; g_early_match_names_false[n]; n++) {
+                if (strcmp(name, g_early_match_names_false[n]) == 0) {
+                    __atomic_add_fetch(&g_execute_false_intercepts, 1, __ATOMIC_RELAXED);
+                    goto intercepted_false;
                 }
             }
         }
@@ -1693,10 +1711,11 @@ static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
     // 周期性统计日志
     if (total == 100 || total == 1000 || total == 5000 || total == 10000 || 
         total == 50000 || total % 100000 == 0) {
-        LOGI("[exec-hook] Stats: total=%d, intercepted=%d (early=%d), targets=%d, interp=%d",
+        LOGI("[exec-hook] Stats: total=%d, intercepted=%d (early=%d, false=%d), targets=%d, interp=%d",
              total, 
              __atomic_load_n(&g_execute_intercepted_calls, __ATOMIC_RELAXED),
              __atomic_load_n(&g_execute_early_intercepts, __ATOMIC_RELAXED),
+             __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED),
              g_execute_hook_target_count, g_execute_hook_interp_count);
     }
     
@@ -1715,6 +1734,23 @@ intercepted:
             LOGI("[exec-hook] ★ INTERCEPTED Execute(MI=%p, name=%s) -> ret=1 #%d (total=%d, early=%d)",
                  methodInfo, safe_name, ic, total,
                  __atomic_load_n(&g_execute_early_intercepts, __ATOMIC_RELAXED));
+        }
+    }
+    return;
+
+// v6.40: 拦截并返回 false (用于 IsHide* 方法, 返回 false=不隐藏=显示)
+intercepted_false:
+    if (ret) {
+        *(int64_t*)ret = 0;  // StackObject.i64 = 0 (bool false)
+    }
+    {
+        int ic = __atomic_add_fetch(&g_execute_intercepted_calls, 1, __ATOMIC_RELAXED);
+        if (ic <= 100) {
+            const char *name = (const char *)f[2];
+            const char *safe_name = (name && (uintptr_t)name > 0x10000) ? name : "?";
+            LOGI("[exec-hook] ★ INTERCEPTED Execute(MI=%p, name=%s) -> ret=0 (false) #%d (total=%d, false=%d)",
+                 methodInfo, safe_name, ic, total,
+                 __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED));
         }
     }
 }

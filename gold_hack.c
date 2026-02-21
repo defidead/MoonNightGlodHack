@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.40"
+#define LOG_TAG "GoldHack v6.39"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1444,7 +1444,6 @@ static volatile int g_execute_hook_bypass = 0;
 // v6.34: 方法名匹配列表 (用于早期拦截, 在 MI 目标注册前生效)
 // 这些是 DLC 相关的方法名, 在 Execute hook 中按名称匹配
 // v6.38: 增加 IsUnlockCurRole, HasFreeGetRole, IsUnlockCard, checkDLCUnlock
-// v6.40: 增加 IsValidPlayDLCX, IsUnlockForGameItemId
 static const char *g_early_match_names[] = {
     "isUnlockRole", "IsDLCRole", "IsUnlockAllDLC",
     "IsUnlockByFirstGame", "IsUnlockGuBao",
@@ -1455,19 +1454,8 @@ static const char *g_early_match_names[] = {
     "IsUnlockAll", "IsUnlockByExtra", "IsUnlockAnyDlc", "isUnlock",
     "IsUnlockCurRole", "HasFreeGetRole", "IsUnlockCard",
     "checkDLCUnlock", "IsUnlockNormalAchieve",
-    "IsValidPlayDLCX", "IsUnlockForGameItemId",
     NULL
 };
-
-// v6.40: 方法名匹配列表 (需要返回 false/0 的方法)
-// IsHidePig/IsHideSlavePig 返回 true 表示隐藏, 我们需要返回 false 以显示
-static const char *g_early_match_names_false[] = {
-    "IsHidePig", "IsHideSlavePig", "IsHideBefore",
-    NULL
-};
-
-// v6.40: 统计 false 拦截次数
-static volatile int g_execute_false_intercepts = 0;
 
 // v6.38: 收集需要 inline hook 的原始 AOT 函数地址
 #define MAX_INLINE_HOOK_ADDRS 32
@@ -1689,19 +1677,13 @@ static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
         if (name && (uintptr_t)name > 0x10000) {
             // 快速前缀检查: DLC 方法名以 i/I/g/c/H 开头
             // v6.39: 修复! checkDLCUnlock='c', HasFreeGetRole='H' 之前被遗漏
-            // v6.40: 无前缀过滤! 直接遍历所有列表, 避免再遗漏
-            // return-true 列表
-            for (int n = 0; g_early_match_names[n]; n++) {
-                if (strcmp(name, g_early_match_names[n]) == 0) {
-                    __atomic_add_fetch(&g_execute_early_intercepts, 1, __ATOMIC_RELAXED);
-                    goto intercepted;
-                }
-            }
-            // v6.40: return-false 列表 (IsHide* 方法)
-            for (int n = 0; g_early_match_names_false[n]; n++) {
-                if (strcmp(name, g_early_match_names_false[n]) == 0) {
-                    __atomic_add_fetch(&g_execute_false_intercepts, 1, __ATOMIC_RELAXED);
-                    goto intercepted_false;
+            char c0 = name[0];
+            if (c0 == 'i' || c0 == 'I' || c0 == 'g' || c0 == 'c' || c0 == 'H') {
+                for (int n = 0; g_early_match_names[n]; n++) {
+                    if (strcmp(name, g_early_match_names[n]) == 0) {
+                        __atomic_add_fetch(&g_execute_early_intercepts, 1, __ATOMIC_RELAXED);
+                        goto intercepted;
+                    }
                 }
             }
         }
@@ -1711,11 +1693,10 @@ static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
     // 周期性统计日志
     if (total == 100 || total == 1000 || total == 5000 || total == 10000 || 
         total == 50000 || total % 100000 == 0) {
-        LOGI("[exec-hook] Stats: total=%d, intercepted=%d (early=%d, false=%d), targets=%d, interp=%d",
+        LOGI("[exec-hook] Stats: total=%d, intercepted=%d (early=%d), targets=%d, interp=%d",
              total, 
              __atomic_load_n(&g_execute_intercepted_calls, __ATOMIC_RELAXED),
              __atomic_load_n(&g_execute_early_intercepts, __ATOMIC_RELAXED),
-             __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED),
              g_execute_hook_target_count, g_execute_hook_interp_count);
     }
     
@@ -1734,23 +1715,6 @@ intercepted:
             LOGI("[exec-hook] ★ INTERCEPTED Execute(MI=%p, name=%s) -> ret=1 #%d (total=%d, early=%d)",
                  methodInfo, safe_name, ic, total,
                  __atomic_load_n(&g_execute_early_intercepts, __ATOMIC_RELAXED));
-        }
-    }
-    return;
-
-// v6.40: 拦截并返回 false (用于 IsHide* 方法, 返回 false=不隐藏=显示)
-intercepted_false:
-    if (ret) {
-        *(int64_t*)ret = 0;  // StackObject.i64 = 0 (bool false)
-    }
-    {
-        int ic = __atomic_add_fetch(&g_execute_intercepted_calls, 1, __ATOMIC_RELAXED);
-        if (ic <= 100) {
-            const char *name = (const char *)f[2];
-            const char *safe_name = (name && (uintptr_t)name > 0x10000) ? name : "?";
-            LOGI("[exec-hook] ★ INTERCEPTED Execute(MI=%p, name=%s) -> ret=0 (false) #%d (total=%d, false=%d)",
-                 methodInfo, safe_name, ic, total,
-                 __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED));
         }
     }
 }
@@ -2784,80 +2748,7 @@ static int do_unlock_all_dlc(void) {
             }
             LOGI("[dlc] Extra class patches: %d installed", extra_patched);
         }
-
-        // ===== v6.40: 补丁 LoginDataExtension.IsHidePig/IsHideSlavePig → return FALSE =====
-        // 以及 AchieveConfig.IsUnlockForGameItemId → return TRUE
-        // 以及 LoginDataExtension.IsValidPlayDLCX → return TRUE
-        {
-            // return-false 补丁 (IsHide* 方法: 返回 true=隐藏, 我们返回 false=显示)
-            struct { const char *cls_name; const char *ns; const char *method_name; int param_count; int ret_val; } v640_patches[] = {
-                {"LoginDataExtension", "", "IsHidePig",           1, 0},  // return false = 不隐藏猪模式
-                {"LoginDataExtension", "", "IsHideSlavePig",      1, 0},  // return false = 不隐藏小猪妖
-                {"LoginDataExtension", "", "IsValidPlayDLCX",     2, 1},  // return true = DLC可玩
-                {"AchieveConfig",      "", "IsUnlockForGameItemId", 1, 1}, // return true = GameItem解锁
-                {"AchieveConfig",      "", "IsDlcAchieve",        1, 1},  // return true = DLC成就
-                {"DLCCollectionConfig", "", "IsPigMode",           1, 1},  // return true = 是猪模式 (不隐藏)
-            };
-            int num_v640 = sizeof(v640_patches) / sizeof(v640_patches[0]);
-            int v640_patched = 0;
-
-            LOGI("[dlc] ===== v6.40: Patching IsHide*/IsValidPlay/IsUnlockForGameItemId =====");
-            for (int e = 0; e < num_v640; e++) {
-                Il2CppClass cls = fn_class_from_name(g_csharp_image,
-                    v640_patches[e].ns, v640_patches[e].cls_name);
-                if (!cls) {
-                    LOGI("[dlc] v6.40: Class %s not found, skip", v640_patches[e].cls_name);
-                    continue;
-                }
-                Il2CppMethodInfo mi = fn_class_get_method_from_name(
-                    cls, v640_patches[e].method_name, v640_patches[e].param_count);
-                if (!mi) {
-                    LOGI("[dlc] v6.40: %s.%s(%d) not found, skip",
-                         v640_patches[e].cls_name, v640_patches[e].method_name,
-                         v640_patches[e].param_count);
-                    continue;
-                }
-
-                uintptr_t *f = (uintptr_t *)mi;
-                LOGI("[dlc] v6.40: BEFORE %s.%s: mPtr=%p inv=%p interpData=%p MI=%p",
-                     v640_patches[e].cls_name, v640_patches[e].method_name,
-                     (void*)f[0], (void*)f[1], (void*)f[10], mi);
-
-                // 收集原始地址
-                collect_inline_hook_addr(f[0]);
-
-                // 注册到 Execute hook
-                execute_hook_add_target(mi);
-
-                uintptr_t pg = (uintptr_t)mi & ~(uintptr_t)0xFFF;
-                mprotect((void *)pg, 0x2000, PROT_READ | PROT_WRITE);
-                uintptr_t pe = ((uintptr_t)mi + 0x68) & ~(uintptr_t)0xFFF;
-                if (pe != pg) mprotect((void *)pe, 0x1000, PROT_READ | PROT_WRITE);
-
-                if (v640_patches[e].ret_val == 0) {
-                    // return FALSE (用于 IsHide* 方法)
-                    f[0]  = (uintptr_t)custom_return_false_method;
-                    f[1]  = (uintptr_t)custom_bool_false_invoker;
-                    f[11] = 0;  // 清除 interpData 相关的 bridge, 防止解释器绕过
-                    f[12] = 0;
-                } else {
-                    // return TRUE
-                    f[0]  = (uintptr_t)custom_return_true_method;
-                    f[1]  = (uintptr_t)custom_bool_true_invoker;
-                    f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
-                    f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
-                }
-                uint8_t *bf = (uint8_t *)mi + 0x4B;
-                *bf = (*bf | (1 << 4)) & ~(1 << 5);
-
-                LOGI("[dlc] v6.40: ★ %s.%s PATCHED → return %d, interpData=%p",
-                     v640_patches[e].cls_name, v640_patches[e].method_name,
-                     v640_patches[e].ret_val, (void*)f[10]);
-                v640_patched++;
-            }
-            LOGI("[dlc] v6.40: IsHide/GameItem patches: %d installed", v640_patched);
-        }
-
+        
         // ===== 6b1) v6.39: 手术式 BL 指令补丁 =====
         // v6.38 错误地 inline hook 了共享 AOT stub，导致所有按钮失灵。
         // v6.38.1 完全禁用了 inline hook，但 DLC 仍然锁定。

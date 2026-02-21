@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.32"
+#define LOG_TAG "GoldHack v6.33"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -5759,12 +5759,69 @@ static void *hack_thread(void *arg) {
 // 杀死进程。我们通过 inline hook libc 的 kill() 函数来拦截自杀。
 
 static int hook_kill_func(pid_t pid, int sig) {
-    if (sig == SIGKILL && pid == getpid()) {
-        LOGW("[anti-kill] Blocked self-kill (SIGKILL) from anti-tamper check");
+    pid_t self = getpid();
+    if (pid == self && (sig == SIGKILL || sig == SIGABRT || sig == SIGSEGV || sig == SIGTERM || sig == SIGQUIT)) {
+        LOGW("[anti-kill] Blocked self-kill (sig=%d) from anti-tamper check", sig);
         return 0;  // 假装成功但不执行
     }
     // 其他 kill 调用使用原始 syscall
     return (int)syscall(__NR_kill, pid, sig);
+}
+
+// v6.33: hook tgkill — 反篡改使用 tgkill(pid, tid, SIGSEGV) 攻击我们的线程
+static int hook_tgkill_func(pid_t tgid, pid_t tid, int sig) {
+    pid_t self = getpid();
+    if (tgid == self && (sig == SIGSEGV || sig == SIGABRT || sig == SIGKILL || sig == SIGTERM)) {
+        LOGW("[anti-kill] Blocked tgkill(tgid=%d, tid=%d, sig=%d) from anti-tamper", tgid, tid, sig);
+        return 0;
+    }
+    return (int)syscall(__NR_tgkill, tgid, tid, sig);
+}
+
+// v6.33: 安装 SIGSEGV/SIGABRT 信号处理器作为最后防线
+static volatile int g_anti_tamper_signal_count = 0;
+static struct sigaction g_old_sigsegv_action;
+static struct sigaction g_old_sigabrt_action;
+
+static void anti_tamper_signal_handler(int signo, siginfo_t *info, void *context) {
+    // 检查信号来源：SI_TKILL 表示是被其他线程/进程发送的
+    if (info && (info->si_code == SI_TKILL || info->si_code == SI_USER)) {
+        g_anti_tamper_signal_count++;
+        if (g_anti_tamper_signal_count <= 20) {
+            LOGW("[anti-kill] Caught anti-tamper signal %d (code=%d, sender_pid=%d) — IGNORED #%d",
+                 signo, info->si_code, info->si_pid, g_anti_tamper_signal_count);
+        }
+        return;  // 忽略来自 tkill/kill 的信号
+    }
+    // 真正的硬件异常（如 SEGV_MAPERR），调用原始处理器
+    struct sigaction *old = (signo == SIGSEGV) ? &g_old_sigsegv_action : &g_old_sigabrt_action;
+    if (old->sa_flags & SA_SIGINFO) {
+        if (old->sa_sigaction) old->sa_sigaction(signo, info, context);
+    } else {
+        if (old->sa_handler && old->sa_handler != SIG_DFL && old->sa_handler != SIG_IGN) {
+            old->sa_handler(signo);
+        } else {
+            // 恢复默认处理并重新发送
+            struct sigaction dfl = {0};
+            dfl.sa_handler = SIG_DFL;
+            sigaction(signo, &dfl, NULL);
+            raise(signo);
+        }
+    }
+}
+
+static void install_signal_defense(void) {
+    struct sigaction sa = {0};
+    sa.sa_sigaction = anti_tamper_signal_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    
+    if (sigaction(SIGSEGV, &sa, &g_old_sigsegv_action) == 0) {
+        LOGI("[anti-kill] SIGSEGV handler installed (defense against tgkill)");
+    }
+    if (sigaction(SIGABRT, &sa, &g_old_sigabrt_action) == 0) {
+        LOGI("[anti-kill] SIGABRT handler installed (defense against tgkill)");
+    }
 }
 
 // v6.32: hook exit/_exit — 反篡改检测到 kill() 被 hook 后改用 System.exit()
@@ -5850,6 +5907,13 @@ static void install_kill_hook(void) {
     void *Exit_addr = dlsym(RTLD_DEFAULT, "_Exit");
     if (Exit_addr && Exit_addr != _exit_addr) 
         install_simple_hook(Exit_addr, (void*)hook__exit_func, "_Exit()");
+    
+    // v6.33: hook tgkill — 反篡改使用 tgkill 发送 SIGSEGV 给我们的线程
+    void *tgkill_addr = dlsym(RTLD_DEFAULT, "tgkill");
+    if (tgkill_addr) install_simple_hook(tgkill_addr, (void*)hook_tgkill_func, "tgkill()");
+    
+    // v6.33: 安装信号处理器作为最后防线
+    install_signal_defense();
 }
 
 // ========== .so 入口（constructor）==========

@@ -1863,22 +1863,30 @@ static int install_execute_hook(uintptr_t execute_addr) {
 static int try_early_execute_hook(void) {
     if (g_execute_hook_installed) return 0;
     
-    // 1. 快速找 libil2cpp.so 基址 (不依赖 parse_maps)
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (!fp) return -1;
-    
+    // 1. 轮询等待 libil2cpp.so 加载 (最多 3 秒, 每 100ms 检查一次)
+    // Unity 在主线程加载 libil2cpp.so, 我们的线程可能先启动
     uintptr_t il2cpp_base = 0;
-    char line[512];
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "libil2cpp.so") && strstr(line, "r-xp")) {
-            unsigned long addr;
-            if (sscanf(line, "%lx", &addr) == 1) {
-                il2cpp_base = (uintptr_t)addr;
+    for (int attempt = 0; attempt < 30 && !il2cpp_base; attempt++) {
+        FILE *fp = fopen("/proc/self/maps", "r");
+        if (!fp) { usleep(100000); continue; }
+        
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "libil2cpp.so") && strstr(line, "r-xp")) {
+                unsigned long addr;
+                if (sscanf(line, "%lx", &addr) == 1) {
+                    il2cpp_base = (uintptr_t)addr;
+                }
+                break;
             }
-            break;
+        }
+        fclose(fp);
+        
+        if (!il2cpp_base) {
+            if (attempt == 0) LOGI("[exec-hook] v6.34: Waiting for libil2cpp.so...");
+            usleep(100000); // 100ms
         }
     }
-    fclose(fp);
     
     if (!il2cpp_base) {
         LOGI("[exec-hook] v6.34: libil2cpp.so not loaded yet, skip early hook");

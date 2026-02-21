@@ -3336,6 +3336,58 @@ static int do_unlock_all_dlc(void) {
         g_in_safe_access = 0;
         uninstall_sigsegv_handler();
         LOGI("[dlc] v6.35: POST-UpdateDLC: mDLCSet=%p", post_update_dlcset);
+        
+        // v6.35.2: 诊断 — 检查 UpdateDLC 后 mDLCSet 的字段状态
+        // 比较哪些字段有值 vs 哪些为 NULL, 判断 DLC IDs 1-20 是否有效
+        if (post_update_dlcset && fn_object_get_class && fn_class_get_fields 
+            && fn_field_get_name && fn_field_get_offset) {
+            Il2CppClass post_cls = fn_object_get_class(post_update_dlcset);
+            void *piter = NULL;
+            Il2CppFieldInfo pfi;
+            int p_total = 0, p_nonnull = 0;
+            while ((pfi = fn_class_get_fields(post_cls, &piter)) != NULL) {
+                const char *pfn = fn_field_get_name(pfi);
+                int pfo = fn_field_get_offset ? fn_field_get_offset(pfi) : -1;
+                if (pfo < 16) continue;
+                void *pfval = NULL;
+                install_sigsegv_handler();
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                    pfval = *(void **)((uintptr_t)post_update_dlcset + pfo);
+                }
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
+                p_total++;
+                if (pfval) {
+                    p_nonnull++;
+                    LOGI("[dlc] v6.35.2: POST-DLCSet %s (off=%d) = %p ★", pfn, pfo, pfval);
+                }
+            }
+            LOGI("[dlc] v6.35.2: POST-DLCSet summary: %d/%d fields non-null", p_nonnull, p_total);
+        }
+        
+        // v6.35.2: 诊断 — 使用 GetDLCId 发现正确的 DLC ID 映射
+        {
+            Il2CppMethodInfo m_getDLCId = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCId", 1);
+            if (m_getDLCId) {
+                LOGI("[dlc] v6.35.2: ===== GetDLCId discovery (PackageEnum → DLC ID) =====");
+                __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+                for (int32_t pe = 0; pe <= 40; pe++) {
+                    void *params[1] = { &pe };
+                    exc = NULL;
+                    void *r = NULL;
+                    SAFE_INVOKE(r, m_getDLCId, (void*)g_proto_login_inst, params, &exc);
+                    int dlcId = -1;
+                    if (!sigsegv_hit && !exc && r) { SAFE_UNBOX_INT(dlcId, r, -1); }
+                    if (dlcId > 0) {
+                        LOGI("[dlc] v6.35.2:   PackageEnum(%d) → DLC ID %d", pe, dlcId);
+                    }
+                }
+                __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+            } else {
+                LOGW("[dlc] v6.35.2: GetDLCId method not found");
+            }
+        }
     }
 
     // ===== v6.29: REAL verification with original invoker =====

@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.35"
+#define LOG_TAG "GoldHack v6.36"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -3097,16 +3097,242 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6.26: Direct mDLCSet manipulation: %d items populated", direct_add_ok);
     }
     
-    // v6.35.1: AddDLC via Execute 已移除 (始终 SIGSEGV, interpData=NULL 的方法
-    // 即使通过 Execute 也无法正确处理 — HybridCLR Execute 期望 args 已由 bridge 设置)
-    // 改用 mLoginData.DLC 列表注入作为唯一数据修改路径
+    // ===== v6.36: 注入 mLoginData.DLC 列表 (STRING 类型!) =====
+    // v6.35 的致命 BUG: 服务器返回 "dlc":[""] 是字符串列表 List<string>,
+    // 但我们注入的是整数 1-20! isUnlockRole 检查 mLoginData.DLC.Contains(dlcId_string),
+    // 整数值永远匹配不上 DLC ID 字符串.
+    //
+    // v6.36 修复: 
+    // 1. 从 DLCSet 子对象读取 DLCId 字符串 (每个 DLC 类型的产品 ID)
+    // 2. 用 il2cpp_string_new 创建字符串, 注入到 List<string> mLoginData.DLC
+    // 3. 调用 UpdateDLC() 刷新
+
+    // === Phase 1: 发现 DLC ID 字符串 ===
+    // 从 DLCSet 子对象的静态字段读取 DLCId 字符串
+    #define MAX_DLC_IDS 50
+    void *dlc_id_strings[MAX_DLC_IDS]; // Il2CppString* 数组
+    char dlc_id_utf8[MAX_DLC_IDS][128]; // UTF-8 版本用于日志
+    int dlc_id_count = 0;
     
-    // ===== v6.35: 注入 mLoginData.DLC 列表 =====
-    // 核心发现: DLC 状态来自服务器登录响应 → PlayerPrefs JSON "DLC":[]
-    // → mLoginData.DLC (C# List<int>) → mDLCSet → UI
-    // 修改内存中的 mLoginData.DLC 列表, 然后调用 UpdateDLC 重建 mDLCSet
     {
-        LOGI("[dlc] v6.35: ===== mLoginData.DLC injection =====");
+        LOGI("[dlc] v6.36: ===== Phase 1: Discover DLC ID strings from DLCSet =====");
+        
+        void *current_dlcset = NULL;
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+            current_dlcset = *(void **)(g_proto_login_inst + 0x40);
+        }
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        
+        if (current_dlcset && fn_object_get_class && fn_class_get_fields && fn_field_get_name
+            && fn_field_get_offset && fn_field_get_type && fn_class_from_type
+            && fn_field_get_value) {
+            
+            Il2CppClass dlcset_cls = fn_object_get_class(current_dlcset);
+            void *fiter = NULL;
+            Il2CppFieldInfo fi;
+            
+            while ((fi = fn_class_get_fields(dlcset_cls, &fiter)) != NULL) {
+                const char *fname = fn_field_get_name(fi);
+                int foff = fn_field_get_offset ? fn_field_get_offset(fi) : -1;
+                if (foff < 16) continue;
+                
+                // 读取子对象
+                void *sub_obj = NULL;
+                install_sigsegv_handler();
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                    sub_obj = *(void **)((uintptr_t)current_dlcset + foff);
+                }
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
+                
+                if (!sub_obj) continue;
+                
+                // 获取子对象的类, 找 DLCId 字段
+                Il2CppClass sub_cls = fn_object_get_class(sub_obj);
+                if (!sub_cls) continue;
+                
+                void *siter = NULL;
+                Il2CppFieldInfo sfi;
+                while ((sfi = fn_class_get_fields(sub_cls, &siter)) != NULL) {
+                    const char *sfname = fn_field_get_name(sfi);
+                    if (!sfname || strcmp(sfname, "DLCId") != 0) continue;
+                    
+                    // 用 il2cpp_field_get_value 读取 (正确处理静态字段!)
+                    void *dlcid_str = NULL;
+                    install_sigsegv_handler();
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                        fn_field_get_value(sub_obj, sfi, &dlcid_str);
+                    }
+                    g_in_safe_access = 0;
+                    uninstall_sigsegv_handler();
+                    
+                    if (sigsegv_hit || !dlcid_str) {
+                        // field_get_value 崩溃或返回 NULL, 尝试直接读 obj+0x10
+                        install_sigsegv_handler();
+                        g_in_safe_access = 1;
+                        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                            dlcid_str = *(void **)((uintptr_t)sub_obj + 0x10);
+                        }
+                        g_in_safe_access = 0;
+                        uninstall_sigsegv_handler();
+                    }
+                    
+                    if (!dlcid_str || sigsegv_hit) {
+                        LOGW("[dlc] v6.36:   %s.DLCId = NULL/SIGSEGV", fname);
+                        break;
+                    }
+                    
+                    // 验证是 Il2CppString: 读取 length 和 chars
+                    int32_t str_len = 0;
+                    install_sigsegv_handler();
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                        str_len = *(int32_t *)((uintptr_t)dlcid_str + 0x10);
+                    }
+                    g_in_safe_access = 0;
+                    uninstall_sigsegv_handler();
+                    
+                    if (sigsegv_hit || str_len <= 0 || str_len > 200) {
+                        LOGW("[dlc] v6.36:   %s.DLCId = %p (invalid string, len=%d)", fname, dlcid_str, str_len);
+                        break;
+                    }
+                    
+                    // 读取 UTF-16 chars 并转换为 UTF-8
+                    char utf8_buf[256] = {0};
+                    int utf8_pos = 0;
+                    install_sigsegv_handler();
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                        uint16_t *chars = (uint16_t *)((uintptr_t)dlcid_str + 0x14);
+                        for (int ci = 0; ci < str_len && utf8_pos < 250; ci++) {
+                            uint16_t ch = chars[ci];
+                            if (ch < 0x80) {
+                                utf8_buf[utf8_pos++] = (char)ch;
+                            } else if (ch < 0x800) {
+                                utf8_buf[utf8_pos++] = (char)(0xC0 | (ch >> 6));
+                                utf8_buf[utf8_pos++] = (char)(0x80 | (ch & 0x3F));
+                            } else {
+                                utf8_buf[utf8_pos++] = (char)(0xE0 | (ch >> 12));
+                                utf8_buf[utf8_pos++] = (char)(0x80 | ((ch >> 6) & 0x3F));
+                                utf8_buf[utf8_pos++] = (char)(0x80 | (ch & 0x3F));
+                            }
+                        }
+                    }
+                    g_in_safe_access = 0;
+                    uninstall_sigsegv_handler();
+                    utf8_buf[utf8_pos] = 0;
+                    
+                    if (sigsegv_hit || utf8_pos == 0) {
+                        LOGW("[dlc] v6.36:   %s.DLCId = %p (read SIGSEGV)", fname, dlcid_str);
+                        break;
+                    }
+                    
+                    // 检查重复
+                    int is_dup = 0;
+                    for (int di = 0; di < dlc_id_count; di++) {
+                        if (strcmp(dlc_id_utf8[di], utf8_buf) == 0) { is_dup = 1; break; }
+                    }
+                    
+                    if (!is_dup && dlc_id_count < MAX_DLC_IDS) {
+                        dlc_id_strings[dlc_id_count] = dlcid_str;
+                        strncpy(dlc_id_utf8[dlc_id_count], utf8_buf, 127);
+                        dlc_id_utf8[dlc_id_count][127] = 0;
+                        LOGI("[dlc] v6.36:   ★ %s → DLCId=\"%s\" (str=%p, len=%d)",
+                             fname, utf8_buf, dlcid_str, str_len);
+                        dlc_id_count++;
+                    } else if (is_dup) {
+                        LOGI("[dlc] v6.36:   %s → DLCId=\"%s\" (duplicate, skipped)", fname, utf8_buf);
+                    }
+                    break; // found DLCId field, move to next sub-object
+                }
+            }
+        } else {
+            LOGW("[dlc] v6.36: Cannot read DLCSet sub-objects (dlcset=%p, APIs=%d)",
+                 current_dlcset, fn_field_get_value != NULL);
+        }
+        
+        LOGI("[dlc] v6.36: Discovered %d unique DLC ID strings", dlc_id_count);
+    }
+    
+    // === Phase 1b: GetDLCId 方法补充发现 ===
+    // GetDLCId(PackageEnum) 返回 STRING (不是 int!)
+    {
+        Il2CppMethodInfo m_getDLCId = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCId", 1);
+        if (m_getDLCId) {
+            LOGI("[dlc] v6.36: ===== GetDLCId(PackageEnum) → String =====");
+            __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+            for (int32_t pe = 0; pe <= 40; pe++) {
+                void *params[1] = { &pe };
+                exc = NULL;
+                void *r = NULL;
+                SAFE_INVOKE(r, m_getDLCId, (void*)g_proto_login_inst, params, &exc);
+                if (sigsegv_hit || exc || !r) continue;
+                
+                // r 是 Il2CppString* (引用类型直接返回, 不需要 unbox)
+                int32_t slen = 0;
+                install_sigsegv_handler();
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                    slen = *(int32_t *)((uintptr_t)r + 0x10);
+                }
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
+                
+                if (sigsegv_hit || slen <= 0 || slen > 200) continue;
+                
+                // 读取 UTF-8
+                char gbuf[256] = {0};
+                int gpos = 0;
+                install_sigsegv_handler();
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                    uint16_t *gchars = (uint16_t *)((uintptr_t)r + 0x14);
+                    for (int gi = 0; gi < slen && gpos < 250; gi++) {
+                        uint16_t ch = gchars[gi];
+                        if (ch < 0x80) gbuf[gpos++] = (char)ch;
+                        else if (ch < 0x800) {
+                            gbuf[gpos++] = (char)(0xC0 | (ch >> 6));
+                            gbuf[gpos++] = (char)(0x80 | (ch & 0x3F));
+                        } else {
+                            gbuf[gpos++] = (char)(0xE0 | (ch >> 12));
+                            gbuf[gpos++] = (char)(0x80 | ((ch >> 6) & 0x3F));
+                            gbuf[gpos++] = (char)(0x80 | (ch & 0x3F));
+                        }
+                    }
+                }
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
+                gbuf[gpos] = 0;
+                
+                if (gpos > 0) {
+                    LOGI("[dlc] v6.36:   PackageEnum(%d) → \"%s\"", pe, gbuf);
+                    
+                    // 添加到收集列表 (如果不重复)
+                    int is_dup = 0;
+                    for (int di = 0; di < dlc_id_count; di++) {
+                        if (strcmp(dlc_id_utf8[di], gbuf) == 0) { is_dup = 1; break; }
+                    }
+                    if (!is_dup && dlc_id_count < MAX_DLC_IDS) {
+                        dlc_id_strings[dlc_id_count] = r;
+                        strncpy(dlc_id_utf8[dlc_id_count], gbuf, 127);
+                        dlc_id_utf8[dlc_id_count][127] = 0;
+                        dlc_id_count++;
+                    }
+                }
+            }
+            __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+            LOGI("[dlc] v6.36: Total DLC IDs after GetDLCId: %d", dlc_id_count);
+        }
+    }
+    
+    // === Phase 2: 注入 DLC ID 字符串到 mLoginData.DLC (List<string>) ===
+    {
+        LOGI("[dlc] v6.36: ===== Phase 2: Inject DLC ID strings into mLoginData.DLC =====");
         
         void *login_data = NULL;
         install_sigsegv_handler();
@@ -3117,17 +3343,12 @@ static int do_unlock_all_dlc(void) {
         g_in_safe_access = 0;
         uninstall_sigsegv_handler();
         
-        LOGI("[dlc] v6.35: mLoginData @ ProtoLogin+0x30 = %p", login_data);
-        
         if (login_data && fn_object_get_class && fn_class_get_fields && fn_field_get_name
-            && fn_field_get_offset && fn_field_get_type && fn_class_from_type
-            && fn_class_get_name && fn_class_get_method_from_name) {
+            && fn_field_get_offset && fn_string_new) {
             
             Il2CppClass login_cls = fn_object_get_class(login_data);
-            const char *login_cls_name = login_cls ? fn_class_get_name(login_cls) : "(null)";
-            LOGI("[dlc] v6.35: mLoginData class = %s", login_cls_name);
             
-            // 枚举 mLoginData 字段, 找 DLC 相关的
+            // 找 DLC 字段
             void *fiter = NULL;
             Il2CppFieldInfo fi;
             Il2CppFieldInfo dlc_field = NULL;
@@ -3136,32 +3357,19 @@ static int do_unlock_all_dlc(void) {
             
             while ((fi = fn_class_get_fields(login_cls, &fiter)) != NULL) {
                 const char *fname = fn_field_get_name(fi);
-                int foff = fn_field_get_offset ? fn_field_get_offset(fi) : -1;
-                void *ftype = fn_field_get_type(fi);
-                Il2CppClass fcls = ftype ? fn_class_from_type(ftype) : NULL;
-                const char *tname = (fcls && fn_class_get_name) ? fn_class_get_name(fcls) : "?";
-                
-                // 输出关键字段
-                if (fname && (strstr(fname, "DLC") || strstr(fname, "dlc") || 
-                    strstr(fname, "Dlc") || strstr(fname, "Gold") ||
-                    strstr(fname, "Role") || strstr(fname, "role"))) {
-                    LOGI("[dlc] v6.35:   F: %s (off=%d, type=%s)", fname, foff, tname);
-                }
-                
-                // 精确匹配 "DLC" 字段
                 if (fname && strcmp(fname, "DLC") == 0) {
                     dlc_field = fi;
-                    dlc_field_offset = foff;
-                    dlc_field_cls = fcls;
-                    LOGI("[dlc] v6.35: ★ Found DLC field: off=%d, type=%s", foff, tname);
+                    dlc_field_offset = fn_field_get_offset ? fn_field_get_offset(fi) : -1;
+                    void *ftype = fn_field_get_type ? fn_field_get_type(fi) : NULL;
+                    dlc_field_cls = (ftype && fn_class_from_type) ? fn_class_from_type(ftype) : NULL;
+                    break;
                 }
             }
             
-            if (dlc_field && dlc_field_cls) {
-                const char *dlc_type = fn_class_get_name(dlc_field_cls);
-                LOGI("[dlc] v6.35: DLC field type: %s", dlc_type);
-                
-                // 读取当前 DLC 列表对象
+            if (!dlc_field || dlc_field_offset < 0) {
+                LOGW("[dlc] v6.36: DLC field not found in LoginData!");
+            } else {
+                // 读取 DLC 列表对象
                 void *dlc_list_obj = NULL;
                 install_sigsegv_handler();
                 g_in_safe_access = 1;
@@ -3171,29 +3379,18 @@ static int do_unlock_all_dlc(void) {
                 g_in_safe_access = 0;
                 uninstall_sigsegv_handler();
                 
-                LOGI("[dlc] v6.35: DLC list object = %p", dlc_list_obj);
-                
-                // 获取 List 的实际类 (可能是 List<int>, List<Int32> 等)
                 Il2CppClass list_cls = dlc_list_obj ? fn_object_get_class(dlc_list_obj) : dlc_field_cls;
                 const char *list_cls_name = (list_cls && fn_class_get_name) ? fn_class_get_name(list_cls) : "?";
-                LOGI("[dlc] v6.35: DLC list class = %s @ %p", list_cls_name, list_cls);
+                LOGI("[dlc] v6.36: DLC list = %p, class = %s", dlc_list_obj, list_cls_name);
                 
                 if (!dlc_list_obj && list_cls && fn_object_new) {
-                    // DLC 列表为空, 创建新 List<int> 实例
-                    LOGI("[dlc] v6.35: Creating new DLC list...");
                     dlc_list_obj = fn_object_new(list_cls);
                     if (dlc_list_obj) {
                         Il2CppMethodInfo list_ctor = fn_class_get_method_from_name(list_cls, ".ctor", 0);
                         if (list_ctor) {
                             exc = NULL;
-                            void *r = NULL;
-                            SAFE_INVOKE(r, list_ctor, dlc_list_obj, NULL, &exc);
-                            if (sigsegv_hit || exc) {
-                                LOGW("[dlc] v6.35: List .ctor failed, trying bypass...");
-                                // 即使 ctor 失败也继续 — il2cpp_object_new 已初始化对象头
-                            }
+                            SAFE_INVOKE(exc, list_ctor, dlc_list_obj, NULL, &exc);
                         }
-                        // 写入 mLoginData.DLC 字段
                         install_sigsegv_handler();
                         g_in_safe_access = 1;
                         if (sigsetjmp(g_jmpbuf, 1) == 0) {
@@ -3201,116 +3398,69 @@ static int do_unlock_all_dlc(void) {
                         }
                         g_in_safe_access = 0;
                         uninstall_sigsegv_handler();
-                        LOGI("[dlc] v6.35: ★ Created DLC list @ %p, written to mLoginData+0x%x",
-                             dlc_list_obj, dlc_field_offset);
+                        LOGI("[dlc] v6.36: Created new DLC list @ %p", dlc_list_obj);
                     }
                 }
                 
                 if (dlc_list_obj && list_cls) {
-                    // 查找 Add 方法 (List<int>.Add(int))
                     Il2CppMethodInfo m_add = fn_class_get_method_from_name(list_cls, "Add", 1);
-                    
-                    // 也查找 get_Count 和 Clear
                     Il2CppMethodInfo m_count = fn_class_get_method_from_name(list_cls, "get_Count", 0);
                     Il2CppMethodInfo m_clear = fn_class_get_method_from_name(list_cls, "Clear", 0);
                     
-                    LOGI("[dlc] v6.35: List methods: Add=%p, get_Count=%p, Clear=%p",
-                         m_add, m_count, m_clear);
-                    
-                    // 读取当前 count
-                    int current_count = -1;
-                    if (m_count) {
-                        exc = NULL;
-                        void *r = NULL;
-                        SAFE_INVOKE(r, m_count, dlc_list_obj, NULL, &exc);
-                        if (!sigsegv_hit && r) {
-                            SAFE_UNBOX_INT(current_count, r, -1);
-                        }
-                    }
-                    LOGI("[dlc] v6.35: Current DLC list count = %d", current_count);
-                    
-                    // 如果列表已有内容, 先清空
-                    if (current_count > 0 && m_clear) {
-                        LOGI("[dlc] v6.35: Clearing existing DLC list...");
+                    // 先清空列表
+                    if (m_clear) {
                         exc = NULL;
                         void *r = NULL;
                         SAFE_INVOKE(r, m_clear, dlc_list_obj, NULL, &exc);
+                        LOGI("[dlc] v6.36: Cleared DLC list");
                     }
                     
-                    // 添加 DLC ID (1-20)
-                    if (m_add) {
-                        int list_add_ok = 0;
-                        for (int32_t dlcId = 1; dlcId <= 20; dlcId++) {
-                            void *params[1] = { &dlcId };
+                    // 添加所有发现的 DLC ID 字符串
+                    int list_add_ok = 0;
+                    if (m_add && fn_string_new) {
+                        for (int di = 0; di < dlc_id_count; di++) {
+                            // 用 il2cpp_string_new 创建 Il2CppString*
+                            void *il2cpp_str = fn_string_new(dlc_id_utf8[di]);
+                            if (!il2cpp_str) {
+                                LOGW("[dlc] v6.36: string_new failed for \"%s\"", dlc_id_utf8[di]);
+                                continue;
+                            }
+                            
+                            // List<string>.Add(string) — 参数是 POINTER 到字符串引用
+                            void *params[1] = { &il2cpp_str };
                             exc = NULL;
                             void *r = NULL;
                             SAFE_INVOKE(r, m_add, dlc_list_obj, params, &exc);
                             if (!sigsegv_hit && !exc) {
                                 list_add_ok++;
+                                LOGI("[dlc] v6.36:   Added \"%s\" to DLC list ✓", dlc_id_utf8[di]);
                             } else {
-                                LOGW("[dlc] v6.35: List.Add(%d) failed (sigsegv=%d exc=%p)",
-                                     dlcId, sigsegv_hit, exc);
-                                break;
+                                LOGW("[dlc] v6.36:   Add \"%s\" failed (segv=%d)", dlc_id_utf8[di], sigsegv_hit);
                             }
-                        }
-                        LOGI("[dlc] v6.35: ★ mLoginData.DLC: added %d DLC IDs", list_add_ok);
-                        
-                        // 验证最终 count
-                        if (m_count) {
-                            exc = NULL;
-                            void *r = NULL;
-                            SAFE_INVOKE(r, m_count, dlc_list_obj, NULL, &exc);
-                            int final_count = -1;
-                            if (!sigsegv_hit && r) {
-                                SAFE_UNBOX_INT(final_count, r, -1);
-                            }
-                            LOGI("[dlc] v6.35: Final DLC list count = %d", final_count);
                         }
                     } else {
-                        // Add 方法未找到, 尝试直接写 List 内部结构
-                        // List<int> 内部: _items (int[] at offset 0x10), _size (int at 0x18)
-                        LOGW("[dlc] v6.35: List.Add not found, trying direct _items/_size write...");
-                        // 获取 List 的内部结构
-                        void *list_fiter = NULL;
-                        Il2CppFieldInfo list_fi;
-                        int items_off = -1, size_off = -1;
-                        Il2CppClass items_cls = NULL;
-                        while ((list_fi = fn_class_get_fields(list_cls, &list_fiter)) != NULL) {
-                            const char *lfname = fn_field_get_name(list_fi);
-                            int lfoff = fn_field_get_offset ? fn_field_get_offset(list_fi) : -1;
-                            LOGI("[dlc] v6.35: List field: %s off=%d", lfname, lfoff);
-                            if (lfname && strcmp(lfname, "_items") == 0) {
-                                items_off = lfoff;
-                                void *lft = fn_field_get_type(list_fi);
-                                items_cls = lft ? fn_class_from_type(lft) : NULL;
-                            }
-                            if (lfname && strcmp(lfname, "_size") == 0) size_off = lfoff;
-                        }
-                        LOGI("[dlc] v6.35: List internal: _items off=%d, _size off=%d", items_off, size_off);
+                        LOGW("[dlc] v6.36: List.Add=%p, string_new=%p", m_add, fn_string_new);
                     }
-                }
-            } else {
-                LOGW("[dlc] v6.35: DLC field not found in %s", login_cls_name);
-                // 输出所有字段名帮助诊断
-                void *fiter2 = NULL;
-                Il2CppFieldInfo fi2;
-                LOGI("[dlc] v6.35: All %s fields:", login_cls_name);
-                while ((fi2 = fn_class_get_fields(login_cls, &fiter2)) != NULL) {
-                    const char *fn2 = fn_field_get_name(fi2);
-                    int fo2 = fn_field_get_offset ? fn_field_get_offset(fi2) : -1;
-                    LOGI("[dlc] v6.35:   %s (off=%d)", fn2, fo2);
+                    
+                    // 验证 count
+                    int final_count = -1;
+                    if (m_count) {
+                        exc = NULL;
+                        void *r = NULL;
+                        SAFE_INVOKE(r, m_count, dlc_list_obj, NULL, &exc);
+                        if (!sigsegv_hit && r) {
+                            SAFE_UNBOX_INT(final_count, r, -1);
+                        }
+                    }
+                    LOGI("[dlc] v6.36: ★ DLC list: added %d strings, final count = %d", list_add_ok, final_count);
                 }
             }
         } else {
-            LOGW("[dlc] v6.35: Cannot inspect mLoginData (ptr=%p, APIs missing)", login_data);
+            LOGW("[dlc] v6.36: Cannot access mLoginData (ptr=%p)", login_data);
         }
     }
     
-    // v6.35.1: SaveLoginData 已移除 — 保存修改后的 DLC 数据到 PlayerPrefs
-    // 会触发 CrashSight 检测 (SIGTRAP 杀进程), 且服务器会在下次登录时覆盖
-    // 改为只修改内存中的数据, 不持久化
-    
-    // UpdateDLC 刷新缓存 — v6.35: 使用 bypass 防止 Execute hook 拦截
+    // === Phase 3: UpdateDLC + POST 验证 ===
     {
         Il2CppMethodInfo m_updateDLC = fn_class_get_method_from_name(g_proto_login_cls, "UpdateDLC", 0);
         if (m_updateDLC) {
@@ -3320,13 +3470,13 @@ static int do_unlock_all_dlc(void) {
             SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
             __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
             if (!sigsegv_hit && !exc) {
-                LOGI("[dlc] v6.35: ★ UpdateDLC() OK (after AddDLC + mLoginData injection)");
+                LOGI("[dlc] v6.36: ★ UpdateDLC() OK");
             } else {
-                LOGW("[dlc] v6.35: UpdateDLC() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
+                LOGW("[dlc] v6.36: UpdateDLC() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
             }
         }
         
-        // 读取 mDLCSet 确认 UpdateDLC 效果
+        // POST 验证
         void *post_update_dlcset = NULL;
         install_sigsegv_handler();
         g_in_safe_access = 1;
@@ -3335,59 +3485,7 @@ static int do_unlock_all_dlc(void) {
         }
         g_in_safe_access = 0;
         uninstall_sigsegv_handler();
-        LOGI("[dlc] v6.35: POST-UpdateDLC: mDLCSet=%p", post_update_dlcset);
-        
-        // v6.35.2: 诊断 — 检查 UpdateDLC 后 mDLCSet 的字段状态
-        // 比较哪些字段有值 vs 哪些为 NULL, 判断 DLC IDs 1-20 是否有效
-        if (post_update_dlcset && fn_object_get_class && fn_class_get_fields 
-            && fn_field_get_name && fn_field_get_offset) {
-            Il2CppClass post_cls = fn_object_get_class(post_update_dlcset);
-            void *piter = NULL;
-            Il2CppFieldInfo pfi;
-            int p_total = 0, p_nonnull = 0;
-            while ((pfi = fn_class_get_fields(post_cls, &piter)) != NULL) {
-                const char *pfn = fn_field_get_name(pfi);
-                int pfo = fn_field_get_offset ? fn_field_get_offset(pfi) : -1;
-                if (pfo < 16) continue;
-                void *pfval = NULL;
-                install_sigsegv_handler();
-                g_in_safe_access = 1;
-                if (sigsetjmp(g_jmpbuf, 1) == 0) {
-                    pfval = *(void **)((uintptr_t)post_update_dlcset + pfo);
-                }
-                g_in_safe_access = 0;
-                uninstall_sigsegv_handler();
-                p_total++;
-                if (pfval) {
-                    p_nonnull++;
-                    LOGI("[dlc] v6.35.2: POST-DLCSet %s (off=%d) = %p ★", pfn, pfo, pfval);
-                }
-            }
-            LOGI("[dlc] v6.35.2: POST-DLCSet summary: %d/%d fields non-null", p_nonnull, p_total);
-        }
-        
-        // v6.35.2: 诊断 — 使用 GetDLCId 发现正确的 DLC ID 映射
-        {
-            Il2CppMethodInfo m_getDLCId = fn_class_get_method_from_name(g_proto_login_cls, "GetDLCId", 1);
-            if (m_getDLCId) {
-                LOGI("[dlc] v6.35.2: ===== GetDLCId discovery (PackageEnum → DLC ID) =====");
-                __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
-                for (int32_t pe = 0; pe <= 40; pe++) {
-                    void *params[1] = { &pe };
-                    exc = NULL;
-                    void *r = NULL;
-                    SAFE_INVOKE(r, m_getDLCId, (void*)g_proto_login_inst, params, &exc);
-                    int dlcId = -1;
-                    if (!sigsegv_hit && !exc && r) { SAFE_UNBOX_INT(dlcId, r, -1); }
-                    if (dlcId > 0) {
-                        LOGI("[dlc] v6.35.2:   PackageEnum(%d) → DLC ID %d", pe, dlcId);
-                    }
-                }
-                __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
-            } else {
-                LOGW("[dlc] v6.35.2: GetDLCId method not found");
-            }
-        }
+        LOGI("[dlc] v6.36: POST-UpdateDLC: mDLCSet=%p", post_update_dlcset);
     }
 
     // ===== v6.29: REAL verification with original invoker =====

@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.38"
+#define LOG_TAG "GoldHack v6.38.1"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -2748,33 +2748,14 @@ static int do_unlock_all_dlc(void) {
             LOGI("[dlc] Extra class patches: %d installed", extra_patched);
         }
         
-        // ===== 6b1) v6.38: Inline hook 所有收集到的 AOT 函数地址 =====
-        // MethodInfo 补丁只能拦截通过 MethodInfo f[0] 的间接调用。
-        // AOT 编译的直接调用 (bl <addr>) 会绕过我们的补丁。
-        // 通过 inline hook 替换原始函数入口的前 16 字节为跳转指令，
-        // 确保 ANY 调用方式（直接/间接/vtable）都被拦截。
-        {
-            LOGI("[dlc] v6.38: ===== Inline hooking %d unique AOT function addresses =====",
-                 g_inline_hook_count);
-            int inline_ok = 0;
-            for (int ih = 0; ih < g_inline_hook_count; ih++) {
-                uintptr_t addr = g_inline_hook_addrs[ih];
-                // 跳过已经是我们函数的地址
-                if (addr == (uintptr_t)custom_return_true_method) continue;
-                
-                // 安全检查: 确保地址在 libil2cpp.so 范围内
-                char label[64];
-                snprintf(label, sizeof(label), "AOT_unlock_%d@%p", ih, (void*)addr);
-                
-                int ret = inline_hook_method(addr, (void*)custom_return_true_method, label);
-                if (ret == 0) {
-                    inline_ok++;
-                } else {
-                    LOGW("[dlc] v6.38: inline hook FAILED for %s", label);
-                }
-            }
-            LOGI("[dlc] v6.38: ★ Inline hooks installed: %d/%d", inline_ok, g_inline_hook_count);
-        }
+        // ===== 6b1) v6.38→v6.38.1: 移除 AOT inline hook =====
+        // v6.38 在此处对收集到的 10 个共享 AOT 桩函数安装 inline hook，
+        // 但这些桩 (如 0x720959d1cc, 0x720959d434) 是通用的 "return false" 实现，
+        // 被游戏中数百个非 DLC 相关方法共用 (按钮状态、UI逻辑等)。
+        // 全部 hook 成 return true 导致游戏按钮无法点击。
+        // MethodInfo f[0] 补丁 + Execute hook 已足够覆盖 DLC 解锁方法。
+        LOGI("[dlc] v6.38.1: Skipping AOT inline hooks (shared stubs break UI, collected %d addrs)",
+             g_inline_hook_count);
         
         // ===== 6b2) v6.8.1: 不再暴力 patch 其他类 =====
         // v6.8 暴力 patch 了 IsDownloading, IsPreDownload, IsFilterItem, IsOnlyContainPvPShop 等

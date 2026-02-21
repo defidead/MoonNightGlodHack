@@ -35,7 +35,7 @@
 #define TARGET_GOLD     99999       // 目标金币值，编译时可用 -DTARGET_GOLD=888888 覆盖
 #endif
 #ifndef WAIT_SECONDS
-#define WAIT_SECONDS    5          // 等待游戏加载的秒数，编译时可用 -DWAIT_SECONDS=20 覆盖
+#define WAIT_SECONDS    2          // v6.34: 减少等待 (早期Execute hook不依赖API初始化)
 #endif
 
 // ========== RoleInfo 字段偏移定义 ==========
@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.33"
+#define LOG_TAG "GoldHack v6.34"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1426,6 +1426,31 @@ static uintptr_t g_execute_hook_targets[MAX_EXECUTE_HOOK_TARGETS];
 static int g_execute_hook_target_count = 0;
 static volatile int g_execute_hook_installed = 0;
 
+// v6.34: interpData 二级索引 — 捕获同一方法的不同 MI 对象
+static uintptr_t g_execute_hook_interp_targets[MAX_EXECUTE_HOOK_TARGETS];
+static int g_execute_hook_interp_count = 0;
+
+// v6.34: 诊断计数器
+static volatile int g_execute_total_calls = 0;
+static volatile int g_execute_intercepted_calls = 0;
+static volatile int g_execute_early_intercepts = 0;
+
+// v6.34: 方法名匹配列表 (用于早期拦截, 在 MI 目标注册前生效)
+// 这些是 DLC 相关的方法名, 在 Execute hook 中按名称匹配
+static const char *g_early_match_names[] = {
+    "isUnlockRole", "IsDLCRole", "IsUnlockAllDLC",
+    "IsUnlockByFirstGame", "IsUnlockGuBao",
+    "IsDianCang", "IsOldPlayer", "isUnlockDLC",
+    "IsBoughtAllItems", "IsUnlockByGameId", "IsUnlockByGameIds",
+    "isUnlockByItem",
+    "get_isUnlockAll", "IsUnlockDianCang",
+    "IsUnlockAll", "IsUnlockByExtra", "IsUnlockAnyDlc", "isUnlock",
+    NULL
+};
+
+// v6.34: 缓存 libil2cpp.so 基址 (用于缓存 Execute 偏移)
+static uintptr_t g_il2cpp_base_for_cache = 0;
+
 // Execute 原始入口地址 (被 hook 后用于 trampoline)
 static uintptr_t g_execute_addr = 0;
 // 保存的原始指令 (前 16 字节 = 4 条 ARM64 指令)
@@ -1443,6 +1468,17 @@ static void execute_hook_add_target(void *mi) {
     if (g_execute_hook_target_count < MAX_EXECUTE_HOOK_TARGETS) {
         g_execute_hook_targets[g_execute_hook_target_count++] = (uintptr_t)mi;
         LOGI("[exec-hook] Added target MI=%p (#%d)", mi, g_execute_hook_target_count);
+    }
+    // v6.34: 同时记录 interpData (f[10]) 用于二级匹配
+    uintptr_t *f = (uintptr_t *)mi;
+    uintptr_t interp_data = f[10];
+    if (interp_data && interp_data > 0x10000 && g_execute_hook_interp_count < MAX_EXECUTE_HOOK_TARGETS) {
+        // 去重
+        for (int i = 0; i < g_execute_hook_interp_count; i++) {
+            if (g_execute_hook_interp_targets[i] == interp_data) return;
+        }
+        g_execute_hook_interp_targets[g_execute_hook_interp_count++] = interp_data;
+        LOGI("[exec-hook] Added interpData target %p (#%d)", (void*)interp_data, g_execute_hook_interp_count);
     }
 }
 
@@ -1571,30 +1607,84 @@ static uintptr_t find_execute_from_bridge(uintptr_t bridge_addr) {
 // trampoline 跳转到 C 函数, C 函数做判断, 然后调用原始 Execute 或直接返回。
 
 // C hook 函数: 检查 MethodInfo 是否需要返回 true
-// 如果匹配, 写 ret=1 并返回 (不调用原始 Execute)
-// 如果不匹配, 调用原始 Execute (通过 trampoline)
+// v6.34: 三层匹配:
+//   1. MI 指针精确匹配 (最快)
+//   2. interpData 匹配 (捕获同一方法的不同 MI 对象)
+//   3. 方法名匹配 (早期模式, 在 MI 目标注册前生效)
 typedef void (*execute_func_t)(const void* methodInfo, void* args, void* ret);
 static execute_func_t g_orig_execute = NULL;  // 指向 trampoline (执行原始指令后跳回 Execute+16)
 
 static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
-    // 快速路径: 检查 methodInfo 是否在目标列表中
+    int total = __atomic_add_fetch(&g_execute_total_calls, 1, __ATOMIC_RELAXED);
+    
     uintptr_t mi_addr = (uintptr_t)methodInfo;
+    const uintptr_t *f = (const uintptr_t *)methodInfo;
+    
+    // Phase 1: MI 指针精确匹配 (快速路径)
     for (int i = 0; i < g_execute_hook_target_count; i++) {
         if (g_execute_hook_targets[i] == mi_addr) {
-            // 匹配! 写 ret=1 并返回
-            if (ret) {
-                *(int64_t*)ret = 1;  // StackObject.i64 = 1 (bool true)
-            }
-            static int hook_calls = 0;
-            if (hook_calls < 50) {
-                LOGI("[exec-hook] ★ INTERCEPTED Execute(MI=%p) -> ret=1 #%d", methodInfo, hook_calls);
-                hook_calls++;
-            }
-            return;
+            goto intercepted;
         }
     }
+    
+    // Phase 2: interpData 匹配 (捕获不同 MI 对象)
+    if (g_execute_hook_interp_count > 0) {
+        uintptr_t interp_data = f[10];
+        if (interp_data) {
+            for (int i = 0; i < g_execute_hook_interp_count; i++) {
+                if (g_execute_hook_interp_targets[i] == interp_data) {
+                    goto intercepted;
+                }
+            }
+        }
+    }
+    
+    // Phase 3: 方法名匹配 (早期模式 + 兜底)
+    // 读取 MI 的 name 字段 (f[2]) 并与已知 DLC 方法名比较
+    {
+        const char *name = (const char *)f[2];
+        if (name && (uintptr_t)name > 0x10000) {
+            // 快速前缀检查: DLC 方法名都以 i/I/g 开头
+            char c0 = name[0];
+            if (c0 == 'i' || c0 == 'I' || c0 == 'g') {
+                for (int n = 0; g_early_match_names[n]; n++) {
+                    if (strcmp(name, g_early_match_names[n]) == 0) {
+                        __atomic_add_fetch(&g_execute_early_intercepts, 1, __ATOMIC_RELAXED);
+                        goto intercepted;
+                    }
+                }
+            }
+        }
+    }
+    
     // 不匹配, 调用原始 Execute
+    // 周期性统计日志
+    if (total == 100 || total == 1000 || total == 5000 || total == 10000 || 
+        total == 50000 || total % 100000 == 0) {
+        LOGI("[exec-hook] Stats: total=%d, intercepted=%d (early=%d), targets=%d, interp=%d",
+             total, 
+             __atomic_load_n(&g_execute_intercepted_calls, __ATOMIC_RELAXED),
+             __atomic_load_n(&g_execute_early_intercepts, __ATOMIC_RELAXED),
+             g_execute_hook_target_count, g_execute_hook_interp_count);
+    }
+    
     g_orig_execute(methodInfo, args, ret);
+    return;
+
+intercepted:
+    if (ret) {
+        *(int64_t*)ret = 1;  // StackObject.i64 = 1 (bool true)
+    }
+    {
+        int ic = __atomic_add_fetch(&g_execute_intercepted_calls, 1, __ATOMIC_RELAXED);
+        if (ic <= 100) {
+            const char *name = (const char *)f[2];
+            const char *safe_name = (name && (uintptr_t)name > 0x10000) ? name : "?";
+            LOGI("[exec-hook] ★ INTERCEPTED Execute(MI=%p, name=%s) -> ret=1 #%d (total=%d, early=%d)",
+                 methodInfo, safe_name, ic, total,
+                 __atomic_load_n(&g_execute_early_intercepts, __ATOMIC_RELAXED));
+        }
+    }
 }
 
 // 安装 Execute inline hook, 返回 0=成功
@@ -1749,7 +1839,104 @@ static int install_execute_hook(uintptr_t execute_addr) {
     g_execute_hook_installed = 1;
     LOGI("[exec-hook] ★ Execute hook installed! Hook=%p, Trampoline=%p, Execute=%p",
          (void*)hook_execute_func, tramp_mem, (void*)execute_addr);
+    
+    // v6.34: 保存 Execute 偏移到缓存, 下次启动可立即安装 hook
+    if (g_il2cpp_base_for_cache) {
+        uint64_t offset = execute_addr - g_il2cpp_base_for_cache;
+        const char *cache_path = "/data/user/0/com.ztgame.yyzy/cache/exec_v34";
+        FILE *cf = fopen(cache_path, "wb");
+        if (cf) {
+            fwrite(&g_il2cpp_base_for_cache, 8, 1, cf);
+            fwrite(&offset, 8, 1, cf);
+            fclose(cf);
+            LOGI("[exec-hook] v6.34: ★ Cached Execute offset 0x%lx (base=%p)", 
+                 (unsigned long)offset, (void*)g_il2cpp_base_for_cache);
+        }
+    }
+    
     return 0;
+}
+
+// ===== v6.34: 从缓存的偏移量尽早安装 Execute hook =====
+// 首次运行时缓存 Execute 偏移; 后续重启 <1 秒内安装 hook
+// 这解决了 "游戏在 hook 安装前就缓存了 DLC 状态" 的根本问题
+static int try_early_execute_hook(void) {
+    if (g_execute_hook_installed) return 0;
+    
+    // 1. 快速找 libil2cpp.so 基址 (不依赖 parse_maps)
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) return -1;
+    
+    uintptr_t il2cpp_base = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, "libil2cpp.so") && strstr(line, "r-xp")) {
+            unsigned long addr;
+            if (sscanf(line, "%lx", &addr) == 1) {
+                il2cpp_base = (uintptr_t)addr;
+            }
+            break;
+        }
+    }
+    fclose(fp);
+    
+    if (!il2cpp_base) {
+        LOGI("[exec-hook] v6.34: libil2cpp.so not loaded yet, skip early hook");
+        return -1;
+    }
+    LOGI("[exec-hook] v6.34: libil2cpp.so base = %p", (void*)il2cpp_base);
+    g_il2cpp_base_for_cache = il2cpp_base;
+    
+    // 2. 读取缓存文件
+    const char *cache_path = "/data/user/0/com.ztgame.yyzy/cache/exec_v34";
+    FILE *cf = fopen(cache_path, "rb");
+    if (!cf) {
+        LOGI("[exec-hook] v6.34: No cached Execute offset (first run), will cache after discovery");
+        return -1;
+    }
+    
+    uint64_t cached_base, cached_offset;
+    int ok = (fread(&cached_base, 8, 1, cf) == 1 && fread(&cached_offset, 8, 1, cf) == 1);
+    fclose(cf);
+    
+    if (!ok || cached_offset == 0 || cached_offset > 0x10000000) {
+        LOGI("[exec-hook] v6.34: Invalid cache data, skip");
+        return -1;
+    }
+    
+    // 3. 计算 Execute 运行时地址
+    uintptr_t exec_addr = il2cpp_base + cached_offset;
+    
+    // 4. 验证: 读取目标地址的指令, 确认看起来像一个函数入口
+    install_sigsegv_handler();
+    g_in_safe_access = 1;
+    int valid = 0;
+    if (sigsetjmp(g_jmpbuf, 1) == 0) {
+        uint32_t first_insn = *(volatile uint32_t *)exec_addr;
+        // Execute 入口应该是 STP (0xA9xx) 指令
+        if ((first_insn >> 24) == 0xA9) {
+            valid = 1;
+        }
+        LOGI("[exec-hook] v6.34: Cached Execute @ %p, first insn=0x%08x, valid=%d",
+             (void*)exec_addr, first_insn, valid);
+    }
+    g_in_safe_access = 0;
+    uninstall_sigsegv_handler();
+    
+    if (!valid) {
+        LOGW("[exec-hook] v6.34: Cached offset invalid (lib may have changed), skip");
+        unlink(cache_path);
+        return -1;
+    }
+    
+    // 5. 安装 Execute hook — 此时无 MI 目标, 但名称匹配会生效!
+    LOGI("[exec-hook] v6.34: ★ Installing EARLY Execute hook from cache (offset=0x%lx)",
+         (unsigned long)cached_offset);
+    int ret = install_execute_hook(exec_addr);
+    if (ret == 0) {
+        LOGI("[exec-hook] v6.34: ★★★ EARLY Execute hook ACTIVE! Name-based DLC interception enabled");
+    }
+    return ret;
 }
 
 // 分配 RWX 内存并写入 ARM64 代码
@@ -5567,6 +5754,11 @@ static void *dlc_monitor_thread(void *arg) {
 static void *hack_thread(void *arg) {
     int target_gold = (int)(intptr_t)arg;
     LOGI("=== GoldHack started, target_gold=%d ===", target_gold);
+    
+    // v6.34: 立即尝试从缓存安装 Execute hook (在游戏加载 DLC 状态之前!)
+    // 首次运行会失败 (无缓存), 重启后 <1 秒内安装
+    try_early_execute_hook();
+    
     LOGI("Waiting %d seconds for game to load...", WAIT_SECONDS);
     sleep(WAIT_SECONDS);
 
@@ -5582,6 +5774,8 @@ static void *hack_thread(void *arg) {
         LOGE("libil2cpp.so not found in memory");
         return NULL;
     }
+    // v6.34: 保存基址用于 Execute 偏移缓存
+    g_il2cpp_base_for_cache = il2cpp_base;
 
     // 3. 尝试获取 il2cpp API（优先从缓存加载）
     LOGI("Attempting to resolve il2cpp APIs...");

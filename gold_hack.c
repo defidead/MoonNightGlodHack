@@ -2347,44 +2347,15 @@ static int do_unlock_all_dlc(void) {
                 LOGI("[dlc] v6.31 %s: interpData=%p resolveDatas=%p", mname, (void*)f[10], (void*)resolve_ptr);
                 
                 if (resolve_ptr && resolve_ptr > 0x1000) {
-                    // dump resolveDatas 前 64 字节 (8 qwords)
+                    // dump resolveDatas 前 64 字节 (8 qwords) — 仅诊断
+                    // v6.33: resolveDatas 包含 packed IR 操作码参数，不是指针!
+                    // 之前把 packed 值误当指针解引用导致 SIGSEGV 崩溃。
+                    // Execute hook (v6.32) 才是正确的拦截方式。
                     uintptr_t *rd = (uintptr_t *)resolve_ptr;
-                    LOGI("[dlc] v6.31 %s resolveDatas:", mname);
+                    LOGI("[dlc] v6.33 %s resolveDatas (diagnostic only):", mname);
                     for (int ri = 0; ri < 8; ri++) {
                         uintptr_t rval = rd[ri];
                         LOGI("[dlc]   rd[%d] = 0x%016lx", ri, (unsigned long)rval);
-                        // 如果看起来像指针, 检查是否是 MethodInfo
-                        if (rval > 0x700000000000ULL && rval < 0xc000000000000000ULL) {
-                            uintptr_t *candidate_mi = (uintptr_t *)rval;
-                            // MethodInfo 的 f[0] 应该是一个代码指针 (0x72... 范围)
-                            uintptr_t cf0 = candidate_mi[0];
-                            uintptr_t cf1 = candidate_mi[1];
-                            if (cf0 > 0x700000000000ULL && cf0 < 0x800000000000ULL) {
-                                // 看起来像 MethodInfo! f[2] 应该是名字字符串
-                                const char *rd_name = "(unknown)";
-                                uintptr_t name_ptr = candidate_mi[2];
-                                if (name_ptr > 0x700000000000ULL) {
-                                    // Il2CppString: len at +0x10, chars at +0x14
-                                    // 但 MethodInfo 的 name 是 const char* (C 字符串)
-                                    // 实际上 name_ptr 是 MHP 加密后的字符串指针
-                                    // 用 fn_method_get_name 获取名字更安全
-                                    rd_name = fn_method_get_name ? 
-                                              fn_method_get_name((void*)rval) : "(no API)";
-                                }
-                                uintptr_t cf10 = candidate_mi[10]; // interpData
-                                uintptr_t cf11 = candidate_mi[11]; // methodPointerCallByInterp
-                                LOGI("[dlc]     → MethodInfo '%s' f[0]=%p f[11]=%p interpData=%p",
-                                     rd_name, (void*)cf0, (void*)cf11, (void*)cf10);
-                                
-                                // ★ 核心: 修改这个子方法的 f[0] 和 f[11]
-                                // 这样当 IR 执行 CallCommonNativeInstance 时
-                                // 会调用我们的 bridge 返回 true
-                                candidate_mi[0] = (uintptr_t)custom_return_true_method;
-                                candidate_mi[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
-                                candidate_mi[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
-                                LOGI("[dlc]     ★ rd[%d] MI '%s' PATCHED f[0]+f[11]+f[12]", ri, rd_name);
-                            }
-                        }
                     }
                 }
                 
@@ -2454,27 +2425,8 @@ static int do_unlock_all_dlc(void) {
             f[0]  = (uintptr_t)custom_return_true_method;   // methodPointer
             f[1]  = (uintptr_t)custom_bool_true_invoker;    // invoker_method (0x08)
             // f[2] = name → 不动!
-            // v6.31: 同样修改 resolveDatas 中引用的 MI
-            if (f[10]) {
-                uint8_t *imi_raw = (uint8_t*)f[10];
-                uintptr_t resolve_ptr = *(uintptr_t*)(imi_raw + 0x18);
-                if (resolve_ptr && resolve_ptr > 0x1000) {
-                    uintptr_t *rd = (uintptr_t *)resolve_ptr;
-                    for (int ri = 0; ri < 8; ri++) {
-                        uintptr_t rval = rd[ri];
-                        if (rval > 0x700000000000ULL && rval < 0xc000000000000000ULL) {
-                            uintptr_t *cmi = (uintptr_t *)rval;
-                            uintptr_t cf0 = cmi[0];
-                            if (cf0 > 0x700000000000ULL && cf0 < 0x800000000000ULL) {
-                                cmi[0] = (uintptr_t)custom_return_true_method;
-                                cmi[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;
-                                cmi[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;
-                                LOGI("[dlc] ★ v6.31 extra %s rd[%d] MI PATCHED", extra_proto_methods[ep], ri);
-                            }
-                        }
-                    }
-                }
-            }
+            // v6.33: resolveDatas 是 packed IR 参数，不是指针，不再尝试解引用
+            // Execute hook (v6.32) 会拦截这些方法的调用
             f[11] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // methodPointerCallByInterp
             f[12] = (uintptr_t)custom_hybridclr_bridge_bool_true;  // virtualMethodPointerCallByInterp
             // v6.31: 保留 bit5, 只设 bit4

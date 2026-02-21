@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.38.1"
+#define LOG_TAG "GoldHack v6.39"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1675,9 +1675,10 @@ static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
     {
         const char *name = (const char *)f[2];
         if (name && (uintptr_t)name > 0x10000) {
-            // 快速前缀检查: DLC 方法名都以 i/I/g 开头
+            // 快速前缀检查: DLC 方法名以 i/I/g/c/H 开头
+            // v6.39: 修复! checkDLCUnlock='c', HasFreeGetRole='H' 之前被遗漏
             char c0 = name[0];
-            if (c0 == 'i' || c0 == 'I' || c0 == 'g') {
+            if (c0 == 'i' || c0 == 'I' || c0 == 'g' || c0 == 'c' || c0 == 'H') {
                 for (int n = 0; g_early_match_names[n]; n++) {
                     if (strcmp(name, g_early_match_names[n]) == 0) {
                         __atomic_add_fetch(&g_execute_early_intercepts, 1, __ATOMIC_RELAXED);
@@ -2748,14 +2749,145 @@ static int do_unlock_all_dlc(void) {
             LOGI("[dlc] Extra class patches: %d installed", extra_patched);
         }
         
-        // ===== 6b1) v6.38→v6.38.1: 移除 AOT inline hook =====
-        // v6.38 在此处对收集到的 10 个共享 AOT 桩函数安装 inline hook，
-        // 但这些桩 (如 0x720959d1cc, 0x720959d434) 是通用的 "return false" 实现，
-        // 被游戏中数百个非 DLC 相关方法共用 (按钮状态、UI逻辑等)。
-        // 全部 hook 成 return true 导致游戏按钮无法点击。
-        // MethodInfo f[0] 补丁 + Execute hook 已足够覆盖 DLC 解锁方法。
-        LOGI("[dlc] v6.38.1: Skipping AOT inline hooks (shared stubs break UI, collected %d addrs)",
-             g_inline_hook_count);
+        // ===== 6b1) v6.39: 手术式 BL 指令补丁 =====
+        // v6.38 错误地 inline hook 了共享 AOT stub，导致所有按钮失灵。
+        // v6.38.1 完全禁用了 inline hook，但 DLC 仍然锁定。
+        // 
+        // 根本原因: 所有 DLC 检查方法 (IsUnlockCurRole, isUnlockRole 等) 都是 AOT 编译的，
+        // 它们的 mPtr 指向共享的 "return false" stub。当 AOT 代码直接调用这些方法时，
+        // 使用的是 BL <stub_addr> 指令，完全绕过 MethodInfo 补丁。
+        //
+        // v6.39 方案: 扫描 CALLER 方法的函数体，找到调用共享 stub 的 BL 指令，
+        // 将其替换为 MOV W0, #1 (直接返回 true)。这是精确的手术式补丁:
+        // - 只修改特定 caller 中的特定 BL 指令
+        // - 不修改共享 stub 本身 (安全，不影响其他方法)
+        // - MOV W0, #1 = 0x52800020 (ARM64 编码)
+        {
+            LOGI("[dlc] v6.39: ===== Surgical BL patching in AOT callers =====");
+            LOGI("[dlc] v6.39: %d shared 'return false' stub addresses collected", g_inline_hook_count);
+            for (int i = 0; i < g_inline_hook_count; i++) {
+                LOGI("[dlc] v6.39: Stub[%d] = %p", i, (void*)g_inline_hook_addrs[i]);
+            }
+            
+            // 需要扫描的类: 这些类的方法可能调用 DLC 检查 stub
+            struct { const char *name; const char *ns; } scan_classes[] = {
+                {"EnterLayer",        ""},
+                {"BookShelfManager",  ""},
+                {"UserInfo",          ""},
+                {"SDKManager",        ""},
+                {"Achieve",           ""},
+                {"PurchaseManager",   ""},
+                {"GameManager",       ""},
+                {"ConfigManager",     ""},
+                {"LoginPanel",        ""},
+                {"GameStartPanel",    ""},
+                {NULL, NULL}
+            };
+            
+            int total_bl_patched = 0;
+            int total_methods_scanned = 0;
+            
+            // 安装 SIGSEGV handler 用于安全读取
+            install_sigsegv_handler();
+            
+            for (int ci = 0; scan_classes[ci].name; ci++) {
+                Il2CppClass cls = fn_class_from_name(g_csharp_image,
+                    scan_classes[ci].ns, scan_classes[ci].name);
+                if (!cls) {
+                    LOGI("[dlc] v6.39: %s not found, skip", scan_classes[ci].name);
+                    continue;
+                }
+                
+                int class_bl_patched = 0;
+                void *iter = NULL;
+                Il2CppMethodInfo mi;
+                while ((mi = fn_class_get_methods(cls, &iter)) != NULL) {
+                    uintptr_t *f = (uintptr_t *)mi;
+                    uintptr_t func_addr = f[0]; // mPtr = 函数体地址
+                    
+                    // 跳过: 已被我们替换的方法
+                    if (func_addr == (uintptr_t)custom_return_true_method) continue;
+                    // 跳过: 无效地址
+                    if (func_addr < 0x100000) continue;
+                    // 跳过: 函数本身就是共享 stub (trivial method)
+                    int is_stub = 0;
+                    for (int s = 0; s < g_inline_hook_count; s++) {
+                        if (func_addr == g_inline_hook_addrs[s]) { is_stub = 1; break; }
+                    }
+                    if (is_stub) continue;
+                    // 跳过: HybridCLR 解释器方法 (interpData != 0, 它们不用 BL 调用)
+                    uintptr_t interp_data = f[10];
+                    if (interp_data != 0 && interp_data > 0x10000) continue;
+                    
+                    // 安全读取函数体，扫描 BL 指令
+                    g_in_safe_access = 1;
+                    if (sigsetjmp(g_jmpbuf, 1) != 0) {
+                        // SIGSEGV - 无法读取此方法的代码
+                        g_in_safe_access = 0;
+                        continue;
+                    }
+                    
+                    volatile uint32_t *insn = (volatile uint32_t *)func_addr;
+                    int method_bl_patched = 0;
+                    const char *mname = (const char *)f[2];
+                    const char *safe_mname = (mname && (uintptr_t)mname > 0x10000) ? mname : "?";
+                    
+                    // 扫描最多 2048 条指令 (8KB)
+                    for (int i = 0; i < 2048; i++) {
+                        uint32_t inst = insn[i];
+                        
+                        // BL 指令检测: bit[31:26] = 100101
+                        if ((inst & 0xFC000000) != 0x94000000) continue;
+                        
+                        // 解码 BL 目标地址
+                        int32_t imm26 = (int32_t)(inst & 0x03FFFFFF);
+                        if (imm26 & 0x02000000) imm26 |= (int32_t)0xFC000000; // 符号扩展
+                        uintptr_t bl_target = (uintptr_t)&insn[i] + (int64_t)imm26 * 4;
+                        
+                        // 检查目标是否是我们收集的共享 stub
+                        for (int s = 0; s < g_inline_hook_count; s++) {
+                            if (bl_target == g_inline_hook_addrs[s]) {
+                                // 补丁: BL <stub> → MOV W0, #1
+                                uintptr_t patch_addr = (uintptr_t)&insn[i];
+                                uintptr_t page = patch_addr & ~(uintptr_t)0xFFF;
+                                mprotect((void*)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
+                                // 跨页检查
+                                uintptr_t page2 = (patch_addr + 4) & ~(uintptr_t)0xFFF;
+                                if (page2 != page) mprotect((void*)page2, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC);
+                                
+                                *(uint32_t*)patch_addr = 0x52800020; // MOV W0, #1
+                                __builtin___clear_cache((char*)patch_addr, (char*)(patch_addr + 4));
+                                
+                                method_bl_patched++;
+                                class_bl_patched++;
+                                total_bl_patched++;
+                                
+                                LOGI("[dlc] v6.39: ★ PATCHED BL @%p in %s.%s [insn#%d] -> MOV W0,#1 (stub[%d]=%p)",
+                                     (void*)patch_addr, scan_classes[ci].name, safe_mname,
+                                     i, s, (void*)g_inline_hook_addrs[s]);
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (method_bl_patched > 0) {
+                        total_methods_scanned++;
+                        LOGI("[dlc] v6.39: %s.%s: %d BLs patched (func@%p)",
+                             scan_classes[ci].name, safe_mname, method_bl_patched, (void*)func_addr);
+                    }
+                }
+                
+                if (class_bl_patched > 0) {
+                    LOGI("[dlc] v6.39: %s: total %d BLs patched", scan_classes[ci].name, class_bl_patched);
+                }
+            }
+            
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+            
+            LOGI("[dlc] v6.39: ★★ Surgical BL patching COMPLETE: %d BLs in %d methods",
+                 total_bl_patched, total_methods_scanned);
+        }
         
         // ===== 6b2) v6.8.1: 不再暴力 patch 其他类 =====
         // v6.8 暴力 patch 了 IsDownloading, IsPreDownload, IsFilterItem, IsOnlyContainPvPShop 等

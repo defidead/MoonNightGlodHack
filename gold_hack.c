@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.34"
+#define LOG_TAG "GoldHack v6.35"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1435,6 +1435,9 @@ static volatile int g_execute_total_calls = 0;
 static volatile int g_execute_intercepted_calls = 0;
 static volatile int g_execute_early_intercepts = 0;
 
+// v6.35: Execute hook 旁路标志 (REAL verification 期间设为 1, 跳过所有拦截)
+static volatile int g_execute_hook_bypass = 0;
+
 // v6.34: 方法名匹配列表 (用于早期拦截, 在 MI 目标注册前生效)
 // 这些是 DLC 相关的方法名, 在 Execute hook 中按名称匹配
 static const char *g_early_match_names[] = {
@@ -1616,6 +1619,12 @@ static execute_func_t g_orig_execute = NULL;  // 指向 trampoline (执行原始
 
 static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
     int total = __atomic_add_fetch(&g_execute_total_calls, 1, __ATOMIC_RELAXED);
+    
+    // v6.35: 旁路模式 — REAL verification 期间跳过所有拦截
+    if (__atomic_load_n(&g_execute_hook_bypass, __ATOMIC_ACQUIRE)) {
+        g_orig_execute(methodInfo, args, ret);
+        return;
+    }
     
     uintptr_t mi_addr = (uintptr_t)methodInfo;
     const uintptr_t *f = (const uintptr_t *)methodInfo;
@@ -3088,33 +3097,331 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6.26: Direct mDLCSet manipulation: %d items populated", direct_add_ok);
     }
     
-    // UpdateDLC 刷新缓存 (UpdateDLC 的 interpData 正常，不会 SIGSEGV)
+    // ===== v6.35: 通过 Execute 直接调用 AddDLC =====
+    // v6.22 尝试 il2cpp_runtime_invoke(AddDLC) 失败: bridge 读取 NULL interpData → SIGSEGV
+    // 核心发现: Execute 函数内部会处理 NULL interpData (调用 Transform 懒初始化)
+    // 所以直接调用 g_orig_execute(AddDLC_MI, stackArgs, NULL) 可以绕过 bridge
+    // StackObject 布局: args[0]=this(ptr), args[1]=dlcId(i64)
+    if (m_addDLC && g_orig_execute) {
+        LOGI("[dlc] v6.35: ===== Calling AddDLC via Execute (bypasses bridge) =====");
+        
+        // 设置 bypass 防止 AddDLC 被 Execute hook 拦截
+        __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+        
+        int add_ok = 0;
+        int add_fail = 0;
+        for (int32_t dlcId = 1; dlcId <= 50; dlcId++) {
+            // HybridCLR StackObject: 8 bytes per slot (union { int64_t i64; void* ptr; })
+            // Instance method: args[0] = this, args[1] = param0
+            int64_t stack_args[2];
+            stack_args[0] = (int64_t)(uintptr_t)g_proto_login_inst;  // this
+            stack_args[1] = (int64_t)dlcId;                           // dlcId
+            
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                g_orig_execute(m_addDLC, (void*)stack_args, NULL);
+                add_ok++;
+            } else {
+                add_fail++;
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
+                if (add_fail >= 3) {
+                    LOGW("[dlc] v6.35: AddDLC SIGSEGV x%d, aborting", add_fail);
+                    break;
+                }
+                continue;
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+        }
+        
+        __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+        LOGI("[dlc] v6.35: ★ AddDLC via Execute: %d/50 OK, %d SIGSEGV", add_ok, add_fail);
+        
+        // 读取 mDLCSet 确认 AddDLC 是否生效
+        {
+            void *dlc_set_after = NULL;
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                dlc_set_after = *(void **)(g_proto_login_inst + 0x40);
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+            LOGI("[dlc] v6.35: POST-AddDLC: mDLCSet=%p",
+                 dlc_set_after);
+        }
+    } else {
+        LOGW("[dlc] v6.35: Cannot call AddDLC via Execute (addDLC=%p, orig_execute=%p)",
+             m_addDLC, g_orig_execute);
+    }
+    
+    // ===== v6.35: 注入 mLoginData.DLC 列表 =====
+    // 核心发现: DLC 状态来自服务器登录响应 → PlayerPrefs JSON "DLC":[]
+    // → mLoginData.DLC (C# List<int>) → mDLCSet → UI
+    // 修改内存中的 mLoginData.DLC 列表, 然后调用 UpdateDLC 重建 mDLCSet
+    {
+        LOGI("[dlc] v6.35: ===== mLoginData.DLC injection =====");
+        
+        void *login_data = NULL;
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+            login_data = *(void **)(g_proto_login_inst + 0x30);
+        }
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        
+        LOGI("[dlc] v6.35: mLoginData @ ProtoLogin+0x30 = %p", login_data);
+        
+        if (login_data && fn_object_get_class && fn_class_get_fields && fn_field_get_name
+            && fn_field_get_offset && fn_field_get_type && fn_class_from_type
+            && fn_class_get_name && fn_class_get_method_from_name) {
+            
+            Il2CppClass login_cls = fn_object_get_class(login_data);
+            const char *login_cls_name = login_cls ? fn_class_get_name(login_cls) : "(null)";
+            LOGI("[dlc] v6.35: mLoginData class = %s", login_cls_name);
+            
+            // 枚举 mLoginData 字段, 找 DLC 相关的
+            void *fiter = NULL;
+            Il2CppFieldInfo fi;
+            Il2CppFieldInfo dlc_field = NULL;
+            int dlc_field_offset = -1;
+            Il2CppClass dlc_field_cls = NULL;
+            
+            while ((fi = fn_class_get_fields(login_cls, &fiter)) != NULL) {
+                const char *fname = fn_field_get_name(fi);
+                int foff = fn_field_get_offset ? fn_field_get_offset(fi) : -1;
+                void *ftype = fn_field_get_type(fi);
+                Il2CppClass fcls = ftype ? fn_class_from_type(ftype) : NULL;
+                const char *tname = (fcls && fn_class_get_name) ? fn_class_get_name(fcls) : "?";
+                
+                // 输出关键字段
+                if (fname && (strstr(fname, "DLC") || strstr(fname, "dlc") || 
+                    strstr(fname, "Dlc") || strstr(fname, "Gold") ||
+                    strstr(fname, "Role") || strstr(fname, "role"))) {
+                    LOGI("[dlc] v6.35:   F: %s (off=%d, type=%s)", fname, foff, tname);
+                }
+                
+                // 精确匹配 "DLC" 字段
+                if (fname && strcmp(fname, "DLC") == 0) {
+                    dlc_field = fi;
+                    dlc_field_offset = foff;
+                    dlc_field_cls = fcls;
+                    LOGI("[dlc] v6.35: ★ Found DLC field: off=%d, type=%s", foff, tname);
+                }
+            }
+            
+            if (dlc_field && dlc_field_cls) {
+                const char *dlc_type = fn_class_get_name(dlc_field_cls);
+                LOGI("[dlc] v6.35: DLC field type: %s", dlc_type);
+                
+                // 读取当前 DLC 列表对象
+                void *dlc_list_obj = NULL;
+                install_sigsegv_handler();
+                g_in_safe_access = 1;
+                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                    dlc_list_obj = *(void **)((uintptr_t)login_data + dlc_field_offset);
+                }
+                g_in_safe_access = 0;
+                uninstall_sigsegv_handler();
+                
+                LOGI("[dlc] v6.35: DLC list object = %p", dlc_list_obj);
+                
+                // 获取 List 的实际类 (可能是 List<int>, List<Int32> 等)
+                Il2CppClass list_cls = dlc_list_obj ? fn_object_get_class(dlc_list_obj) : dlc_field_cls;
+                const char *list_cls_name = (list_cls && fn_class_get_name) ? fn_class_get_name(list_cls) : "?";
+                LOGI("[dlc] v6.35: DLC list class = %s @ %p", list_cls_name, list_cls);
+                
+                if (!dlc_list_obj && list_cls && fn_object_new) {
+                    // DLC 列表为空, 创建新 List<int> 实例
+                    LOGI("[dlc] v6.35: Creating new DLC list...");
+                    dlc_list_obj = fn_object_new(list_cls);
+                    if (dlc_list_obj) {
+                        Il2CppMethodInfo list_ctor = fn_class_get_method_from_name(list_cls, ".ctor", 0);
+                        if (list_ctor) {
+                            exc = NULL;
+                            void *r = NULL;
+                            SAFE_INVOKE(r, list_ctor, dlc_list_obj, NULL, &exc);
+                            if (sigsegv_hit || exc) {
+                                LOGW("[dlc] v6.35: List .ctor failed, trying bypass...");
+                                // 即使 ctor 失败也继续 — il2cpp_object_new 已初始化对象头
+                            }
+                        }
+                        // 写入 mLoginData.DLC 字段
+                        install_sigsegv_handler();
+                        g_in_safe_access = 1;
+                        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                            *(void **)((uintptr_t)login_data + dlc_field_offset) = dlc_list_obj;
+                        }
+                        g_in_safe_access = 0;
+                        uninstall_sigsegv_handler();
+                        LOGI("[dlc] v6.35: ★ Created DLC list @ %p, written to mLoginData+0x%x",
+                             dlc_list_obj, dlc_field_offset);
+                    }
+                }
+                
+                if (dlc_list_obj && list_cls) {
+                    // 查找 Add 方法 (List<int>.Add(int))
+                    Il2CppMethodInfo m_add = fn_class_get_method_from_name(list_cls, "Add", 1);
+                    
+                    // 也查找 get_Count 和 Clear
+                    Il2CppMethodInfo m_count = fn_class_get_method_from_name(list_cls, "get_Count", 0);
+                    Il2CppMethodInfo m_clear = fn_class_get_method_from_name(list_cls, "Clear", 0);
+                    
+                    LOGI("[dlc] v6.35: List methods: Add=%p, get_Count=%p, Clear=%p",
+                         m_add, m_count, m_clear);
+                    
+                    // 读取当前 count
+                    int current_count = -1;
+                    if (m_count) {
+                        exc = NULL;
+                        void *r = NULL;
+                        SAFE_INVOKE(r, m_count, dlc_list_obj, NULL, &exc);
+                        if (!sigsegv_hit && r) {
+                            SAFE_UNBOX_INT(current_count, r, -1);
+                        }
+                    }
+                    LOGI("[dlc] v6.35: Current DLC list count = %d", current_count);
+                    
+                    // 如果列表已有内容, 先清空
+                    if (current_count > 0 && m_clear) {
+                        LOGI("[dlc] v6.35: Clearing existing DLC list...");
+                        exc = NULL;
+                        void *r = NULL;
+                        SAFE_INVOKE(r, m_clear, dlc_list_obj, NULL, &exc);
+                    }
+                    
+                    // 添加 DLC ID (1-20)
+                    if (m_add) {
+                        int list_add_ok = 0;
+                        for (int32_t dlcId = 1; dlcId <= 20; dlcId++) {
+                            void *params[1] = { &dlcId };
+                            exc = NULL;
+                            void *r = NULL;
+                            SAFE_INVOKE(r, m_add, dlc_list_obj, params, &exc);
+                            if (!sigsegv_hit && !exc) {
+                                list_add_ok++;
+                            } else {
+                                LOGW("[dlc] v6.35: List.Add(%d) failed (sigsegv=%d exc=%p)",
+                                     dlcId, sigsegv_hit, exc);
+                                break;
+                            }
+                        }
+                        LOGI("[dlc] v6.35: ★ mLoginData.DLC: added %d DLC IDs", list_add_ok);
+                        
+                        // 验证最终 count
+                        if (m_count) {
+                            exc = NULL;
+                            void *r = NULL;
+                            SAFE_INVOKE(r, m_count, dlc_list_obj, NULL, &exc);
+                            int final_count = -1;
+                            if (!sigsegv_hit && r) {
+                                SAFE_UNBOX_INT(final_count, r, -1);
+                            }
+                            LOGI("[dlc] v6.35: Final DLC list count = %d", final_count);
+                        }
+                    } else {
+                        // Add 方法未找到, 尝试直接写 List 内部结构
+                        // List<int> 内部: _items (int[] at offset 0x10), _size (int at 0x18)
+                        LOGW("[dlc] v6.35: List.Add not found, trying direct _items/_size write...");
+                        // 获取 List 的内部结构
+                        void *list_fiter = NULL;
+                        Il2CppFieldInfo list_fi;
+                        int items_off = -1, size_off = -1;
+                        Il2CppClass items_cls = NULL;
+                        while ((list_fi = fn_class_get_fields(list_cls, &list_fiter)) != NULL) {
+                            const char *lfname = fn_field_get_name(list_fi);
+                            int lfoff = fn_field_get_offset ? fn_field_get_offset(list_fi) : -1;
+                            LOGI("[dlc] v6.35: List field: %s off=%d", lfname, lfoff);
+                            if (lfname && strcmp(lfname, "_items") == 0) {
+                                items_off = lfoff;
+                                void *lft = fn_field_get_type(list_fi);
+                                items_cls = lft ? fn_class_from_type(lft) : NULL;
+                            }
+                            if (lfname && strcmp(lfname, "_size") == 0) size_off = lfoff;
+                        }
+                        LOGI("[dlc] v6.35: List internal: _items off=%d, _size off=%d", items_off, size_off);
+                    }
+                }
+            } else {
+                LOGW("[dlc] v6.35: DLC field not found in %s", login_cls_name);
+                // 输出所有字段名帮助诊断
+                void *fiter2 = NULL;
+                Il2CppFieldInfo fi2;
+                LOGI("[dlc] v6.35: All %s fields:", login_cls_name);
+                while ((fi2 = fn_class_get_fields(login_cls, &fiter2)) != NULL) {
+                    const char *fn2 = fn_field_get_name(fi2);
+                    int fo2 = fn_field_get_offset ? fn_field_get_offset(fi2) : -1;
+                    LOGI("[dlc] v6.35:   %s (off=%d)", fn2, fo2);
+                }
+            }
+        } else {
+            LOGW("[dlc] v6.35: Cannot inspect mLoginData (ptr=%p, APIs missing)", login_data);
+        }
+    }
+    
+    // ===== v6.35: 调用 SaveLoginData 持久化修改后的 DLC 数据 =====
+    {
+        Il2CppMethodInfo m_save = fn_class_get_method_from_name(g_proto_login_cls, "SaveLoginData", 0);
+        if (m_save) {
+            __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+            exc = NULL;
+            void *r = NULL;
+            SAFE_INVOKE(r, m_save, (void*)g_proto_login_inst, NULL, &exc);
+            __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+            if (!sigsegv_hit && !exc) {
+                LOGI("[dlc] v6.35: ★ SaveLoginData() OK (persisted DLC data)");
+            } else {
+                LOGW("[dlc] v6.35: SaveLoginData() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
+            }
+        }
+    }
+    
+    // UpdateDLC 刷新缓存 — v6.35: 使用 bypass 防止 Execute hook 拦截
     {
         Il2CppMethodInfo m_updateDLC = fn_class_get_method_from_name(g_proto_login_cls, "UpdateDLC", 0);
         if (m_updateDLC) {
+            __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
             exc = NULL;
             void *r = NULL;
             SAFE_INVOKE(r, m_updateDLC, (void*)g_proto_login_inst, NULL, &exc);
+            __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
             if (!sigsegv_hit && !exc) {
-                LOGI("[dlc] v6.26: ★ UpdateDLC() OK");
+                LOGI("[dlc] v6.35: ★ UpdateDLC() OK (after AddDLC + mLoginData injection)");
             } else {
-                LOGW("[dlc] v6.26: UpdateDLC() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
+                LOGW("[dlc] v6.35: UpdateDLC() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
             }
         }
+        
+        // 读取 mDLCSet 确认 UpdateDLC 效果
+        void *post_update_dlcset = NULL;
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+            post_update_dlcset = *(void **)(g_proto_login_inst + 0x40);
+        }
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        LOGI("[dlc] v6.35: POST-UpdateDLC: mDLCSet=%p", post_update_dlcset);
     }
 
     // ===== v6.29: REAL verification with original invoker =====
     // 上面的 verification (step 7) 用的是 custom_bool_true_invoker, 始终返回 true.
     // 这里临时恢复原始 invoker, 让 fn_runtime_invoke 走原始的 InterpreterInvoke 路径,
     // 执行真实的 IL 代码检查 DLCSet 数据. 这告诉我们 DLCSet 填充是否正确.
+    // v6.35: 同时设置 Execute hook bypass, 防止 Execute 层面再次拦截
     int real_unlocked_count = 0;
     if (g_orig_isUnlockRole_invoker && m_isUnlock) {
-        LOGI("[dlc] v6.29: ===== REAL isUnlockRole verification (original invoker) =====");
+        LOGI("[dlc] v6.35: ===== REAL isUnlockRole verification (bypass=1) =====");
         uintptr_t *unlock_f = (uintptr_t *)m_isUnlock;
         uintptr_t saved_custom_invoker = unlock_f[1];
         
         // 临时恢复原始 invoker (InterpreterInvoke)
         unlock_f[1] = g_orig_isUnlockRole_invoker;
+        // v6.35: 设置 Execute hook bypass, 让调用不被拦截
+        __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
         
         for (int32_t rid = 0; rid <= 15; rid++) {
             void *params[1] = { &rid };
@@ -3123,23 +3430,24 @@ static int do_unlock_all_dlc(void) {
             SAFE_INVOKE(result, m_isUnlock, (void *)g_proto_login_inst, params, &exc);
             int val = -1;
             if (sigsegv_hit) {
-                LOGE("[dlc] v6.29:   REAL isUnlockRole(%d) SIGSEGV!", rid);
+                LOGE("[dlc] v6.35:   REAL isUnlockRole(%d) SIGSEGV!", rid);
             } else if (exc) {
-                LOGE("[dlc] v6.29:   REAL isUnlockRole(%d) EXCEPTION", rid);
+                LOGE("[dlc] v6.35:   REAL isUnlockRole(%d) EXCEPTION", rid);
             } else if (result) {
                 SAFE_UNBOX_INT(val, result, -1);
-                LOGI("[dlc] v6.29:   REAL isUnlockRole(%d) = %d%s", rid, val, val > 0 ? " ✓" : " ✗");
+                LOGI("[dlc] v6.35:   REAL isUnlockRole(%d) = %d%s", rid, val, val > 0 ? " ✓" : " ✗");
                 if (val > 0) real_unlocked_count++;
             } else {
-                LOGI("[dlc] v6.29:   REAL isUnlockRole(%d) result=NULL", rid);
+                LOGI("[dlc] v6.35:   REAL isUnlockRole(%d) result=NULL", rid);
             }
         }
-        LOGI("[dlc] v6.29: ★ REAL verification: %d/16 roles (with original invoker, checks DLCSet data)", real_unlocked_count);
+        LOGI("[dlc] v6.35: ★ REAL verification: %d/16 roles (bypass=1, original interpreter)", real_unlocked_count);
         
-        // 恢复自定义 invoker
+        // 恢复 Execute hook 拦截 + 自定义 invoker
+        __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
         unlock_f[1] = saved_custom_invoker;
     } else {
-        LOGW("[dlc] v6.29: Cannot do REAL verification - original invoker not saved");
+        LOGW("[dlc] v6.35: Cannot do REAL verification - original invoker not saved");
     }
 
     if (unlocked_count >= 10) {
@@ -3151,7 +3459,7 @@ static int do_unlock_all_dlc(void) {
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.32 complete (patched=%d/16, real=%d/16, mi_hooks=%d, exec_hook=%d, targets=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.35 complete (patched=%d/16, real=%d/16, mi_hooks=%d, exec_hook=%d, targets=%d) =====",
          unlocked_count, real_unlocked_count, g_mi_hooks_installed, g_execute_hook_installed, g_execute_hook_target_count);
     return unlocked_count;
 }

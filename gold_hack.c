@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.37"
+#define LOG_TAG "GoldHack v6.38"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1443,6 +1443,7 @@ static volatile int g_execute_hook_bypass = 0;
 
 // v6.34: 方法名匹配列表 (用于早期拦截, 在 MI 目标注册前生效)
 // 这些是 DLC 相关的方法名, 在 Execute hook 中按名称匹配
+// v6.38: 增加 IsUnlockCurRole, HasFreeGetRole, IsUnlockCard, checkDLCUnlock
 static const char *g_early_match_names[] = {
     "isUnlockRole", "IsDLCRole", "IsUnlockAllDLC",
     "IsUnlockByFirstGame", "IsUnlockGuBao",
@@ -1451,8 +1452,26 @@ static const char *g_early_match_names[] = {
     "isUnlockByItem",
     "get_isUnlockAll", "IsUnlockDianCang",
     "IsUnlockAll", "IsUnlockByExtra", "IsUnlockAnyDlc", "isUnlock",
+    "IsUnlockCurRole", "HasFreeGetRole", "IsUnlockCard",
+    "checkDLCUnlock", "IsUnlockNormalAchieve",
     NULL
 };
+
+// v6.38: 收集需要 inline hook 的原始 AOT 函数地址
+#define MAX_INLINE_HOOK_ADDRS 32
+static uintptr_t g_inline_hook_addrs[MAX_INLINE_HOOK_ADDRS];
+static int g_inline_hook_count = 0;
+
+static void collect_inline_hook_addr(uintptr_t addr) {
+    if (!addr || addr < 0x10000) return;
+    // 去重
+    for (int i = 0; i < g_inline_hook_count; i++) {
+        if (g_inline_hook_addrs[i] == addr) return;
+    }
+    if (g_inline_hook_count < MAX_INLINE_HOOK_ADDRS) {
+        g_inline_hook_addrs[g_inline_hook_count++] = addr;
+    }
+}
 
 // v6.34: 缓存 libil2cpp.so 基址 (用于缓存 Execute 偏移)
 static uintptr_t g_il2cpp_base_for_cache = 0;
@@ -2476,6 +2495,9 @@ static int do_unlock_all_dlc(void) {
             LOGI("[dlc] BEFORE %s: mPtr=%p inv=%p name=%p interpData=%p MI=%p",
                  mname, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[10], mi);
             
+            // v6.38: 收集原始函数地址用于后续 inline hook
+            collect_inline_hook_addr(f[0]);
+            
             // v6.32: 注册到 Execute hook 目标列表 (在 patch f[0] 之前!)
             execute_hook_add_target(mi);
             
@@ -2622,6 +2644,8 @@ static int do_unlock_all_dlc(void) {
             int pc_found = fn_method_get_param_count ? fn_method_get_param_count(mi) : -1;
             LOGI("[dlc] BEFORE ProtoLogin.%s(%d): mPtr=%p inv=%p name=%p interpData=%p MI=%p",
                  extra_proto_methods[ep], pc_found, (void*)f[0], (void*)f[1], (void*)f[2], (void*)f[10], mi);
+            // v6.38: 收集原始函数地址用于后续 inline hook
+            collect_inline_hook_addr(f[0]);
             // v6.32: 注册到 Execute hook 目标列表
             execute_hook_add_target(mi);
             uintptr_t page = (uintptr_t)mi & ~(uintptr_t)0xFFF;
@@ -2655,6 +2679,7 @@ static int do_unlock_all_dlc(void) {
         // ===== 6b) v6.27: 恢复 extra class patches (v6.10 水平) =====
         // v6.16 移除了这些 patch 声称"按钮失灵"，但实际上按钮问题是浮窗拦截触摸导致的
         // （v6.18 已通过 FLAG_NOT_TOUCH_MODAL + collapsed 修复）。现在安全恢复。
+        // v6.38: 增加 IsUnlockCurRole, HasFreeGetRole, IsUnlockCard, Achieve 方法
         {
             struct { const char *cls_name; const char *ns; const char *method_name; int param_count; } extra_patches[] = {
                 {"EditorSettingExtension",    "", "get_isUnlockAll",    0},  // v6.28: 恢复! v6.9 有这个
@@ -2666,6 +2691,11 @@ static int do_unlock_all_dlc(void) {
                 {"PurchaseRedConfig",         "", "IsUnlockAll",        1},
                 {"PackageSystem",             "", "IsUnlockAnyDlc",     1},
                 {"PurchasePocketPanel",       "", "isUnlock",            1},
+                // v6.38: 新增 — 解锁调灵师/小猪妖/愿望之夜的关键方法
+                {"EnterLayer",                "", "IsUnlockCurRole",    0},  // 检查当前角色是否解锁
+                {"SDKManager",                "", "HasFreeGetRole",     0},  // 免费获取角色
+                {"Achieve",                   "", "IsUnlockCard",       1},  // 卡牌解锁
+                {"Achieve",                   "", "IsUnlockNormalAchieve", 1}, // 成就解锁
             };
             int num_extra = sizeof(extra_patches) / sizeof(extra_patches[0]);
             int extra_patched = 0;
@@ -2692,6 +2722,9 @@ static int do_unlock_all_dlc(void) {
                      extra_patches[e].cls_name, extra_patches[e].method_name,
                      (void*)f[0], (void*)f[1], (void*)f[10]);
                 
+                // v6.38: 收集原始函数地址用于后续 inline hook
+                collect_inline_hook_addr(f[0]);
+                
                 // v6.32: 注册到 Execute hook 目标列表
                 execute_hook_add_target(mi);
                 
@@ -2713,6 +2746,34 @@ static int do_unlock_all_dlc(void) {
                 extra_patched++;
             }
             LOGI("[dlc] Extra class patches: %d installed", extra_patched);
+        }
+        
+        // ===== 6b1) v6.38: Inline hook 所有收集到的 AOT 函数地址 =====
+        // MethodInfo 补丁只能拦截通过 MethodInfo f[0] 的间接调用。
+        // AOT 编译的直接调用 (bl <addr>) 会绕过我们的补丁。
+        // 通过 inline hook 替换原始函数入口的前 16 字节为跳转指令，
+        // 确保 ANY 调用方式（直接/间接/vtable）都被拦截。
+        {
+            LOGI("[dlc] v6.38: ===== Inline hooking %d unique AOT function addresses =====",
+                 g_inline_hook_count);
+            int inline_ok = 0;
+            for (int ih = 0; ih < g_inline_hook_count; ih++) {
+                uintptr_t addr = g_inline_hook_addrs[ih];
+                // 跳过已经是我们函数的地址
+                if (addr == (uintptr_t)custom_return_true_method) continue;
+                
+                // 安全检查: 确保地址在 libil2cpp.so 范围内
+                char label[64];
+                snprintf(label, sizeof(label), "AOT_unlock_%d@%p", ih, (void*)addr);
+                
+                int ret = inline_hook_method(addr, (void*)custom_return_true_method, label);
+                if (ret == 0) {
+                    inline_ok++;
+                } else {
+                    LOGW("[dlc] v6.38: inline hook FAILED for %s", label);
+                }
+            }
+            LOGI("[dlc] v6.38: ★ Inline hooks installed: %d/%d", inline_ok, g_inline_hook_count);
         }
         
         // ===== 6b2) v6.8.1: 不再暴力 patch 其他类 =====

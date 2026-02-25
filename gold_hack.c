@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.41"
+#define LOG_TAG "GoldHack v6.42"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1433,6 +1433,12 @@ static volatile int g_execute_hook_installed = 0;
 static uintptr_t g_execute_hook_interp_targets[MAX_EXECUTE_HOOK_TARGETS];
 static int g_execute_hook_interp_count = 0;
 
+// v6.42: FALSE 目标列表 (IsHidePig/IsHideSlavePig 需要返回 false)
+static uintptr_t g_execute_hook_false_targets[MAX_EXECUTE_HOOK_TARGETS];
+static int g_execute_hook_false_target_count = 0;
+static uintptr_t g_execute_hook_false_interp_targets[MAX_EXECUTE_HOOK_TARGETS];
+static int g_execute_hook_false_interp_count = 0;
+
 // v6.34: 诊断计数器
 static volatile int g_execute_total_calls = 0;
 static volatile int g_execute_intercepted_calls = 0;
@@ -1516,6 +1522,29 @@ static void execute_hook_add_target(void *mi) {
         }
         g_execute_hook_interp_targets[g_execute_hook_interp_count++] = interp_data;
         LOGI("[exec-hook] Added interpData target %p (#%d)", (void*)interp_data, g_execute_hook_interp_count);
+    }
+}
+
+// v6.42: 添加 FALSE 目标 (Execute hook 中返回 false 而不是 true)
+static void execute_hook_add_false_target(void *mi) {
+    if (!mi) return;
+    // 去重
+    for (int i = 0; i < g_execute_hook_false_target_count; i++) {
+        if (g_execute_hook_false_targets[i] == (uintptr_t)mi) return;
+    }
+    if (g_execute_hook_false_target_count < MAX_EXECUTE_HOOK_TARGETS) {
+        g_execute_hook_false_targets[g_execute_hook_false_target_count++] = (uintptr_t)mi;
+        LOGI("[exec-hook] Added FALSE target MI=%p (#%d)", mi, g_execute_hook_false_target_count);
+    }
+    // 同时记录 interpData 用于二级匹配
+    uintptr_t *f = (uintptr_t *)mi;
+    uintptr_t interp_data = f[10];
+    if (interp_data && interp_data > 0x10000 && g_execute_hook_false_interp_count < MAX_EXECUTE_HOOK_TARGETS) {
+        for (int i = 0; i < g_execute_hook_false_interp_count; i++) {
+            if (g_execute_hook_false_interp_targets[i] == interp_data) return;
+        }
+        g_execute_hook_false_interp_targets[g_execute_hook_false_interp_count++] = interp_data;
+        LOGI("[exec-hook] Added FALSE interpData target %p (#%d)", (void*)interp_data, g_execute_hook_false_interp_count);
     }
 }
 
@@ -1664,6 +1693,13 @@ static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
     const uintptr_t *f = (const uintptr_t *)methodInfo;
     
     // Phase 1: MI 指针精确匹配 (快速路径)
+    // v6.42: 先检查 FALSE 目标 (IsHidePig/IsHideSlavePig), 再检查 TRUE 目标
+    for (int i = 0; i < g_execute_hook_false_target_count; i++) {
+        if (g_execute_hook_false_targets[i] == mi_addr) {
+            __atomic_add_fetch(&g_execute_false_intercepts, 1, __ATOMIC_RELAXED);
+            goto intercepted_false;
+        }
+    }
     for (int i = 0; i < g_execute_hook_target_count; i++) {
         if (g_execute_hook_targets[i] == mi_addr) {
             goto intercepted;
@@ -1671,9 +1707,16 @@ static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
     }
     
     // Phase 2: interpData 匹配 (捕获不同 MI 对象)
-    if (g_execute_hook_interp_count > 0) {
+    // v6.42: 先检查 FALSE interpData, 再检查 TRUE interpData
+    if (g_execute_hook_interp_count > 0 || g_execute_hook_false_interp_count > 0) {
         uintptr_t interp_data = f[10];
         if (interp_data) {
+            for (int i = 0; i < g_execute_hook_false_interp_count; i++) {
+                if (g_execute_hook_false_interp_targets[i] == interp_data) {
+                    __atomic_add_fetch(&g_execute_false_intercepts, 1, __ATOMIC_RELAXED);
+                    goto intercepted_false;
+                }
+            }
             for (int i = 0; i < g_execute_hook_interp_count; i++) {
                 if (g_execute_hook_interp_targets[i] == interp_data) {
                     goto intercepted;
@@ -1713,12 +1756,13 @@ static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
     // 周期性统计日志
     if (total == 100 || total == 1000 || total == 5000 || total == 10000 || 
         total == 50000 || total % 100000 == 0) {
-        LOGI("[exec-hook] Stats: total=%d, intercepted=%d (early=%d, false=%d), targets=%d, interp=%d",
+        LOGI("[exec-hook] Stats: total=%d, intercepted=%d (early=%d, false=%d), targets=%d+%dF, interp=%d+%dF",
              total, 
              __atomic_load_n(&g_execute_intercepted_calls, __ATOMIC_RELAXED),
              __atomic_load_n(&g_execute_early_intercepts, __ATOMIC_RELAXED),
              __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED),
-             g_execute_hook_target_count, g_execute_hook_interp_count);
+             g_execute_hook_target_count, g_execute_hook_false_target_count,
+             g_execute_hook_interp_count, g_execute_hook_false_interp_count);
     }
     
     g_orig_execute(methodInfo, args, ret);
@@ -3908,39 +3952,134 @@ static int do_unlock_all_dlc(void) {
             }
         }
         
-        // 4f. LoginDataExtension 方法地址诊断 (确认 Execute hook 可拦截)
+        // 4f. LoginDataExtension 方法: 注册到 Execute hook
+        // v6.42: IsHidePig/IsHideSlavePig → FALSE 目标 (返回 false = 显示猪模式)
+        //        IsValidPlayDLCX → TRUE 目标 (返回 true = 允许试玩)
         if (fn_class_from_name && fn_class_get_method_from_name && g_csharp_image) {
             Il2CppClass lde_cls = fn_class_from_name(g_csharp_image, "", "LoginDataExtension");
             if (lde_cls) {
-                LOGI("[dlc] v6.41: ===== LoginDataExtension methods =====");
+                LOGI("[dlc] v6.42: ===== LoginDataExtension methods =====");
                 const char *lde_methods[] = {"IsHidePig", "IsHideSlavePig", "IsValidPlayDLCX", NULL};
                 int lde_params[] = {1, 1, 2};
                 for (int m = 0; lde_methods[m]; m++) {
                     Il2CppMethodInfo mi = fn_class_get_method_from_name(lde_cls, lde_methods[m], lde_params[m]);
                     if (mi) {
                         uintptr_t *f = (uintptr_t *)mi;
-                        LOGI("[dlc] v6.41:   %s(%d): mPtr=%p interpData=%p MI=%p",
+                        LOGI("[dlc] v6.42:   %s(%d): mPtr=%p interpData=%p MI=%p",
                              lde_methods[m], lde_params[m], (void*)f[0], (void*)f[10], mi);
-                        // 注册到 Execute hook (但不修改 MethodInfo!)
-                        execute_hook_add_target(mi);
+                        // v6.42: IsHidePig/IsHideSlavePig 注册为 FALSE 目标
+                        if (strcmp(lde_methods[m], "IsHidePig") == 0 || 
+                            strcmp(lde_methods[m], "IsHideSlavePig") == 0) {
+                            execute_hook_add_false_target(mi);
+                        } else {
+                            execute_hook_add_target(mi);
+                        }
                     } else {
-                        LOGW("[dlc] v6.41:   %s(%d) not found", lde_methods[m], lde_params[m]);
+                        LOGW("[dlc] v6.42:   %s(%d) not found", lde_methods[m], lde_params[m]);
                     }
                 }
             }
         }
         
-        LOGI("[dlc] v6.41: Phase 4 complete (false_intercept_count=%d)",
+        // 4g. GameItemMgr: 检查关键 GameItemID 是否存在
+        // v6.42: 检查 TiaoLingShi(1015), XiaoZhuYao(1016), SlavePig(14005) 是否在 gameItems 中
+        if (fn_class_from_name && fn_class_get_method_from_name && g_csharp_image) {
+            Il2CppClass gim_cls = fn_class_from_name(g_csharp_image, "", "GameItemMgr");
+            if (gim_cls) {
+                Il2CppMethodInfo m_getInstance = fn_class_get_method_from_name(gim_cls, "get_Instance", 0);
+                if (m_getInstance) {
+                    __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+                    exc = NULL;
+                    void *gim_inst = NULL;
+                    SAFE_INVOKE(gim_inst, m_getInstance, NULL, NULL, &exc);
+                    __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+                    
+                    if (!sigsegv_hit && gim_inst) {
+                        // 读取 gameItems dict (offset 0x10)
+                        void *game_items_dict = NULL;
+                        install_sigsegv_handler();
+                        g_in_safe_access = 1;
+                        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                            game_items_dict = *(void **)((uintptr_t)gim_inst + 0x10);
+                        }
+                        g_in_safe_access = 0;
+                        uninstall_sigsegv_handler();
+                        
+                        if (game_items_dict && (uintptr_t)game_items_dict > 0x1000) {
+                            Il2CppClass dict_cls = fn_object_get_class(game_items_dict);
+                            Il2CppMethodInfo m_containsKey = fn_class_get_method_from_name(dict_cls, "ContainsKey", 1);
+                            if (m_containsKey) {
+                                LOGI("[dlc] v6.42: ===== GameItemMgr key check =====");
+                                int check_ids[] = {1015, 1016, 14005, 1001, 1002, 1003, 1005, 1006, 1010, 1011, 1012, 1013, 1014};
+                                const char *check_names[] = {"TiaoLingShi", "XiaoZhuYao", "SlavePig", "MoShuShiDLC", "YaoJiShiDLC", "LangRenDLC", "QiYueShiDLC", "JiXieShiDLC", "QiShi", "YouXia", "XiuNv", "NvWu", "RemoveAD"};
+                                for (int k = 0; k < 13; k++) {
+                                    __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+                                    exc = NULL;
+                                    void *contains_result = NULL;
+                                    // ContainsKey(Int32) - 值类型参数直接传递
+                                    void *args_buf[1];
+                                    int32_t key_val = check_ids[k];
+                                    args_buf[0] = &key_val;
+                                    SAFE_INVOKE(contains_result, m_containsKey, game_items_dict, args_buf, &exc);
+                                    __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+                                    int exists = -1;
+                                    if (!sigsegv_hit && contains_result) {
+                                        SAFE_UNBOX_INT(exists, contains_result, -1);
+                                    }
+                                    LOGI("[dlc] v6.42:   GameItemMgr[%d/%s] = %s",
+                                         check_ids[k], check_names[k],
+                                         exists == 1 ? "EXISTS" : (exists == 0 ? "MISSING" : "ERROR"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 4h. 注册更多 DLC 解锁相关方法到 Execute hook
+        // AchieveConfig.IsUnlockForGameItemId, GordianGameBridge.IsUnlockByGameId
+        if (fn_class_from_name && fn_class_get_method_from_name && g_csharp_image) {
+            struct { const char *cls; const char *ns; const char *method; int params; } extra_methods[] = {
+                {"AchieveConfig", "", "IsUnlockForGameItemId", 1},
+                {"GordianGameBridge", "Gordian", "IsUnlockByGameId", 2},
+                {"GordianUserInfo", "Gordian", "IsUnlockByGameId", 2},
+                {"GordianUserInfo", "Gordian", "IsGordianAchieveUnlock", 1},
+                {NULL, NULL, NULL, 0}
+            };
+            LOGI("[dlc] v6.42: ===== Extra DLC method registration =====");
+            for (int m = 0; extra_methods[m].cls; m++) {
+                // 先在 Assembly-CSharp.dll 中查找，Gordian 命名空间的类也可能在这里
+                Il2CppClass cls = fn_class_from_name(g_csharp_image, extra_methods[m].ns, extra_methods[m].cls);
+                if (!cls) {
+                    LOGW("[dlc] v6.42:   %s.%s not found in Assembly-CSharp image", extra_methods[m].ns, extra_methods[m].cls);
+                    continue;
+                }
+                Il2CppMethodInfo mi = fn_class_get_method_from_name(cls, extra_methods[m].method, extra_methods[m].params);
+                if (mi) {
+                    uintptr_t *f2 = (uintptr_t *)mi;
+                    LOGI("[dlc] v6.42:   %s.%s(%d): mPtr=%p interpData=%p MI=%p",
+                         extra_methods[m].cls, extra_methods[m].method, extra_methods[m].params,
+                         (void*)f2[0], (void*)f2[10], mi);
+                    execute_hook_add_target(mi);
+                } else {
+                    LOGW("[dlc] v6.42:   %s.%s(%d) method not found", extra_methods[m].cls, extra_methods[m].method, extra_methods[m].params);
+                }
+            }
+        }
+        
+        LOGI("[dlc] v6.42: Phase 4 complete (false_targets=%d, false_intercepts=%d)",
+             g_execute_hook_false_target_count,
              __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED));
     }
 
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.41 complete (patched=%d/16, real=%d/16, mi_hooks=%d, exec_hook=%d, targets=%d, false_targets=%d) =====",
+    LOGI("[dlc] ===== DLC unlock v6.42 complete (patched=%d/16, real=%d/16, mi_hooks=%d, exec_hook=%d, targets=%d+%dF, interp=%d+%dF) =====",
          unlocked_count, real_unlocked_count, g_mi_hooks_installed, g_execute_hook_installed, 
-         g_execute_hook_target_count,
-         __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED));
+         g_execute_hook_target_count, g_execute_hook_false_target_count,
+         g_execute_hook_interp_count, g_execute_hook_false_interp_count);
     return unlocked_count;
 }
 /* v6.17: 以下旧的诊断代码已禁用 */

@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.42"
+#define LOG_TAG "GoldHack v6.43"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -4071,12 +4071,148 @@ static int do_unlock_all_dlc(void) {
         LOGI("[dlc] v6.42: Phase 4 complete (false_targets=%d, false_intercepts=%d)",
              g_execute_hook_false_target_count,
              __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED));
+        
+        // 4i. GameItemMgr 注入: 为缺失的 GameItemID 创建条目
+        // v6.43: 调用 GetOrCreateItem() 创建缺失项, 然后设置 num=1 表示已拥有
+        // 关键缺失项: XiaoZhuYao(1016), SlavePig(14005)
+        // 同时补充: QiShi(1010), YouXia(1011), XiuNv(1012), NvWu(1013), RemoveAD(1014)
+        if (fn_class_from_name && fn_class_get_method_from_name && fn_object_new && g_csharp_image) {
+            Il2CppClass gim_cls2 = fn_class_from_name(g_csharp_image, "", "GameItemMgr");
+            if (gim_cls2) {
+                Il2CppMethodInfo m_goci = fn_class_get_method_from_name(gim_cls2, "GetOrCreateItem", 1);
+                Il2CppMethodInfo m_getInst2 = fn_class_get_method_from_name(gim_cls2, "get_Instance", 0);
+                if (m_goci && m_getInst2) {
+                    __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+                    exc = NULL;
+                    void *gim2 = NULL;
+                    SAFE_INVOKE(gim2, m_getInst2, NULL, NULL, &exc);
+                    __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+                    
+                    if (!sigsegv_hit && gim2) {
+                        LOGI("[dlc] v6.43: ===== GameItemMgr item injection =====");
+                        // 注入所有可能缺失的 GameItemID
+                        int inject_ids[] = {1016, 14005, 1010, 1011, 1012, 1013, 1014, 1015};
+                        const char *inject_names[] = {"XiaoZhuYao", "SlavePig", "QiShi", "YouXia", "XiuNv", "NvWu", "RemoveAD", "TiaoLingShi"};
+                        int inject_count = 8;
+                        int injected = 0;
+                        
+                        for (int j = 0; j < inject_count; j++) {
+                            __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+                            exc = NULL;
+                            void *item_result = NULL;
+                            void *goci_args[1];
+                            int32_t goci_id = inject_ids[j];
+                            goci_args[0] = &goci_id;
+                            SAFE_INVOKE(item_result, m_goci, gim2, goci_args, &exc);
+                            __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+                            
+                            if (sigsegv_hit || !item_result) {
+                                LOGW("[dlc] v6.43:   GetOrCreateItem(%d/%s) failed (sigsegv=%d exc=%p result=%p)",
+                                     inject_ids[j], inject_names[j], sigsegv_hit, exc, item_result);
+                                continue;
+                            }
+                            
+                            // item_result 是 IGameItem (GameItem 对象)
+                            // 读取 GameItem.data (LoginGameItem) at offset 0x18
+                            void *login_game_item = NULL;
+                            install_sigsegv_handler();
+                            g_in_safe_access = 1;
+                            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                                login_game_item = *(void **)((uintptr_t)item_result + 0x18);
+                            }
+                            g_in_safe_access = 0;
+                            uninstall_sigsegv_handler();
+                            
+                            if (login_game_item && (uintptr_t)login_game_item > 0x1000) {
+                                // 读取当前 num, 如果为 0 则设置为 1
+                                int32_t cur_num = 0;
+                                install_sigsegv_handler();
+                                g_in_safe_access = 1;
+                                if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                                    cur_num = *(int32_t *)((uintptr_t)login_game_item + 0x14);
+                                    if (cur_num <= 0) {
+                                        *(int32_t *)((uintptr_t)login_game_item + 0x14) = 1;
+                                        // 同时设置 id 字段 (offset 0x10) 确保正确
+                                        *(int32_t *)((uintptr_t)login_game_item + 0x10) = inject_ids[j];
+                                    }
+                                }
+                                g_in_safe_access = 0;
+                                uninstall_sigsegv_handler();
+                                
+                                int32_t new_num = (cur_num <= 0) ? 1 : cur_num;
+                                LOGI("[dlc] v6.43:   Inject %d/%s: item=%p data=%p num: %d→%d %s",
+                                     inject_ids[j], inject_names[j], item_result, login_game_item,
+                                     cur_num, new_num, (cur_num <= 0) ? "✓ INJECTED" : "✓ ALREADY_OK");
+                                injected++;
+                            } else {
+                                // data 为 null, 需要创建 LoginGameItem
+                                LOGI("[dlc] v6.43:   Item %d/%s: data=NULL, creating LoginGameItem...",
+                                     inject_ids[j], inject_names[j]);
+                                Il2CppClass lgi_cls = fn_class_from_name(g_csharp_image, "", "LoginGameItem");
+                                if (lgi_cls) {
+                                    void *new_lgi = fn_object_new(lgi_cls);
+                                    if (new_lgi) {
+                                        // 设置 id 和 num
+                                        install_sigsegv_handler();
+                                        g_in_safe_access = 1;
+                                        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                                            *(int32_t *)((uintptr_t)new_lgi + 0x10) = inject_ids[j]; // id
+                                            *(int32_t *)((uintptr_t)new_lgi + 0x14) = 1;             // num
+                                            *(int64_t *)((uintptr_t)new_lgi + 0x18) = 0;             // date
+                                            *(int64_t *)((uintptr_t)new_lgi + 0x20) = 0;             // time
+                                            *(int32_t *)((uintptr_t)new_lgi + 0x28) = 0;             // deltanum
+                                            // 将新 LoginGameItem 写入 GameItem.data
+                                            *(void **)((uintptr_t)item_result + 0x18) = new_lgi;
+                                        }
+                                        g_in_safe_access = 0;
+                                        uninstall_sigsegv_handler();
+                                        LOGI("[dlc] v6.43:   Inject %d/%s: created LoginGameItem=%p (id=%d, num=1) ✓",
+                                             inject_ids[j], inject_names[j], new_lgi, inject_ids[j]);
+                                        injected++;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // 验证注入后的 gameItems count
+                        void *dict2 = NULL;
+                        install_sigsegv_handler();
+                        g_in_safe_access = 1;
+                        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                            dict2 = *(void **)((uintptr_t)gim2 + 0x10);
+                        }
+                        g_in_safe_access = 0;
+                        uninstall_sigsegv_handler();
+                        
+                        if (dict2 && (uintptr_t)dict2 > 0x1000) {
+                            Il2CppClass dict_cls2 = fn_object_get_class(dict2);
+                            Il2CppMethodInfo m_cnt2 = fn_class_get_method_from_name(dict_cls2, "get_Count", 0);
+                            if (m_cnt2) {
+                                __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+                                exc = NULL;
+                                void *cnt_r = NULL;
+                                SAFE_INVOKE(cnt_r, m_cnt2, dict2, NULL, &exc);
+                                __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+                                int new_count = -1;
+                                if (!sigsegv_hit && cnt_r) {
+                                    SAFE_UNBOX_INT(new_count, cnt_r, -1);
+                                }
+                                LOGI("[dlc] v6.43: GameItemMgr injection: %d/%d items injected, dict count: 27→%d",
+                                     injected, inject_count, new_count);
+                            }
+                        }
+                    }
+                } else {
+                    LOGW("[dlc] v6.43: GetOrCreateItem or get_Instance method not found");
+                }
+            }
+        }
     }
 
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.42 complete (patched=%d/16, real=%d/16, mi_hooks=%d, exec_hook=%d, targets=%d+%dF, interp=%d+%dF) =====",
+    LOGI("[dlc] ===== DLC unlock v6.43 complete (patched=%d/16, real=%d/16, mi_hooks=%d, exec_hook=%d, targets=%d+%dF, interp=%d+%dF) =====",
          unlocked_count, real_unlocked_count, g_mi_hooks_installed, g_execute_hook_installed, 
          g_execute_hook_target_count, g_execute_hook_false_target_count,
          g_execute_hook_interp_count, g_execute_hook_false_interp_count);

@@ -67,7 +67,7 @@
 #define MAX_API_STRINGS 300         // 最大 il2cpp API 字符串数
 #define MAX_SCAN_SIZE   (200*1024*1024)  // 单个内存区域最大扫描大小
 
-#define LOG_TAG "GoldHack v6.39"
+#define LOG_TAG "GoldHack v6.41"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1454,8 +1454,20 @@ static const char *g_early_match_names[] = {
     "IsUnlockAll", "IsUnlockByExtra", "IsUnlockAnyDlc", "isUnlock",
     "IsUnlockCurRole", "HasFreeGetRole", "IsUnlockCard",
     "checkDLCUnlock", "IsUnlockNormalAchieve",
+    // v6.41: 调灵师/小猪妖/愿望之夜 解锁
+    "IsValidPlayDLCX", "IsUnlockForGameItemId",
+    "IsGordianAchieveUnlock",
     NULL
 };
+
+// v6.41: 需要返回 FALSE 的方法 (IsHidePig=true 表示隐藏, 我们要显示所以返回 false)
+static const char *g_early_match_false_names[] = {
+    "IsHidePig", "IsHideSlavePig",
+    NULL
+};
+
+// v6.41: 诊断计数器 (返回 false 的拦截次数)
+static volatile int g_execute_false_intercepts = 0;
 
 // v6.38: 收集需要 inline hook 的原始 AOT 函数地址
 #define MAX_INLINE_HOOK_ADDRS 32
@@ -1679,6 +1691,14 @@ static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
             // v6.39: 修复! checkDLCUnlock='c', HasFreeGetRole='H' 之前被遗漏
             char c0 = name[0];
             if (c0 == 'i' || c0 == 'I' || c0 == 'g' || c0 == 'c' || c0 == 'H') {
+                // v6.41: 先检查需要返回 FALSE 的方法 (IsHidePig, IsHideSlavePig)
+                for (int n = 0; g_early_match_false_names[n]; n++) {
+                    if (strcmp(name, g_early_match_false_names[n]) == 0) {
+                        __atomic_add_fetch(&g_execute_false_intercepts, 1, __ATOMIC_RELAXED);
+                        goto intercepted_false;
+                    }
+                }
+                // 然后检查需要返回 TRUE 的方法
                 for (int n = 0; g_early_match_names[n]; n++) {
                     if (strcmp(name, g_early_match_names[n]) == 0) {
                         __atomic_add_fetch(&g_execute_early_intercepts, 1, __ATOMIC_RELAXED);
@@ -1693,14 +1713,32 @@ static void hook_execute_func(const void* methodInfo, void* args, void* ret) {
     // 周期性统计日志
     if (total == 100 || total == 1000 || total == 5000 || total == 10000 || 
         total == 50000 || total % 100000 == 0) {
-        LOGI("[exec-hook] Stats: total=%d, intercepted=%d (early=%d), targets=%d, interp=%d",
+        LOGI("[exec-hook] Stats: total=%d, intercepted=%d (early=%d, false=%d), targets=%d, interp=%d",
              total, 
              __atomic_load_n(&g_execute_intercepted_calls, __ATOMIC_RELAXED),
              __atomic_load_n(&g_execute_early_intercepts, __ATOMIC_RELAXED),
+             __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED),
              g_execute_hook_target_count, g_execute_hook_interp_count);
     }
     
     g_orig_execute(methodInfo, args, ret);
+    return;
+
+intercepted_false:
+    // v6.41: 返回 FALSE (IsHidePig/IsHideSlavePig: false = 不隐藏 = 显示猪模式)
+    if (ret) {
+        *(int64_t*)ret = 0;  // StackObject.i64 = 0 (bool false)
+    }
+    {
+        int ic = __atomic_add_fetch(&g_execute_intercepted_calls, 1, __ATOMIC_RELAXED);
+        int fc = __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED);
+        if (fc <= 30) {
+            const char *name = (const char *)f[2];
+            const char *safe_name = (name && (uintptr_t)name > 0x10000) ? name : "?";
+            LOGI("[exec-hook] ★ INTERCEPTED Execute(MI=%p, name=%s) -> ret=0 (FALSE) #%d (false_total=%d)",
+                 methodInfo, safe_name, ic, fc);
+        }
+    }
     return;
 
 intercepted:
@@ -2770,8 +2808,12 @@ static int do_unlock_all_dlc(void) {
             }
             
             // 需要扫描的类: 这些类的方法可能调用 DLC 检查 stub
+            // v6.41: 移除 EnterLayer! 因为 EnterLayer.UpdateEntryState 中既有
+            // isUnlockRole(应返回 true) 又有 IsHidePig/IsHideSlavePig(应返回 false)
+            // 的 BL 调用，它们共享同一个 stub 无法区分。
+            // EnterLayer 的方法调用改为完全依赖 Execute hook 拦截。
             struct { const char *name; const char *ns; } scan_classes[] = {
-                {"EnterLayer",        ""},
+                // {"EnterLayer",        ""},  // v6.41: REMOVED - IsHidePig conflict
                 {"BookShelfManager",  ""},
                 {"UserInfo",          ""},
                 {"SDKManager",        ""},
@@ -3740,11 +3782,165 @@ static int do_unlock_all_dlc(void) {
              unlocked_count, real_unlocked_count);
     }
 
+    // === Phase 4: v6.41 - 调灵师/小猪妖/愿望之夜 数据层解锁 ===
+    // 策略: 不修改任何 MethodInfo (会破坏共享 AOT stub),
+    // 而是修改 LoginData.tryplaydlcx 数据字段 + 依赖 Execute hook 拦截
+    {
+        LOGI("[dlc] v6.41: ===== Phase 4: 调灵师/小猪妖/愿望之夜 data injection =====");
+        
+        void *login_data = NULL;
+        install_sigsegv_handler();
+        g_in_safe_access = 1;
+        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+            login_data = *(void **)(g_proto_login_inst + 0x30);
+        }
+        g_in_safe_access = 0;
+        uninstall_sigsegv_handler();
+        
+        if (login_data && (uintptr_t)login_data > 0x1000) {
+            // 4a. 设置 tryplaydlcx = 1 (offset 0xf0)
+            // tryplaydlcx 控制试玩 DLC 功能, 非零值启用
+            int32_t old_tryplay = 0;
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                old_tryplay = *(int32_t *)((uintptr_t)login_data + 0xf0);
+                *(int32_t *)((uintptr_t)login_data + 0xf0) = 1;
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+            LOGI("[dlc] v6.41: LoginData.tryplaydlcx: %d → 1 (login_data=%p)", old_tryplay, login_data);
+            
+            // 4b. 读取 totalPay (offset 0xec) 用于诊断
+            int32_t total_pay = 0;
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                total_pay = *(int32_t *)((uintptr_t)login_data + 0xec);
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+            LOGI("[dlc] v6.41: LoginData.totalPay=%d", total_pay);
+            
+            // 4c. 读取 FreePlayData (offset 0x118) 状态
+            void *free_play_data = NULL;
+            install_sigsegv_handler();
+            g_in_safe_access = 1;
+            if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                free_play_data = *(void **)((uintptr_t)login_data + 0x118);
+            }
+            g_in_safe_access = 0;
+            uninstall_sigsegv_handler();
+            LOGI("[dlc] v6.41: LoginData.FreePlayData=%p", free_play_data);
+        } else {
+            LOGW("[dlc] v6.41: Cannot access mLoginData (ptr=%p)", login_data);
+        }
+        
+        // 4d. GameItemMgr 诊断 (读取单例和 gameItems 字典计数)
+        if (fn_class_from_name && g_csharp_image) {
+            Il2CppClass gim_cls = fn_class_from_name(g_csharp_image, "", "GameItemMgr");
+            if (gim_cls) {
+                Il2CppMethodInfo m_getInstance = fn_class_get_method_from_name(gim_cls, "get_Instance", 0);
+                if (m_getInstance) {
+                    __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+                    exc = NULL;
+                    void *gim_inst = NULL;
+                    SAFE_INVOKE(gim_inst, m_getInstance, NULL, NULL, &exc);
+                    __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+                    
+                    if (!sigsegv_hit && gim_inst) {
+                        LOGI("[dlc] v6.41: GameItemMgr.Instance=%p", gim_inst);
+                        
+                        // 读取 gameItems dict (offset 0x10)
+                        void *game_items_dict = NULL;
+                        install_sigsegv_handler();
+                        g_in_safe_access = 1;
+                        if (sigsetjmp(g_jmpbuf, 1) == 0) {
+                            game_items_dict = *(void **)((uintptr_t)gim_inst + 0x10);
+                        }
+                        g_in_safe_access = 0;
+                        uninstall_sigsegv_handler();
+                        
+                        if (game_items_dict && (uintptr_t)game_items_dict > 0x1000) {
+                            Il2CppClass dict_cls = fn_object_get_class(game_items_dict);
+                            Il2CppMethodInfo m_getCount = fn_class_get_method_from_name(dict_cls, "get_Count", 0);
+                            if (m_getCount) {
+                                __atomic_store_n(&g_execute_hook_bypass, 1, __ATOMIC_RELEASE);
+                                exc = NULL;
+                                void *cnt_result = NULL;
+                                SAFE_INVOKE(cnt_result, m_getCount, game_items_dict, NULL, &exc);
+                                __atomic_store_n(&g_execute_hook_bypass, 0, __ATOMIC_RELEASE);
+                                int item_count = -1;
+                                if (!sigsegv_hit && cnt_result) {
+                                    SAFE_UNBOX_INT(item_count, cnt_result, -1);
+                                }
+                                LOGI("[dlc] v6.41: GameItemMgr.gameItems count=%d", item_count);
+                            }
+                        } else {
+                            LOGI("[dlc] v6.41: GameItemMgr.gameItems dict=%p (empty/null)", game_items_dict);
+                        }
+                    } else {
+                        LOGW("[dlc] v6.41: GameItemMgr.get_Instance() failed (sigsegv=%d exc=%p)", sigsegv_hit, exc);
+                    }
+                } else {
+                    LOGW("[dlc] v6.41: GameItemMgr.get_Instance method not found");
+                }
+            } else {
+                LOGW("[dlc] v6.41: GameItemMgr class not found");
+            }
+        }
+        
+        // 4e. 读取 GameItemID 枚举值 (诊断)
+        if (fn_class_from_name && fn_class_get_fields && fn_field_get_name 
+            && fn_field_static_get_value && g_csharp_image) {
+            Il2CppClass gi_cls = fn_class_from_name(g_csharp_image, "", "GameItemID");
+            if (gi_cls) {
+                LOGI("[dlc] v6.41: ===== GameItemID enum values =====");
+                void *fiter = NULL;
+                Il2CppFieldInfo fi;
+                while ((fi = fn_class_get_fields(gi_cls, &fiter)) != NULL) {
+                    const char *fname = fn_field_get_name(fi);
+                    if (!fname || strcmp(fname, "value__") == 0) continue;
+                    int32_t val = -1;
+                    fn_field_static_get_value(fi, &val);
+                    LOGI("[dlc] v6.41:   %s = %d", fname, val);
+                }
+            }
+        }
+        
+        // 4f. LoginDataExtension 方法地址诊断 (确认 Execute hook 可拦截)
+        if (fn_class_from_name && fn_class_get_method_from_name && g_csharp_image) {
+            Il2CppClass lde_cls = fn_class_from_name(g_csharp_image, "", "LoginDataExtension");
+            if (lde_cls) {
+                LOGI("[dlc] v6.41: ===== LoginDataExtension methods =====");
+                const char *lde_methods[] = {"IsHidePig", "IsHideSlavePig", "IsValidPlayDLCX", NULL};
+                int lde_params[] = {1, 1, 2};
+                for (int m = 0; lde_methods[m]; m++) {
+                    Il2CppMethodInfo mi = fn_class_get_method_from_name(lde_cls, lde_methods[m], lde_params[m]);
+                    if (mi) {
+                        uintptr_t *f = (uintptr_t *)mi;
+                        LOGI("[dlc] v6.41:   %s(%d): mPtr=%p interpData=%p MI=%p",
+                             lde_methods[m], lde_params[m], (void*)f[0], (void*)f[10], mi);
+                        // 注册到 Execute hook (但不修改 MethodInfo!)
+                        execute_hook_add_target(mi);
+                    } else {
+                        LOGW("[dlc] v6.41:   %s(%d) not found", lde_methods[m], lde_params[m]);
+                    }
+                }
+            }
+        }
+        
+        LOGI("[dlc] v6.41: Phase 4 complete (false_intercept_count=%d)",
+             __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED));
+    }
+
     #undef SAFE_INVOKE
     #undef SAFE_UNBOX_INT
 
-    LOGI("[dlc] ===== DLC unlock v6.35 complete (patched=%d/16, real=%d/16, mi_hooks=%d, exec_hook=%d, targets=%d) =====",
-         unlocked_count, real_unlocked_count, g_mi_hooks_installed, g_execute_hook_installed, g_execute_hook_target_count);
+    LOGI("[dlc] ===== DLC unlock v6.41 complete (patched=%d/16, real=%d/16, mi_hooks=%d, exec_hook=%d, targets=%d, false_targets=%d) =====",
+         unlocked_count, real_unlocked_count, g_mi_hooks_installed, g_execute_hook_installed, 
+         g_execute_hook_target_count,
+         __atomic_load_n(&g_execute_false_intercepts, __ATOMIC_RELAXED));
     return unlocked_count;
 }
 /* v6.17: 以下旧的诊断代码已禁用 */
